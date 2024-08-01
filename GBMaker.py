@@ -1,14 +1,15 @@
-import numpy as np
 import math
+
+import numpy as np
 from scipy.spatial import transform
 
 
 class GBMaker:
     def __init__(self, lattice_parameter, gb_thickness,
-                 misorientation, repeat_factor=5,gb_id=0):
+                 misorientation, repeat_factor=5, gb_id=0):
         """
         Class to create a GB structure based on user defined parameters.
-        GB is placed along x-axis
+        The GB normal is aligned along the x-axis.
         :param float lattice_parameter: Crystal lattice parameter (A)
         :param float gb_thickness: The width of the GB region (A)
         :param np.ndarray misorientation: Misorientation angles
@@ -88,7 +89,7 @@ class GBMaker:
 
         self.left_grain = self.get_points_inside_box(
             atoms,
-            [0, 0, 0, self.grain_xdim, self.grain_ydim , self.grain_zdim ])
+            [0, 0, 0, self.grain_xdim, self.grain_ydim, self.grain_zdim])
 
     def generate_right_grain(self):
         body_diagonal = np.linalg.norm(
@@ -108,14 +109,7 @@ class GBMaker:
             atoms,
             [self.grain_xdim, 0, 0, 2*self.grain_xdim, self.grain_ydim + 1, self.grain_zdim + 1])
 
-    def translate_right_grain(self, dy, dz):
-        self.generate_right_grain()
-        self.right_grain[:, 1] = (
-            self.right_grain[:, 1] + dy) % self.grain_ydim
-        self.right_grain[:, 2] = (
-            self.right_grain[:, 2] + dz) % self.grain_zdim
-
-    def write_lammps(self, file_name,autogen_positions=True):
+    def write_lammps(self, file_name, autogen_positions=True):
         if autogen_positions:
             # Generate concatenated positions
             self.positions = np.vstack(
@@ -152,10 +146,11 @@ class GBMaker:
         # run_lammps_script()
         # update_GB()
 
+
 if __name__ == '__main__':
     theta = math.radians(5)
     G = GBMaker(lattice_parameter=3.61, gb_thickness=0.0,
-            misorientation=[theta, 0, 0], repeat_factor=4)
+                misorientation=[theta, 0, 0], repeat_factor=4)
     G.run_optimization()
     # for (i, dy) in enumerate(np.arange(-G.spacing['y'], G.spacing['y'],
     #                                    0.1*G.spacing['y'])):
