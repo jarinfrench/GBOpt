@@ -1,14 +1,16 @@
 import math
+import warnings
 from copy import deepcopy
 
 import numpy as np
+from scipy.spatial import Delaunay
 
 from GBMaker import GBMaker
 
 
 class GBManipulator:
     """
-    Class to manipulate atoms in the grain boundary region
+    Class to manipulate atoms in the grain boundary region.
     :param GBMaker GB: The GBMaker instance containing the generated GB
     """
 
@@ -18,14 +20,11 @@ class GBManipulator:
     def translate_right_grain(self, dy: float, dz: float):
         """
         Displace the right grain in the plane of the GB by dy, dz
-        :param float dy: Displacement in y direction (angstroms)
-        :param float dz: Displacement in z direction (angstroms)
+        :param float dy: Displacement in y direction (angstroms).
+        :param float dz: Displacement in z direction (angstroms).
         :return np.ndarray: Atom positions after translation.
         """
-        if i == 0:
-            filename = "CSL_GB.dat"
-        else:
-            filename = f"CSL_GB_{i}.dat"
+
         # Displace all atoms in the right grain by [0, dy, dz]. We modulo by the
         # grain dimensions so atoms do not exceed the original boundary conditions
         updated_right_grain = deepcopy(GB.right_grain)
@@ -36,13 +35,15 @@ class GBManipulator:
 
         return np.vstack((GB.left_grain, updated_right_grain))
 
-    def merge_slices(self, GB1, GB2):
+    def slice_and_merge(self, GB1, GB2):
         """
         Given two GB systems, merge them by cutting them at the same location and
         swapping one slice with the same slice in the other system.
-        :param np.ndarray GB1: The positions of atoms for parent 1
-        :param np.ndarray GB2: The positions of atoms for parent 2
+        :param np.ndarray GB1: The positions of GB atoms for parent 1.
+        :param np.ndarray GB2: The positions of GB atoms for parent 2.
         :return np.ndarray: Atom positions after merging the slices.
+        TODO: Make the slice a randomly oriented, randomly placed plane, rather than a
+        randomly placed x-oriented plane.
         """
 
         slice_pos = GB.gb_thickness * (0.25 + 0.5*np.random.rand())
@@ -52,45 +53,68 @@ class GBManipulator:
 
         return new_positions
 
-    def remove_atoms(self, GB, fraction: float):
+    def remove_atoms(self, GBpos, fraction: float):
         """
-        Removes _fraction_ of atoms at the GB plane
-        :param np.ndarray GB: The positions of the atoms in the parent.
-        :param float fraction: The fraction of atoms in the GB plane to remove
+        Removes _fraction_ of atoms at the GB plane.
+        :param np.ndarray GBpos: The positions of the GB atoms in the parent.
+        :param float fraction: The fraction of atoms in the GB plane to remove. Must be
+            less than 25% of the total number of atoms in the GB slab.
         :return np.ndarray: Atom positions after atom removal
         """
-        if fraction < 0 or fraction > 0.25:
+        if fraction <= 0 or fraction > 0.25:
             raise ValueError("Invalid value for fraction ("
                              f"{fraction=}). Must be between 0 and .25")
-        if fraction == 0:
-            return GB
-        else:
-            raise NotImplementedError(
-                "This mutator has not been implemented yet")
 
-    def insert_atoms(self, GB, fraction: float):
+        num_to_keep = len(GBpos) - int(fraction * len(GBpos))
+        if num_to_keep == len(GBpos):
+            warnings.warn(
+                "Calculated fraction of atoms to remove is 0 "
+                f"(int({fraction}*{len(GBpos)}=0)"
+            )
+            return GBpos
+        new_GB = np.random.Generator.choice(GBpos, num_to_keep, replace=False)
+        return new_GB
+
+    def insert_atoms(self, GBpos, fraction: float):
         """
         Inserts _fraction_ atoms in the GB at lattice sites. Empty sites are assumed to
-        have a resolution of 1 angstrom.
-        :param np.ndarray GB: The positions of the atoms in the parent.
-        :param float fraction: The fraction of empty lattice sites to fill
-            (0 <= fraction <= 0.25)
+        have a resolution of 1 angstrom. TODO: Compare Delaunay Triangulation vs 1
+        Angstrom Resolution.
+        :param np.ndarray GBpos: The positions of the GB atoms in the parent.
+        :param float fraction: The fraction of empty lattice sites to fill. Must be less
+            than or equal to 25% of the total number of atoms in the GB slab.
         :return np.ndarray: Atom positions after atom insertion.
         """
-        if fraction < 0 or fraction > 0.25:
+        if fraction <= 0 or fraction > 0.25:
             raise ValueError("Invalid value for fraction ("
                              f"{fraction=}). Must be between 0 and 0.25")
-        if fraction == 0:
-            return GB
-        else:
-            raise NotImplementedError(
-                "This mutator has not been implemented yet")
 
-    def displace_along_soft_modes(self, GB):
+        # Delaunay triangulation approach
+        triangulation = Delaunay(GBpos)
+        circumcenters = np.einsum(
+            'ijk,ik->ij', triangulation.transform[:, :3, :], triangulation.transform[:, 3, :])
+        sphere_radii = np.linalg.norm(
+            GB[triangulation.simplices[:, 0]] - circumcenters, axis=1)
+        interstitial_radii = sphere_radii - GB.radius
+        probabilities = interstitial_radii / np.sum(interstitial_radii)
+        num_sites = len(circumcenters)
+        raise NotImplementedError("This mutator has not been implemented yet")
+
+    def displace_along_soft_modes(self, GBpos):
         """
         Displace atoms along soft phonon modes.
-        :param np.ndarray GB: The positions of the atoms in the parent.
+        :param np.ndarray GBpos: The positions of the GB atoms in the parent.
         :return np.ndarray: Atom positions after displacement.
+        """
+
+        raise NotImplementedError("This mutator has not been implemented yet.")
+
+    def apply_group_symmetry(self, GBpos, group):
+        """
+        Apply the specified group symmetry to the GB region.
+        :param np.ndarray GBpos: The positions of the GB atoms in the parent.
+        :param str group: One of the 230 crystallographic space groups.
+        :return np.ndarray: Atoms positions after applying group symmetry.
         """
 
         raise NotImplementedError("This mutator has not been implemented yet.")
