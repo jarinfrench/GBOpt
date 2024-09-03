@@ -64,10 +64,7 @@ class Atom:
             raise AtomValueError(f"The {attribute} must be a positive value.")
         return value
 
-    # Standard getters and setters. In every case except position a deepcopy of the
-    # value is passed in to prevent inadvertent changes to parameters. If a deepcopy of
-    # position needs to be passed, a helper method needs to be written where the
-    # assignment actually takes place.
+    # Standard getters and setters.
     @property
     def id(self) -> int:
         return self._id

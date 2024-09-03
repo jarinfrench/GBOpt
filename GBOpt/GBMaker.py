@@ -1,4 +1,3 @@
-import copy
 import math
 import warnings
 from fractions import Fraction
@@ -464,11 +463,11 @@ class GBMaker:
 
     @property
     def unit_cell(self) -> UnitCell:
-        return copy.deepcopy(self.__unit_cell)
+        return self.__unit_cell
 
     @property
     def spacing(self) -> dict:
-        return copy.deepcopy(self.__spacing)
+        return self.__spacing
 
     @property
     def radius(self) -> float:
@@ -476,19 +475,19 @@ class GBMaker:
 
     @property
     def gb(self) -> np.ndarray:
-        return copy.deepcopy(self.__gb)
+        return self.__gb
 
     @property
     def left_grain(self) -> np.ndarray:
-        return copy.deepcopy(self.__left_grain)
+        return self.__left_grain
 
     @property
     def right_grain(self) -> np.ndarray:
-        return copy.deepcopy(self.__right_grain)
+        return self.__right_grain
 
     @property
     def box_dims(self) -> np.ndarray:
-        return copy.deepcopy(self.__box_dims)
+        return self.__box_dims
 
 
 if __name__ == '__main__':
