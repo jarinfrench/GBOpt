@@ -1,10 +1,10 @@
-import copy
 import math
 import warnings
 from os.path import isfile
 from typing import Union
 
 import numpy as np
+from numba import float64, jit
 from scipy.spatial import Delaunay, KDTree, cKDTree
 
 from GBOpt.Atom import Atom
@@ -234,23 +234,21 @@ class Parent:
             self.__right_grain = np.array(right_grain)
 
     # Getters
-    # In most cases we return a deepcopy so that changes are not reflected in the
-    # original data.
     @property
     def left_grain(self) -> np.ndarray:
-        return copy.deepcopy(self.__left_grain)
+        return self.__left_grain
 
     @property
     def right_grain(self) -> np.ndarray:
-        return copy.deepcopy(self.__right_grain)
+        return self.__right_grain
 
     @property
     def whole_gb(self) -> np.ndarray:
-        return copy.deepcopy(self.__whole_gb)
+        return self.__whole_gb
 
     @property
     def unit_cell(self) -> UnitCell:
-        return copy.deepcopy(self.__unit_cell)
+        return self.__unit_cell
 
     @property
     def gb_thickness(self) -> float:
@@ -258,7 +256,7 @@ class Parent:
 
     @property
     def box_dims(self) -> np.ndarray:
-        return copy.deepcopy(self.__box_dims)
+        return self.__box_dims
 
     @property
     def x_dim(self) -> float:
@@ -328,6 +326,86 @@ class _ParentsProxy:
         return len(self.__manipulator._GBManipulator__parents)
 
 
+@jit(float64(float64, float64), nopython=True, cache=True)
+def _gaussian(x: float, sigma: float = 0.02) -> float:
+    """
+    Calculates a Gaussian-smeared delta function at **x** given a standard deviation
+    of **sigma**.
+
+    :param x: where to calculate the Gaussian-smeared delta function.
+    :param sigma: Standard deviation of the Gaussian-smeared delta
+        function, optional, defaults to 0.02.
+    :return: Value of the Gaussian-smeared delta function at x.
+    """
+    prefactor = 1 / (sigma * np.sqrt(2 * np.pi))
+    return prefactor * np.exp(-x * x / (2 * sigma * sigma))
+
+
+@jit(nopython=True, cache=True)
+def _calculate_fingerprint_vector(atom, neighs, NB, V, Btype, Delta, Rmax):
+    """
+    Calculates the fingerprint for **atom** as described in Lyakhov *et al.*,
+    Computer Phys. Comm. 181 (2010) 1623-1632 (Eq. 4).
+
+    :param atom: The atom we are calculating the fingerprint for.
+    :param neighs: list of Atom containing the neighbors to _atom_.
+    :param NB: The number of atoms of type B neighbor to _atom_.
+    :param V: The volume of the unit cell in angstroms**3.
+    :param Btype: The type of neighbors we are interested in.
+    :param Delta: The discretization length for Rs in angstroms.
+    :param Rmax: The maximum distance from atom to calculate the fingerprint.
+    :return: The vector containing the fingerprint for _atom_.
+    """
+    Rs = np.arange(0, Rmax+Delta, Delta)
+
+    fingerprint_vector = np.zeros_like(Rs)
+    for idx, R in enumerate(Rs):
+        local_sum = 0
+        for neigh in neighs:
+            # if neigh['type'] == Btype # TODO: Swap to use Atom class
+            if neigh[0] == Btype:
+                # Rij = atom['position'].distance(neigh['position']) # TODO: Swap to use Atom class
+                diff = atom[1:] - neigh[1:]
+                # Rij = np.linalg.norm(atom[1:] - neigh[1:])
+                Rij = np.sqrt(np.dot(diff, diff))
+                delta = _gaussian(R-Rij, 0.02)
+                local_sum += delta / \
+                    (4 * np.pi * Rij * Rij * (NB / V) * Delta)
+                # pdb.set_trace()
+        fingerprint_vector[idx] = local_sum - 1
+
+    return fingerprint_vector
+
+
+@jit(nopython=True, cache=True)
+def _calculate_local_order(atom, neighs, unit_cell_types, unit_cell_a0, N, Delta, Rmax):
+    """
+    Calculates the local order parameter following Lyakhov *et al.*, Computer Phys.
+    Comm. 181 (2010) 1623-1632 (Eq. 5).
+
+    :param atom: Atom we are calculating the local order for.
+    :param neighs: Neighbors of **atom**.
+    :param Delta: Bin size to calculate the fingerprint vector, optional, defaults
+        to 0.05.
+    :param Rmax: Maximum distance from **atom** to consider as a
+        neighbor to **atom** in angstroms, optional, defaults to 10.
+    :return: The local order parameter for **atom** based on its neighbors.
+    """
+    local_sum = 0
+    # atom_types = set([a['type'] for a in neighs]) # TODO: Swap to use Atom class
+
+    atom_types = np.unique(neighs[:, 0])
+    V = unit_cell_a0**3
+    unit_cell_types = unit_cell_types
+    prefactor = Delta / (N * (V/N)**(1/3))
+    for Btype in atom_types:
+        NB = np.sum(unit_cell_types == Btype)
+        fingerprint = _calculate_fingerprint_vector(
+            atom, neighs, NB, V, Btype, Delta, Rmax)
+        local_sum += NB * prefactor * np.dot(fingerprint, fingerprint)
+    return np.sqrt(local_sum)
+
+
 class GBManipulator:
     """
     Class to manipulate atoms in the grain boundary region.
@@ -388,87 +466,6 @@ class GBManipulator:
                     gb_thickness = GB1.gb_thickness
             self.__parents[1] = Parent(
                 GB2, unit_cell=unit_cell, gb_thickness=gb_thickness)
-
-    @staticmethod
-    # @jit(float64(float64, float64), nopython=True, cache=True)
-    def __gaussian(x: float, sigma: float = 0.02) -> float:
-        """
-        Calculates a Gaussian-smeared delta function at **x** given a standard deviation
-        of **sigma**.
-
-        :param x: where to calculate the Gaussian-smeared delta function.
-        :param sigma: Standard deviation of the Gaussian-smeared delta
-            function, optional, defaults to 0.02.
-        :return: Value of the Gaussian-smeared delta function at x.
-        """
-        prefactor = 1 / (sigma * np.sqrt(2 * np.pi))
-        return prefactor * np.exp(-x * x / (2 * sigma * sigma))
-
-    # def __calculate_fingerprint_vector(self, atom: Atom, neighs: Sequence[Atom], NB: int, V: float, Btype: int, Delta: float, Rmax: float) -> np.ndarray: # TODO: Swap to use Atom class
-    # @jit(float64[:](np.ndarray, np.ndarray, int64, float64, int64, float64, float64), nopython=True, cache=True)
-    def __calculate_fingerprint_vector(self, atom: np.ndarray, neighs: np.ndarray, NB: int, V: float, Btype: int, Delta: float, Rmax: float):
-        """
-        Calculates the fingerprint for **atom** as described in Lyakhov *et al.*,
-        Computer Phys. Comm. 181 (2010) 1623-1632 (Eq. 4).
-
-        :param atom: The atom we are calculating the fingerprint for.
-        :param neighs: list of Atom containing the neighbors to _atom_.
-        :param NB: The number of atoms of type B neighbor to _atom_.
-        :param V: The volume of the unit cell in angstroms**3.
-        :param Btype: The type of neighbors we are interested in.
-        :param Delta: The discretization length for Rs in angstroms.
-        :param Rmax: The maximum distance from atom to calculate the fingerprint.
-        :return: The vector containing the fingerprint for _atom_.
-        """
-        Rs = np.arange(0, Rmax+Delta, Delta)
-
-        fingerprint_vector = np.zeros_like(Rs)
-        for idx, R in enumerate(Rs):
-            local_sum = 0
-            for neigh in neighs:
-                # if neigh['type'] == Btype # TODO: Swap to use Atom class
-                if neigh[0] == Btype:
-                    # Rij = atom['position'].distance(neigh['position']) # TODO: Swap to use Atom class
-                    Rij = np.linalg.norm(atom[1:] - neigh[1:])
-                    delta = self.__gaussian(R-Rij)
-                    local_sum += delta / \
-                        (4 * np.pi * Rij * Rij * (NB / V) * Delta)
-                    # pdb.set_trace()
-            fingerprint_vector[idx] = local_sum - 1
-
-        return fingerprint_vector
-
-    # def __calculate_local_order(self, atom: Atom, neighs: list[Atom] or np.ndarray[Atom], Delta: float=0.05, Rmax: float=10) -> float: # TODO: Swap to use Atom class
-    # @jit(float64(np.ndarray, np.ndarray, np.ndarray, float64, int64, int64, float64, float64), nopython=True, cache=True)
-    # def __calculate_local_order(self, atom: np.ndarray, neighs: np.ndarray, atom_types: np.ndarray, V: float, N: int, NBs: int, Delta: float = 0.05, Rmax: float = 10) -> float:
-    def __calculate_local_order(self, atom: np.ndarray, neighs: np.ndarray, Delta: float = 0.05, Rmax: float = 10) -> float:
-        """
-        Calculates the local order parameter following Lyakhov *et al.*, Computer Phys.
-        Comm. 181 (2010) 1623-1632 (Eq. 5).
-
-        :param atom: Atom we are calculating the local order for.
-        :param neighs: Neighbors of **atom**.
-        :param Delta: Bin size to calculate the fingerprint vector, optional, defaults
-            to 0.05.
-        :param Rmax: Maximum distance from **atom** to consider as a
-            neighbor to **atom** in angstroms, optional, defaults to 10.
-        :return: The local order parameter for **atom** based on its neighbors.
-        """
-        local_sum = 0
-        # atom_types = set([a['type'] for a in neighs]) # TODO: Swap to use Atom class
-
-        atom_types = set([a[0] for a in neighs])
-        unit_cell = self.__parents[0].unit_cell
-        N = len(unit_cell.unit_cell)
-        for Btype in atom_types:
-            NB = np.sum(
-                [1 if atom_type == Btype else 0 for atom_type in unit_cell.types()])
-            V = unit_cell.a0**3
-            fingerprint = self.__calculate_fingerprint_vector(
-                atom, neighs, NB, V, Btype, Delta, Rmax)
-            local_sum += NB / N * Delta / \
-                (V/N)**(1/3) * np.dot(fingerprint, fingerprint)
-        return np.sqrt(local_sum)
 
     def __create_neighbor_list(self, rcut: float, pos: np.ndarray) -> list:
         """
@@ -588,8 +585,15 @@ class GBManipulator:
         for idx, atom_idx in enumerate(GB_slab_indices):
             atom = atoms[atom_idx]
             neigh_indices = neighbor_list[atom_idx]
-            order[idx] = self.__calculate_local_order(
-                atom, atoms[neigh_indices], Rmax=15)
+            order[idx] = _calculate_local_order(
+                atom,
+                atoms[neigh_indices],
+                parent.unit_cell.types(),
+                parent.unit_cell.a0,
+                len(parent.unit_cell.unit_cell),
+                Delta=0.05,
+                Rmax=15
+            )
 
         # We want the probabilities to be inversely proportional to the order parameter.
         # Higher order values should be more 'stable' against removal than low order
