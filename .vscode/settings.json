@@ -1,0 +1,15 @@
+{
+    "files.trimTrailingWhitespace": true,
+    "files.insertFinalNewline": true,
+    "trailing-spaces.trimOnSave": true,
+
+    "[python]": {
+        "editor.tabSize": 4,
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.fixAll": "explicit",
+            "source.organizeImports": "explicit"
+        },
+        "editor.defaultFormatter": "ms-python.autopep8",
+    },
+}
