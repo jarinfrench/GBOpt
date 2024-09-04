@@ -1,4 +1,5 @@
 import math
+import tempfile
 import unittest
 
 import numpy as np
@@ -172,6 +173,18 @@ class TestGBManipulator(unittest.TestCase):
         manipulator.parents = [Parent(self.file1, unit_cell=self.GB.unit_cell),
                                Parent(self.file2, unit_cell=self.GB.unit_cell)]
         self.assertFalse(None in manipulator.parents)
+
+    def test_write_lammps_after_manipulate(self):
+        manipulator = GBManipulator(self.GB, self.GB)
+        p1 = manipulator.translate_right_grain(1, 1)
+        p2 = manipulator.slice_and_merge()
+        p3 = manipulator.insert_atoms(0.2, method='delaunay')
+        p4 = manipulator.remove_atoms(0.2)
+        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+            self.GB.write_lammps(p1, self.GB.box_dims, temp_file.name)
+            self.GB.write_lammps(p2, self.GB.box_dims, temp_file.name)
+            self.GB.write_lammps(p3, self.GB.box_dims, temp_file.name)
+            self.GB.write_lammps(p4, self.GB.box_dims, temp_file.name)
 
 
 class TestParent(unittest.TestCase):
