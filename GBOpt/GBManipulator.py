@@ -110,6 +110,17 @@ class Parent:
                 gb_thickness = 10
             self.__init_by_snapshot(GB, unit_cell, gb_thickness)
         self.__whole_gb = np.vstack((self.__left_grain, self.__right_grain))
+        left_x_max = max(self.__left_grain[:, 1])
+        right_x_min = min(self.__right_grain[:, 1])
+        left_cut = left_x_max - self.__gb_thickness / 2.0
+        right_cut = right_x_min + self.__gb_thickness / 2.0
+        left_gb_indices = self.__left_grain[:, 1] > left_cut
+        right_gb_indices = self.__right_grain[:, 1] < right_cut
+        gb_indices = np.hstack((left_gb_indices, right_gb_indices))
+        self.__gb_indices = np.array(range(len(self.__whole_gb)))[gb_indices]
+        left_gb = self.__left_grain[left_gb_indices]
+        right_gb = self.__right_grain[right_gb_indices]
+        self.__gb_region = np.vstack((left_gb, right_gb))
         # TODO: make this a more robust calculation, rather than assuming the GB is
         # in the middle of the system.
         self.__GBpos = self.__whole_gb[
@@ -245,6 +256,14 @@ class Parent:
     @property
     def whole_gb(self) -> np.ndarray:
         return self.__whole_gb
+
+    @property
+    def gb_indices(self) -> np.ndarray:
+        return self.__gb_indices
+
+    @property
+    def gb_region(self) -> np.ndarray:
+        return self.__gb_region
 
     @property
     def unit_cell(self) -> UnitCell:
@@ -631,16 +650,7 @@ class GBManipulator:
         if not self.__one_parent:
             warnings.warn("Atom insertion only occuring based on parent 1.")
         parent = self.__parents[0]
-        pos = parent.whole_gb[:, 1:]
-        GB_slab_indices = np.where(
-            np.logical_and(
-                pos[:, 0] >= (parent.box_dims[0, 1] - parent.box_dims[0, 0]
-                              ) / 2 - parent.gb_thickness / 2,
-                pos[:, 0] <= (parent.box_dims[0, 1] - parent.box_dims[0, 0]
-                              ) / 2 + parent.gb_thickness / 2
-            )
-        )
-        GB_slab = pos[GB_slab_indices]
+        GB_slab = parent.gb_region
 
         def Delaunay_approach(GB_slab: np.ndarray, atom_radius: float) -> np.ndarray:
             """
@@ -738,12 +748,31 @@ class GBManipulator:
                                         )
             return filtered_sites[indices]
 
+        available_types = set(parent.unit_cell.types())
+        type_counts = {}
+        for i in available_types:
+            type_counts[i] = np.sum(parent.unit_cell.types() == i)
+        type_ratios = {key: int(value / math.gcd(*type_counts.values()))
+                       for key, value in type_counts.items()}
+        total_ratio = sum(type_ratios.values())
+
         if method == 'delaunay':
-            return np.vstack((pos, Delaunay_approach(GB_slab, parent.unit_cell.radius)))
+            new_pos = Delaunay_approach(GB_slab[:, 1:], parent.unit_cell.radius)
         elif method == 'grid':
-            return np.vstack((pos, grid_approach(GB_slab, parent.unit_cell.radius)))
+            new_pos = grid_approach(GB_slab[:, 1:], parent.unit_cell.radius)
         else:
             raise GBManipulatorValueError(f"Unrecognized insert_atoms method: {method}")
+
+        extra = len(new_pos) % total_ratio
+        if extra != 0:
+            new_pos = new_pos[:-extra]
+        num_elements = [int(len(new_pos) * (r / total_ratio))
+                        for r in type_ratios.values()]
+        new_types = np.array([val for val, num in zip(
+            available_types, num_elements) for _ in range(num)])
+        self.__rng.shuffle(new_types)
+
+        return np.vstack((parent.whole_gb, np.insert(new_pos, 0, new_types, axis=1)))
 
     def displace_along_soft_modes(self) -> np.ndarray:
         """
