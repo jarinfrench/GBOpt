@@ -667,6 +667,24 @@ class GBMaker:
         self.update_spacing()
 
     @property
+    def structure(self) -> str:
+        return self.__structure
+
+    @structure.setter
+    def structure(self, value: str) -> None:
+        self.__structure = self.__validate(value, str, "structure")
+        if set([self.__structure, value]).issubset(
+            set(["fluorite", "rocksalt", "zincblende"])
+        ):
+            raise GBMakerValueError(
+                "Cannot estimate conversion from " f"{self.__structure} to {value}"
+            )
+        else:
+            atom_types = tuple(set(self.__unit_cell.names()))
+
+        self.__unit_cell = self.__init_unit_cell(atom_types)
+
+    @property
     def gb_thickness(self) -> float:
         return self.__gb_thickness
 
