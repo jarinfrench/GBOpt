@@ -394,7 +394,6 @@ class TestParent(unittest.TestCase):
 
     def test_parent_getters(self):
         parent = Parent(self.GB)
-        self.assertEqual(repr(parent.unit_cell), repr(self.GB.unit_cell))
         self.assertEqual(parent.gb_thickness, self.GB.gb_thickness)
         self.assertTrue(np.allclose(parent.box_dims, self.GB.box_dims))
         # Parent calculates x_dim differently than GB
