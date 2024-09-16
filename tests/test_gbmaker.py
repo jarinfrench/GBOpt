@@ -81,6 +81,14 @@ class TestGBMaker(unittest.TestCase):
         with self.assertRaises(GBMakerTypeError):
             self.gbm.misorientation = "invalid"
 
+    def test_invalid_misorientation_length(self):
+        with self.assertRaises(GBMakerValueError):
+            self.gbm.misorientation = np.array([0.1, 0.2])
+
+    def test_invalid_misorientation_type(self):
+        with self.assertRaises(GBMakerTypeError):
+            self.gbm.misorientation = "invalid"
+
     def test_invalid_structure_type(self):
         with self.assertRaises(GBMakerTypeError):
             self.gbm.structure = 123
