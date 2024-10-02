@@ -900,15 +900,125 @@ class GBManipulator:
         new_atoms['name'] = new_types
         return np.hstack((parent.whole_system, new_atoms))
 
-    def displace_along_soft_modes(self) -> np.ndarray:
+    def displace_along_soft_modes(self, d_max: float = None, *, mesh_size: int = 4, num_q: int = 50, num_children: int = 1) -> np.ndarray:
         """
         Displace atoms along soft phonon modes.
 
-        :raises NotImplementedError: Not currently implemented.
-        :return: Atom positions after displacement.
+        :param d_max: Maximum displacement of atoms allowed, optional, defaults to 1.5
+            times the ideal bond length.
+        :param mesh_size: Keyword argument. Specifies the size of the mesh for
+            identifying unique q points. Optional. Defaults to 4.
+        :param num_q: Keyword argument. Specifies the number of unique q points to use
+            when calculating the dynamical matrix and determining the displacements.
+            Optional. Defaults to 50.
+        :param num_children: Keyword argument. Specifies the number of children to
+            create from the parent structure. Optional. Defaults to 1.
+        :return: *num_children* grain boundary structures.
         """
-        pos = self.__parents[0].whole_system
-        raise NotImplementedError("This mutator has not been implemented yet.")
+        if d_max is not None and d_max < 0:
+            raise GBManipulatorValueError("d_max must be a positive float value.")
+        if mesh_size < 1:
+            raise GBManipulatorValueError("mesh_size must be >= 1.")
+        if num_q < 1:
+            raise GBManipulatorValueError("num_q must be >= 1.")
+        if num_children < 1:
+            raise GBManipulatorValueError("num_children must be >= 1.")
+        parent = self.__parents[0]
+        whole_gb = parent.whole_gb
+        # raise NotImplementedError("This mutator has not been implemented yet.")
+
+        ideal_bonds = parent.unit_cell.ideal_bond_lengths
+        # TODO: justify the scaling factor. USPEX uses 1.5
+        if not d_max:
+            d_max = 1.5 * max(ideal_bonds.values())
+        cutoff = 1.5 * max(ideal_bonds.values())
+        neighbor_list = _create_neighbor_list(cutoff, whole_gb)
+        hardness = _calculate_bond_hardness(parent, neighbor_list, ideal_bonds)
+        # spglib defines a structure by a tuple of (basis_vectors, atom_positions,
+        # atom_types). basis_vectors is a 3x3 array of the basis vectors of the crystal,
+        # atom_positions is the positions of the atoms in the unit cell in fractional
+        # coordinates, and atom_types is the type of each atom indicated in
+        # atom_positions.
+        structure = (parent.unit_cell.primitive,
+                     parent.unit_cell.positions(), parent.unit_cell.types())
+        mesh = [mesh_size, mesh_size, mesh_size]
+        # Gets all symmetrically distinct q vectors, including time reversal symmetry
+        grid = spg.get_ir_reciprocal_mesh(mesh, structure, is_time_reversal=False)
+        unique_q_points = grid[1] / np.array(mesh, dtype=float)
+
+        # sort the q vectors by magnitude
+        q_magnitudes = np.linalg.norm(unique_q_points, axis=1)
+        sorted_indices = np.argsort(q_magnitudes)
+        unique_q_points = unique_q_points[sorted_indices]
+
+        if len(unique_q_points) < num_q:
+            warnings.warn(
+                f"Fewer q_points generated than desired: {len(unique_q_points)} < "
+                f"{num_q}. Recommended to increase mesh size.")
+
+        n_atoms = len(parent.gb_indices)
+        num_q = len(unique_q_points)
+        freqs = np.zeros(n_atoms * num_q)
+        disps = np.zeros((n_atoms * num_q, 3))
+        for i, q_vec in enumerate(unique_q_points[:num_q]):
+            start = i * n_atoms
+            end = (i+1) * n_atoms
+            dynamical_matrix = _calculate_dynamical_matrix(
+                hardness, parent, neighbor_list, q_vec)
+            freq_vals, disp_vals = np.linalg.eigh(dynamical_matrix)
+            freqs[start:end] = freq_vals
+            disps[start:end, :] = disp_vals.T
+        non_acoustic_indices = np.where((freqs < 1e-2) | (freqs > 1e-2))[0]
+        filtered_freqs = freqs[non_acoustic_indices]
+        filtered_disps = disps[non_acoustic_indices, :]
+        sorted_indices = np.argsort(filtered_freqs)
+        sorted_eigval = filtered_freqs[sorted_indices]
+        sorted_eigvec = filtered_disps[sorted_indices, :]
+        # TODO: determine an ideal number of soft modes to work with here
+        # (how do we determine a good number to work with here?)
+        soft_mode_indices = np.where(sorted_eigval <= 0)[0][:num_children]
+        soft_modes = sorted_eigvec[:, soft_mode_indices]
+
+        pos = np.zeros((num_children, *parent.whole_gb.shape))
+        # initialize to large value
+        max_safe_dmax = np.full(len(parent.gb_indices), np.inf)
+        # minimum allowable distance before atoms are 'too close'
+        threshold = parent.unit_cell.radius
+        # for each shifted atom
+        for child_idx in range(num_children):
+            pos[child_idx] = np.copy(parent.whole_gb)
+            for i, idx in enumerate(parent.gb_indices):
+                for mode_index in soft_mode_indices:
+                    disp_vector = soft_modes[:, mode_index].reshape(-1, 3)
+                    disp_magnitude = np.linalg.norm(disp_vector, axis=1)
+
+                    if np.any(disp_magnitude == 0):
+                        continue
+
+                    neighbors = neighbor_list[idx]
+                    neighbor_positions = whole_gb[neighbors]
+
+                    dists = np.linalg.norm(whole_gb[idx] - neighbor_positions, axis=1)
+
+                    overlap_condition = dists < threshold + disp_magnitude
+                    if np.any(overlap_condition):
+                        safe_displacements = (
+                            dists[overlap_condition] - threshold) / disp_magnitude[overlap_condition]
+                        max_safe_dmax[i] = min(
+                            max_safe_dmax[i], safe_displacements.min())
+
+            for n in range(num_children):
+                adjusted_displacements = soft_modes[:,
+                                                    n] * np.minimum(max_safe_dmax, d_max)
+                pos[n, parent.gb_indices] = whole_gb[parent.gb_indices] + \
+                    adjusted_displacements
+
+            non_gb_indices = np.setdiff1d(
+                np.arange(whole_gb.shape[0]), parent.gb_indices)
+
+            pos[:, non_gb_indices] = whole_gb[non_gb_indices]
+
+        # Need to figure out what exactly is needed to modify atomic positions. It's currently unclear how many child structures are generated from this.
         return pos
 
     def apply_group_symmetry(self, group: str) -> np.ndarray:
