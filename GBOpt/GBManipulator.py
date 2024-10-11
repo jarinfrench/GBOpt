@@ -115,14 +115,15 @@ class Parent:
         *,
         unit_cell: UnitCell = None,
         gb_thickness: float = 10,
-        type_dict: dict = {}
+        type_dict: dict = {}, extra_attributes: list = None
     ) -> None:
         if isinstance(system, GBMaker):
             self.__init_by_gbmaker(system)
         else:
             if gb_thickness is None:  # defaults to 10 if passed in as None.
                 gb_thickness = 10
-            self.__init_by_file(system, unit_cell, gb_thickness, type_dict)
+            self.__init_by_file(system, unit_cell, gb_thickness,
+                                type_dict, extra_attributes)
         # self.__whole_system = np.hstack((self.__left_grain, self.__right_grain))
         left_x_max = max(self.__left_grain["x"])
         right_x_min = min(self.__right_grain["x"])
@@ -171,7 +172,7 @@ class Parent:
         system_file: str,
         unit_cell: UnitCell,
         gb_thickness: float,
-        type_dict: dict
+        type_dict: dict, extra_attributes: list = None
     ) -> None:
         """
         Method for initializing the Parent using a file.
@@ -183,6 +184,8 @@ class Parent:
         :param type_dict: Conversion from type number to type name, optional. Note that
             if this is not provided and the snapshot does not indicate the atom names,
             atom names are assumed started from "H".
+        :param extra_attributes: Optional, defaults to None. A list of strings that the
+            reader will look for while reading the dump file.
         :raises ParentValueError: Exception raised if unit_cell is not passed in or the
             file format of the file is unrecognized, or the file has less than 10 lines.
         :raises ParentFileNotFoundError: Exception raised if the specified file is not
@@ -349,6 +352,8 @@ class Parent:
                     "typelabel")
             col_indices = [required_attribute_indices["typelabel"] if typelabel_in_attrs else required_attribute_indices["type"],
                            required_attribute_indices["x"], required_attribute_indices["y"], required_attribute_indices["z"]]
+            for attr in extra_attributes:
+                col_indices.append(atom_attributes.index(attr))
 
             def convert_type(value):
                 if typelabel_in_attrs:
@@ -796,14 +801,14 @@ class GBManipulator:
     """
 
     def __init__(
-        self,
-        system1: Union[GBMaker, str],
-        system2: Union[GBMaker, str] = None,
-        *,
-        gb_thickness: float = None,
-        unit_cell: UnitCell = None,
-        seed: int = None
-    ) -> None:
+            self,
+            system1: Union[GBMaker, str],
+            system2: Union[GBMaker, str] = None,
+            *,
+            gb_thickness: float = None,
+            unit_cell: UnitCell = None,
+            seed: int = None,
+            extra_attributes: list = None) -> None:
         # initialize the random number generator
         if not seed:
             self.__rng = np.random.default_rng()
@@ -817,21 +822,20 @@ class GBManipulator:
             # not attempt to perform those in the case that only one GB is passed in.
             self.__one_parent = True
             self.__set_parents(system1, unit_cell=unit_cell,
-                               gb_thickness=gb_thickness)
+                               gb_thickness=gb_thickness, extra_attributes)
         else:
             self.__one_parent = False
             self.__set_parents(system1, system2, unit_cell=unit_cell,
-                               gb_thickness=gb_thickness)
+                               gb_thickness=gb_thickness, extra_attributes=extra_attributes)
         self.__num_processes = mp.cpu_count() // 2 or 1
 
     def __set_parents(
-        self,
-        system1: Union[GBMaker, str],
-        system2: Union[GBMaker, str] = None,
-        *,
-        unit_cell=None,
-        gb_thickness=None
-    ) -> None:
+            self,
+            system1: Union[GBMaker, str],
+            system2: Union[GBMaker, str] = None,
+            *,
+            unit_cell=None,
+            gb_thickness=None, extra_attributes: list = None) -> None:
         """
         Method to assign the parent(s) that will create the child(ren).
 
@@ -842,9 +846,12 @@ class GBManipulator:
         :param gb_thickness: Keyword argument. The thickness of the GB region, optional,
             defaults to None. Note that if None is passed to the Parent class
             constructor, a value of 10 is assigned.
+        :param extra_attributes: Extra attributes to read in a dump file. Ignored if
+            given for a GBMaker instance.
         """
         self.__parents[0] = Parent(
-            system1, unit_cell=unit_cell, gb_thickness=gb_thickness)
+
+            system1, unit_cell=unit_cell, gb_thickness=gb_thickness, extra_attributes=extra_attributes)
         if system2 is not None:
             # If there are 2 parents, with the first one being of type GBMaker, and
             # unit_cell has not been passed in, we assume that the unit cell from the
@@ -855,7 +862,7 @@ class GBManipulator:
                 if gb_thickness is None:
                     gb_thickness = system1.gb_thickness
             self.__parents[1] = Parent(
-                system2, unit_cell=unit_cell, gb_thickness=gb_thickness)
+                system2, unit_cell=unit_cell, gb_thickness=gb_thickness, extra_attributes=extra_attributes)
 
     @property
     def rng(self):
@@ -964,8 +971,8 @@ class GBManipulator:
         if (num_to_remove is not None and
                 (
                     num_to_remove < 1 or num_to_remove > int(0.25 * len(gb_atoms))
-                )
-            ):
+                    )
+                ):
             raise GBManipulatorValueError(
                 "Invalid num_to_remove value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region."
@@ -1324,11 +1331,11 @@ class GBManipulator:
              )
 
         if (num_to_insert is not None and
-            (
+                    (
                         num_to_insert < 1 or
                         num_to_insert > int(0.25 * len(gb_atoms))
                     )
-            ):
+                ):
             raise GBManipulatorValueError(
                 "Invalid num_to_insert value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region.")
