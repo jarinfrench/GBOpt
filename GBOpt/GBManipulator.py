@@ -182,9 +182,10 @@ class Parent:
         :param gb_thickness: Thickness of the GB region, given in angstroms.
         :param type_dict: Conversion from type number to type name, optional. Note that
             if this is not provided and the snapshot does not indicate the atom names,
-            atom names are assumed started from "H".
-        :raises ParentValueError: Exception raised if unit_cell is not passed in or the
-            file format of the file is unrecognized, or the file has less than 10 lines.
+            atom names are assumed started from 'H'.
+        :param extra_attributes: Optional, defaults to None. A list of strings that the
+            reader will look for while reading the dump file.
+        :raises ParentValueError: Exception raised if unit_cell is not passed in.
         :raises ParentFileNotFoundError: Exception raised if the specified file is not
             found.
         """
