@@ -963,10 +963,10 @@ class GBManipulator:
             )
 
         if (num_to_remove is not None and
-                (
-                    num_to_remove < 1 or num_to_remove > int(0.25 * len(gb_atoms))
-                )
-            ):
+                    (
+                        num_to_remove < 1 or num_to_remove > int(0.25 * len(gb_atoms))
+                    )
+                ):
             raise GBManipulatorValueError(
                 "Invalid num_to_remove value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region."
@@ -1325,11 +1325,11 @@ class GBManipulator:
              )
 
         if (num_to_insert is not None and
-            (
-                        num_to_insert < 1 or
-                        num_to_insert > int(0.25 * len(gb_atoms))
+                (
+                    num_to_insert < 1 or
+                    num_to_insert > int(0.25 * len(gb_atoms))
                     )
-            ):
+                ):
             raise GBManipulatorValueError(
                 "Invalid num_to_insert value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region.")

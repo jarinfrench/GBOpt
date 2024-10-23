@@ -315,6 +315,14 @@ class GBMaker:
 
         return spacing
 
+    def __generate_gb(self) -> None:
+        """
+        Private method to calculate the left grain, right grain, and whole GB system
+        """
+        self.__left_grain = self.__generate_left_grain()
+        self.__right_grain = self.__generate_right_grain()
+        self.__gb = np.hstack((self.__left_grain, self.__right_grain))
+
     def __init_unit_cell(self, atom_types: str | Tuple[str, ...]) -> UnitCell:
         """
         Initializes the unit cell.
