@@ -95,10 +95,10 @@ class UnitCell:
         )
         if structure == "fcc":
             unit_cell = [
-                Atom(atoms[0], 0.0, 0.0, 0.0),
-                Atom(atoms[0], 0.0, 0.5, 0.5),
-                Atom(atoms[0], 0.5, 0.0, 0.5),
-                Atom(atoms[0], 0.5, 0.5, 0.0)
+                Atom(atom_types[0], 0.0, 0.0, 0.0),
+                Atom(atom_types[0], 0.0, 0.5, 0.5),
+                Atom(atom_types[0], 0.5, 0.0, 0.5),
+                Atom(atom_types[0], 0.5, 0.5, 0.0)
             ]
             self.__radius = math.sqrt(2) * 0.25
             self.__primitive = np.array(
@@ -113,8 +113,8 @@ class UnitCell:
             }
         elif structure == "bcc":
             unit_cell = [
-                Atom(atoms[0], 0.0, 0.0, 0.0),
-                Atom(atoms[0], 0.5, 0.5, 0.5)
+                Atom(atom_types[0], 0.0, 0.0, 0.0),
+                Atom(atom_types[0], 0.5, 0.5, 0.5)
             ]
             self.__radius = math.sqrt(3) * 0.25
             self.__primitive = np.array(
@@ -141,14 +141,14 @@ class UnitCell:
             self.__ideal_bond_lengths = {(1, 1): self.__a0}
         elif structure == "diamond":
             unit_cell = [
-                Atom(atoms[0], 0, 0, 0),
-                Atom(atoms[0], 0, 0.5, 0.5),
-                Atom(atoms[0], 0.5, 0, 0.5),
-                Atom(atoms[0], 0.5, 0.5, 0),
-                Atom(atoms[0], 0.25, 0.25, 0.25),
-                Atom(atoms[0], 0.75, 0.75, 0.25),
-                Atom(atoms[0], 0.75, 0.25, 0.75),
-                Atom(atoms[0], 0.25, 0.75, 0.75)
+                Atom(atom_types[0], 0, 0, 0),
+                Atom(atom_types[0], 0, 0.5, 0.5),
+                Atom(atom_types[0], 0.5, 0, 0.5),
+                Atom(atom_types[0], 0.5, 0.5, 0),
+                Atom(atom_types[0], 0.25, 0.25, 0.25),
+                Atom(atom_types[0], 0.75, 0.75, 0.25),
+                Atom(atom_types[0], 0.75, 0.25, 0.75),
+                Atom(atom_types[0], 0.25, 0.75, 0.75)
             ]
             self.__radius = math.sqrt(3) * 0.125
             self.__primitive = np.array(
@@ -166,18 +166,18 @@ class UnitCell:
                 raise UnitCellValueError(
                     "The specified crystal structure requires 2 atom types.")
             unit_cell = [
-                Atom(atoms[0], 0, 0, 0),
-                Atom(atoms[0], 0, 0.5, 0.5),
-                Atom(atoms[0], 0.5, 0, 0.5),
-                Atom(atoms[0], 0.5, 0.5, 0),
-                Atom(atoms[1], 0.25, 0.25, 0.25),
-                Atom(atoms[1], 0.25, 0.25, 0.75),
-                Atom(atoms[1], 0.25, 0.75, 0.25),
-                Atom(atoms[1], 0.25, 0.75, 0.75),
-                Atom(atoms[1], 0.75, 0.25, 0.25),
-                Atom(atoms[1], 0.75, 0.25, 0.75),
-                Atom(atoms[1], 0.75, 0.75, 0.25),
-                Atom(atoms[1], 0.75, 0.75, 0.75)
+                Atom(atom_types[0], 0, 0, 0),
+                Atom(atom_types[0], 0, 0.5, 0.5),
+                Atom(atom_types[0], 0.5, 0, 0.5),
+                Atom(atom_types[0], 0.5, 0.5, 0),
+                Atom(atom_types[1], 0.25, 0.25, 0.25),
+                Atom(atom_types[1], 0.25, 0.25, 0.75),
+                Atom(atom_types[1], 0.25, 0.75, 0.25),
+                Atom(atom_types[1], 0.25, 0.75, 0.75),
+                Atom(atom_types[1], 0.75, 0.25, 0.25),
+                Atom(atom_types[1], 0.75, 0.25, 0.75),
+                Atom(atom_types[1], 0.75, 0.75, 0.25),
+                Atom(atom_types[1], 0.75, 0.75, 0.75)
             ]
             self.__radius = math.sqrt(3) * 0.125
             self.__primitive = np.array(
@@ -199,14 +199,14 @@ class UnitCell:
                     "The specified crystal structure requires 2 atom types.")
 
             unit_cell = [
-                Atom(atoms[0], 0, 0, 0),
-                Atom(atoms[0], 0, 0.5, 0.5),
-                Atom(atoms[0], 0.5, 0, 0.5),
-                Atom(atoms[0], 0.5, 0.5, 0),
-                Atom(atoms[1], 0, 0, 0.5),
-                Atom(atoms[1], 0, 0.5, 0),
-                Atom(atoms[1], 0.5, 0, 0),
-                Atom(atoms[1], 0.5, 0.5, 0.5)
+                Atom(atom_types[0], 0, 0, 0),
+                Atom(atom_types[0], 0, 0.5, 0.5),
+                Atom(atom_types[0], 0.5, 0, 0.5),
+                Atom(atom_types[0], 0.5, 0.5, 0),
+                Atom(atom_types[1], 0, 0, 0.5),
+                Atom(atom_types[1], 0, 0.5, 0),
+                Atom(atom_types[1], 0.5, 0, 0),
+                Atom(atom_types[1], 0.5, 0.5, 0.5)
             ]
             self.__radius = 0.25
             self.__primitive = np.array(
@@ -227,14 +227,14 @@ class UnitCell:
                 raise UnitCellValueError(
                     "The specified crystal structure requires 2 atom types.")
             unit_cell = [
-                Atom(atoms[0], 0, 0, 0),
-                Atom(atoms[0], 0, 0.5, 0.5),
-                Atom(atoms[0], 0.5, 0, 0.5),
-                Atom(atoms[0], 0.5, 0.5, 0),
-                Atom(atoms[1], 0.25, 0.25, 0.25),
-                Atom(atoms[1], 0.75, 0.75, 0.25),
-                Atom(atoms[1], 0.75, 0.25, 0.75),
-                Atom(atoms[1], 0.25, 0.75, 0.75)
+                Atom(atom_types[0], 0, 0, 0),
+                Atom(atom_types[0], 0, 0.5, 0.5),
+                Atom(atom_types[0], 0.5, 0, 0.5),
+                Atom(atom_types[0], 0.5, 0.5, 0),
+                Atom(atom_types[1], 0.25, 0.25, 0.25),
+                Atom(atom_types[1], 0.75, 0.75, 0.25),
+                Atom(atom_types[1], 0.75, 0.25, 0.75),
+                Atom(atom_types[1], 0.25, 0.75, 0.75)
             ]
             self.__radius = math.sqrt(3) * 0.125
             self.__primitive = np.array(

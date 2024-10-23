@@ -83,11 +83,14 @@ class TestGBManipulator(unittest.TestCase):
         self.assertIsNotNone(self.manipulator_tilt.parents[0])
         self.assertIsNone(self.manipulator_tilt.parents[1])
         self.assertTrue(self.manipulator_tilt._GBManipulator__one_parent)
+        self.assertIsNone(manipulator_tilt.parents[0].extra_atom_attributes)
 
     def test_init_with_two_gbmaker_parents(self):
         manipulator = GBManipulator(self.tilt, self.tilt)
         self.assertIsNotNone(manipulator.parents[0])
         self.assertIsNotNone(manipulator.parents[1])
+        self.assertIsNone(manipulator.parents[0].extra_atom_attributes)
+        self.assertIsNone(manipulator.parents[1].extra_atom_attributes)
 
     def test_init_with_one_snapshot(self):
         unit_cell = UnitCell()
@@ -97,6 +100,7 @@ class TestGBManipulator(unittest.TestCase):
             self.file1, unit_cell=unit_cell, gb_thickness=gb_thickness)
         self.assertIsNotNone(manipulator.parents[0])
         self.assertIsNone(manipulator.parents[1])
+        self.assertIsNone(manipulator.parents[0].extra_atom_attributes)
 
     def test_init_with_two_snapshots(self):
         unit_cell = UnitCell()
@@ -106,6 +110,8 @@ class TestGBManipulator(unittest.TestCase):
             self.file1, self.file2, unit_cell=unit_cell, gb_thickness=gb_thickness)
         self.assertIsNotNone(manipulator.parents[0])
         self.assertIsNotNone(manipulator.parents[1])
+        self.assertIsNone(manipulator.parents[0].extra_atom_attributes)
+        self.assertIsNone(manipulator.parents[1].extra_atom_attributes)
 
     def test_init_with_mixed_input(self):
         unit_cell = UnitCell()
@@ -115,11 +121,15 @@ class TestGBManipulator(unittest.TestCase):
             self.tilt, self.file1, unit_cell=unit_cell, gb_thickness=gb_thickness)
         self.assertIsNotNone(manipulator.parents[0])
         self.assertIsNotNone(manipulator.parents[1])
+        self.assertIsNone(manipulator.parents[0].extra_atom_attributes)
+        self.assertIsNone(manipulator.parents[1].extra_atom_attributes)
 
         manipulator2 = GBManipulator(
             self.file1, self.tilt, unit_cell=unit_cell, gb_thickness=gb_thickness)
         self.assertIsNotNone(manipulator2.parents[0])
         self.assertIsNotNone(manipulator2.parents[1])
+        self.assertIsNone(manipulator2.parents[0].extra_atom_attributes)
+        self.assertIsNone(manipulator2.parents[1].extra_atom_attributes)
 
         # test with GBMaker instance and file, without unit cell or gb_thickness
         manipulator3 = GBManipulator(self.tilt, self.file1)
@@ -127,6 +137,51 @@ class TestGBManipulator(unittest.TestCase):
             manipulator3.parents[0].unit_cell, manipulator3.parents[1].unit_cell)
         self.assertEqual(
             manipulator3.parents[0].gb_thickness, manipulator3.parents[1].gb_thickness)
+        self.assertIsNone(manipulator3.parents[0].extra_atom_attributes)
+        self.assertIsNone(manipulator3.parents[1].extra_atom_attributes)
+
+    def test_init_with_extra_attributes(self):
+        unit_cell = UnitCell()
+        unit_cell.init_by_structure(self.structure, self.a0, self.atom_types)
+        gb_thickness = 10
+        extra_attributes = ["stress"]
+        manipulator = GBManipulator(
+            "tests/inputs/test4.txt",
+            unit_cell=unit_cell,
+            gb_thickness=gb_thickness,
+            extra_attributes=extra_attributes
+        )
+        self.assertIsNotNone(manipulator.parents[0].extra_atom_attributes)
+
+        manipulator2 = GBManipulator(
+            "tests/inputs/test4.txt",
+            "tests/inputs/test4.txt",
+            unit_cell=unit_cell,
+            gb_thickness=gb_thickness,
+            extra_attributes=extra_attributes
+        )
+        self.assertIsNotNone(manipulator2.parents[0].extra_atom_attributes)
+        self.assertIsNotNone(manipulator2.parents[1].extra_atom_attributes)
+
+        manipulator3 = GBManipulator(
+            self.GB,
+            "tests/inputs/test4.txt",
+            unit_cell=unit_cell,
+            gb_thickness=gb_thickness,
+            extra_attributes=extra_attributes
+        )
+        self.assertIsNone(manipulator3.parents[0].extra_atom_attributes)
+        self.assertIsNotNone(manipulator3.parents[1].extra_atom_attributes)
+
+        manipulator4 = GBManipulator(
+            "tests/inputs/test4.txt",
+            self.GB,
+            unit_cell=unit_cell,
+            gb_thickness=gb_thickness,
+            extra_attributes=extra_attributes
+        )
+        self.assertIsNotNone(manipulator4.parents[0].extra_atom_attributes)
+        self.assertIsNone(manipulator4.parents[1].extra_atom_attributes)
 
     def test_grain_translation(self):
         new_system = self.manipulator_tilt.translate_right_grain(1.0, 0.5)
@@ -149,24 +204,29 @@ class TestGBManipulator(unittest.TestCase):
         with self.assertRaises(GBManipulatorValueError):
             _ = self.manipulator_tilt.slice_and_merge()
 
+    @pytest.mark.timeout(5)
     def test_remove_atoms(self):
         new_system = self.manipulator_tilt.remove_atoms(gb_fraction=0.10)
         self.assertGreater(len(self.tilt.whole_system), len(new_system))
 
+    @pytest.mark.timeout(5)
     def test_remove_atoms_fraction_error(self):
         with self.assertRaises(GBManipulatorValueError):
             _ = self.manipulator_tilt.remove_atoms(gb_fraction=0.50)
 
+    @pytest.mark.timeout(5)
     def test_remove_atoms_2_parent_warning(self):
         manipulator = GBManipulator(self.tilt, self.tilt, seed=self.seed)
         with self.assertWarns(UserWarning):
             _ = manipulator.remove_atoms(gb_fraction=0.10)
             _ = manipulator.remove_atoms(gb_fraction=0.10)
 
+    @pytest.mark.timeout(5)
     def test_remove_atoms_calculated_fraction_warning(self):
         with self.assertWarns(UserWarning):
             _ = self.manipulator_tilt.remove_atoms(gb_fraction=1e-7)
 
+    @pytest.mark.timeout(5)
     def test_remove_atoms_with_specific_number(self):
         new_system = self.manipulator_tilt.remove_atoms(num_to_remove=1)
         self.assertEqual(len(self.tilt.whole_system)-1, len(new_system))
@@ -179,6 +239,7 @@ class TestGBManipulator(unittest.TestCase):
         new_system = gbm.remove_atoms(num_to_remove=1, keep_ratio=True)
         self.assertEqual(len(GB.whole_system)-3, len(new_system))
 
+    @pytest.mark.timeout(5)
     def test_insert_atoms(self):
         new_system_delaunay = self.manipulator_tilt.insert_atoms(
             fill_fraction=0.10, method='delaunay')
@@ -187,16 +248,19 @@ class TestGBManipulator(unittest.TestCase):
             fill_fraction=0.10, method='grid')
         self.assertGreater(len(new_system_grid), len(self.tilt.whole_system))
 
+    @pytest.mark.timeout(5)
     def test_insert_atoms_fraction_error(self):
         with self.assertRaises(GBManipulatorValueError):
             _ = self.manipulator_tilt.insert_atoms(
                 fill_fraction=0.50, method='delaunay')
 
+    @pytest.mark.timeout(5)
     def test_insert_atoms_2_parent_warning(self):
         manipulator = GBManipulator(self.tilt, self.tilt, seed=self.seed)
         with self.assertWarns(UserWarning):
             _ = manipulator.insert_atoms(fill_fraction=0.10, method='delaunay')
 
+    @pytest.mark.timeout(5)
     def test_insert_atoms_calculated_fraction_warning(self):
         with self.assertWarns(UserWarning):
             _ = self.manipulator_tilt.insert_atoms(
@@ -206,10 +270,12 @@ class TestGBManipulator(unittest.TestCase):
             _ = self.manipulator_tilt.insert_atoms(
                 fill_fraction=1e-7, method='grid')
 
+    @pytest.mark.timeout(5)
     def test_insert_atoms_invalid_method(self):
         with self.assertRaises(GBManipulatorValueError):
             _ = self.manipulator_tilt.insert_atoms(fill_fraction=0.10, method='invalid')
 
+    @pytest.mark.timeout(5)
     def test_insert_atoms_with_specific_number(self):
         new_system_delaunay = self.manipulator_tilt.insert_atoms(
             method='delaunay', num_to_insert=1)

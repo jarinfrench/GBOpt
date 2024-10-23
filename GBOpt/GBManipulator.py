@@ -117,6 +117,7 @@ class Parent:
         gb_thickness: float = 10,
         type_dict: dict = {}, extra_attributes: list = None
     ) -> None:
+        self.__atom_extras = None
         if isinstance(system, GBMaker):
             self.__init_by_gbmaker(system)
         else:
@@ -269,6 +270,7 @@ class Parent:
             formatted correctly, but is missing required data.
         """
         skip_rows = 0
+        extra_dtype = []
         with open(system_file) as f:
             line = f.readline()
             skip_rows += 1
@@ -352,8 +354,13 @@ class Parent:
                     "typelabel")
             col_indices = [required_attribute_indices["typelabel"] if typelabel_in_attrs else required_attribute_indices["type"],
                            required_attribute_indices["x"], required_attribute_indices["y"], required_attribute_indices["z"]]
-            for attr in extra_attributes:
-                col_indices.append(atom_attributes.index(attr))
+            if extra_attributes:
+                for attr in extra_attributes:
+                    try:
+                        col_indices.append(atom_attributes.index(attr))
+                        extra_dtype += [(attr, 'f8')]
+                    except ValueError:
+                        warnings.warn(f"Attribute {attr} not found in dump file.")
 
             def convert_type(value):
                 if typelabel_in_attrs:
@@ -367,115 +374,24 @@ class Parent:
                 max_rows += 1
                 if not line:
                     break
-
-        self.__whole_system = np.loadtxt(system_file, skiprows=skip_rows, max_rows=max_rows, converters={
-            col_indices[0]: convert_type}, usecols=tuple(col_indices), dtype=Atom.atom_dtype)
-        mask = self.__whole_system["x"] < grain_cutoff
-        self.__left_grain = self.__whole_system[mask]
-        self.__right_grain = self.__whole_system[~mask]
-
-    def __init_from_lammps_input(
-        self,
-        system_file: str,
-        unit_cell: UnitCell,
-        gb_thickness: float,
-        type_dict: dict,
-    ) -> None:
-        """
-        Method for initializing the Parent using a LAMMPS input file.
-
-        :param system_file: Filename of the LAMMPS input file.
-        :param unit_cell: Nominal unit cell of the bulk structure.
-        :param gb_thickness: Thickness of the GB region, given in angstroms.
-        :param type_dict: Conversion from type number to type name, optional. Note that
-            if this is not provided and the snapshot does not indicate the atom names,
-            atom names are assumed started from "H".
-        :param file_keywords: List of keywords used to identify different sections of
-            the file.
-        :raises ParentCorruptedFileError: Exception raised if the file is not formatted
-            correctly.
-        :raises ParentFileMissingDataError: Exception raised if the file is otherwise
-            formatted correctly, but is missing required data.
-        """
-        n_atoms = n_types = 0
-        x_dims = y_dims = z_dims = []
-        type_dict = {}
-        skiprows = 0
-
-        with open(system_file) as f:
-            lines = iter(f)
-            # Skip header and blank lines
-            next(lines)
-            next(lines)
-            skiprows += 2
-
-            for line in lines:
-                skiprows += 1
-                line = line.strip()
-
-                if line.startswith("Atoms"):
-                    next(lines)  # Skip the blank line after "Atoms"
-                    skiprows += 1
-                    break
-
-                line_sp = line.split()
-
-                if "atoms" in line:
-                    n_atoms = int(line_sp[0])
-                elif "atom types" in line:
-                    n_types = int(line_sp[0])
-                elif "xlo xhi" in line:
-                    x_dims = [float(line_sp[0]), float(line_sp[1])]
-                elif "ylo yhi" in line:
-                    y_dims = [float(line_sp[0]), float(line_sp[1])]
-                elif "zlo zhi" in line:
-                    z_dims = [float(line_sp[0]), float(line_sp[1])]
-                elif line == "Atom Type Labels":
-                    next(lines)  # Skip the blank line before the data
-                    skiprows += 1
-                    num_labels = 0
-
-                    for label_line in lines:
-                        skiprows += 1
-                        label_line = label_line.strip().split()
-                        if not label_line:
-                            break
-                        type_dict[label_line[1]] = int(label_line[0])
-                        num_labels += 1
-
-                    if num_labels != n_types:
-                        raise ParentCorruptedFileError(
-                            "Number of labels does not equal number of atom types."
-                        )
-
-        def convert_type(value):
-            if not type_dict:
-                return self.__num_to_name[int(value)]
-            else:
-                return value
-        # We now have to make some assumptions about how the data is actually formatted.
-        # Here, we assume the following:
-        #  column 2: atom type (numeric, if "Atom Type Labels" not found previously, else string)
-        #  column 3: x position
-        #  column 4: y position
-        #  column 5: z position
-        self.__box_dims = np.array([x_dims, y_dims, z_dims])
-        self.__x_dim = x_dims[1] - x_dims[0]
-        self.__y_dim = y_dims[1] - y_dims[0]
-        self.__z_dim = z_dims[1] - z_dims[0]
-        # TODO: Need a more robust calculation of where the GB is located. This calculation is duplicated.
-        grain_cutoff = (x_dims[1] - x_dims[0]) / 2 + x_dims[0]
-        self.__whole_system = np.loadtxt(
-            system_file,
-            skiprows=skiprows,
-            max_rows=n_atoms,
-            converters={1: convert_type},
-            usecols=[1, 2, 3, 4],
-            dtype=Atom.atom_dtype
+        all_data_dtypes = [('f0', '<U2')] + \
+            [(f'f{i+1}', '<f8') for i in range(len(col_indices)-1)]
+        all_data = np.genfromtxt(
+            GB_file, skip_header=skip_rows, max_rows=max_rows,
+            converters={col_indices[0]: convert_type},
+            usecols=tuple(col_indices),
+            dtype=all_data_dtypes
         )
-        mask = self.__whole_system["x"] < grain_cutoff
-        self.__left_grain = self.__whole_system[mask]
-        self.__right_grain = self.__whole_system[~mask]
+
+        self.__whole_gb = np.rec.fromarrays(
+            [all_data[i] for i in all_data.dtypes.names[:4]], dtype=Atom.atom_dtype
+        )
+        if extra_attributes:
+            self.__atom_extras = np.rec.fromarrays(
+                [all_data[i] for i in all_data.dtypes.names[4:]], dtype=extra_dtype)
+
+        self.__left_grain = self.__whole_gb[self.__whole_gb['x'] < grain_cutoff]
+        self.__right_grain = self.__whole_gb[self.__whole_gb['x'] >= grain_cutoff]
 
     # Getters
 
@@ -490,6 +406,14 @@ class Parent:
     @property
     def whole_system(self) -> np.ndarray:
         return self.__whole_system
+
+    @property
+    def extra_atom_attributes(self) -> np.ndarray:
+        return self.__atom_extras
+
+    @property
+    def extra_atom_attributes(self) -> np.ndarray:
+        return self.__atom_extras
 
     @property
     def gb_atoms(self) -> np.ndarray:
@@ -822,7 +746,7 @@ class GBManipulator:
             # not attempt to perform those in the case that only one GB is passed in.
             self.__one_parent = True
             self.__set_parents(system1, unit_cell=unit_cell,
-                               gb_thickness=gb_thickness, extra_attributes)
+                               gb_thickness=gb_thickness, extra_attributes=extra_attributes)
         else:
             self.__one_parent = False
             self.__set_parents(system1, system2, unit_cell=unit_cell,
@@ -971,8 +895,8 @@ class GBManipulator:
         if (num_to_remove is not None and
                 (
                     num_to_remove < 1 or num_to_remove > int(0.25 * len(gb_atoms))
-                    )
-                ):
+                )
+            ):
             raise GBManipulatorValueError(
                 "Invalid num_to_remove value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region."
@@ -1331,11 +1255,11 @@ class GBManipulator:
              )
 
         if (num_to_insert is not None and
-                    (
+            (
                         num_to_insert < 1 or
                         num_to_insert > int(0.25 * len(gb_atoms))
                     )
-                ):
+            ):
             raise GBManipulatorValueError(
                 "Invalid num_to_insert value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region.")
