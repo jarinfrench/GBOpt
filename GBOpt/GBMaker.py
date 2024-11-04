@@ -98,9 +98,9 @@ class GBMaker:
         self.__box_dims = self.__calculate_box_dimensions()
 
     # Private class methods
-    def __approximate_matrix_as_int(self, m: np.ndarray, precision: float = 5) -> np.ndarray:
+    def __approximate_rotation_matrix_as_int(self, m: np.ndarray, precision: float = 5) -> np.ndarray:
         """
-        Approximate the matrix in integer format given the original matrix and
+        Approximate a rotation matrix in integer format given the original matrix and
         the desired precision.
 
         :param m: The matrix to approximate
@@ -124,7 +124,8 @@ class GBMaker:
         )
 
         if abs(R0-R_approx_normed) > 0.5:
-            warnings.warn("Approximated matrix error is greater than 0.5 degrees.")
+            warnings.warn(
+                "Approximated rotation matrix error is greater than 0.5 degrees.")
         return approx_m.astype(int)
 
     def __assign_orientations(self, misorientation: np.ndarray) -> None:
@@ -172,8 +173,9 @@ class GBMaker:
         R_left = self.__Rincl
         R_right = np.dot(self.__Rmis, self.__Rincl)
         # # We store the approximate matrices as objects to allow for large numbers
-        R_left_approx = self.__approximate_matrix_as_int(R_left).astype(object)
-        R_right_approx = self.__approximate_matrix_as_int(R_right).astype(object)
+        R_left_approx = self.__approximate_rotation_matrix_as_int(R_left).astype(object)
+        R_right_approx = self.__approximate_rotation_matrix_as_int(
+            R_right).astype(object)
         # The rows of the approximated matrix gives the Miller indices of the directions
         # that are now aligned along the x, y, and z axes. We calculate the interplanar
         # spacings using the usual formula: d = a / sqrt(h**2+k**2+l**2)

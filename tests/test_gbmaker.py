@@ -199,12 +199,12 @@ class TestGBMaker(unittest.TestCase):
         self.assertGreater(self.gbm.box_dims[0][1], 50.0)
 
     # Tests for private methods
-    def test_approximate_matrix_as_int(self):
+    def test_approximate_rotation_matrix_as_int(self):
         rotation_matrix = np.array([[0.70710678, 0.5, 0.5],
                                     [0.70710678, -0.5, -0.5],
                                     [0.0, 0.70710678, -0.70710678]])
 
-        approx_matrix = self.gbm._GBMaker__approximate_matrix_as_int(
+        approx_matrix = self.gbm._GBMaker__approximate_rotation_matrix_as_int(
             rotation_matrix)
 
         expected_matrix = np.array([[141421, 100000, 100000],
@@ -234,7 +234,7 @@ class TestGBMaker(unittest.TestCase):
 
     def test_non_periodic_boundary_warning(self):
         with self.assertWarns(UserWarning):
-            self.gbm._GBMaker__approximate_matrix_as_int(
+            self.gbm._GBMaker__approximate_rotation_matrix_as_int(
                 np.array([[0.123456789, 0.56789123, -0.918273645], [-0.135792468, 0.246813579, 0.1], [0.159283746, -0.2, 0.1]]))
 
     # Additional tests
