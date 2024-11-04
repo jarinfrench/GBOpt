@@ -66,6 +66,14 @@ class TestGBMaker(unittest.TestCase):
         with self.assertRaises(GBMakerValueError):
             self.gbm.a0 = -5.0
 
+    def test_invalid_misorientation_length(self):
+        with self.assertRaises(GBMakerValueError):
+            self.gbm.misorientation = np.array([0.1, 0.2])
+
+    def test_invalid_misorientation_type(self):
+        with self.assertRaises(GBMakerTypeError):
+            self.gbm.misorientation = "invalid"
+
     def test_invalid_structure_type(self):
         with self.assertRaises(GBMakerTypeError):
             self.gbm.structure = 123
@@ -116,7 +124,7 @@ class TestGBMaker(unittest.TestCase):
         atoms = self.gbm.gb
         box_sizes = self.gbm.box_dims
         with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(atoms, box_sizes, temp_file.name)
+            self.gbm.write_lammps(temp_file.name, atoms, box_sizes)
             with open(temp_file.name, 'r') as f:
                 content = f.readlines()
             self.assertGreater(len(content), 0)
@@ -191,30 +199,19 @@ class TestGBMaker(unittest.TestCase):
         self.assertGreater(self.gbm.box_dims[0][1], 50.0)
 
     # Tests for private methods
-    def test_approximate_matrix_as_int(self):
+    def test_approximate_rotation_matrix_as_int(self):
         rotation_matrix = np.array([[0.70710678, 0.5, 0.5],
                                     [0.70710678, -0.5, -0.5],
                                     [0.0, 0.70710678, -0.70710678]])
 
-        approx_matrix = self.gbm._GBMaker__approximate_matrix_as_int(
+        approx_matrix = self.gbm._GBMaker__approximate_rotation_matrix_as_int(
             rotation_matrix)
 
-        expected_matrix = np.array([[27720, 19601, 19601],
-                                    [27720, -19601, -19601],
+        expected_matrix = np.array([[141421, 100000, 100000],
+                                    [141421, -100000, -100000],
                                     [0, 1, -1]])
 
         np.testing.assert_array_equal(approx_matrix, expected_matrix)
-
-    def test_invalid_values_raise_exceptions(self):
-        with self.assertRaises(GBMakerValueError):
-            GBMaker(-1.0, self.structure,
-                    self.gb_thickness, self.misorientation)
-        with self.assertRaises(GBMakerValueError):
-            GBMaker(self.a0, 'invalid_structure',
-                    self.gb_thickness, self.misorientation)
-        with self.assertRaises(GBMakerValueError):
-            GBMaker(self.a0, self.structure,
-                    self.gb_thickness, np.array([0.1, 0.2]))
 
     def test_calculate_periodic_spacing_logic(self):
         with patch.object(GBMaker, '_GBMaker__calculate_periodic_spacing', return_value={'x': 5.0, 'y': 10.0, 'z': 15.0}):
@@ -237,7 +234,7 @@ class TestGBMaker(unittest.TestCase):
 
     def test_non_periodic_boundary_warning(self):
         with self.assertWarns(UserWarning):
-            self.gbm._GBMaker__approximate_matrix_as_int(
+            self.gbm._GBMaker__approximate_rotation_matrix_as_int(
                 np.array([[0.123456789, 0.56789123, -0.918273645], [-0.135792468, 0.246813579, 0.1], [0.159283746, -0.2, 0.1]]))
 
     # Additional tests
@@ -246,7 +243,7 @@ class TestGBMaker(unittest.TestCase):
         atoms = np.array([[1, 0.0, 0.0, 0.0], [2, 1.0, 1.0, 1.0]])
         box_sizes = np.array([[0.0, 10.0], [0.0, 10.0], [0.0, 10.0]])
         with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(atoms, box_sizes, temp_file.name)
+            self.gbm.write_lammps(temp_file.name, atoms, box_sizes)
             with open(temp_file.name, 'r') as f:
                 content = f.readlines()
             self.assertEqual(content[2].strip(), '2 atoms')
