@@ -319,6 +319,10 @@ class Atom:
     def position(self) -> Position:
         return self.__position
 
+    @property
+    def properties(self) -> Dict[str, Any]:
+        return self.__properties
+
     @position.setter
     def position(self, value: Union[Position, Sequence, np.ndarray]) -> None:
         if isinstance(value, Sequence) and not isinstance(value, str):
