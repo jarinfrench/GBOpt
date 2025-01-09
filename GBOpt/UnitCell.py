@@ -22,7 +22,8 @@ class UnitCell:
     Atom positions are given as fractional coordinates. Types start at 1
     """
 
-    __slots__ = ['__unit_cell', '__primitive', '__a0', '__radius', '__reciprocal']
+    __slots__ = ['__unit_cell', '__primitive', '__a0',
+                 '__radius', '__reciprocal', '__ideal_bond_lengths']
 
     # TODO: Basis might be needed for more complicated structures.
     def __init__(self):
@@ -31,6 +32,7 @@ class UnitCell:
         self.__a0 = 1.0
         self.__radius = 0.0
         self.__reciprocal = np.zeros((3, 3))
+        self.__ideal_bond_lengths = {}
 
     def init_by_structure(self, structure: str, a0: float, atoms: Union[str, Tuple[str, ...]]) -> None:
         """
@@ -61,6 +63,9 @@ class UnitCell:
                     [1.0, 1.0, 0.0]
                 ]
             )
+            self.__ideal_bond_lengths = {
+                (1, 1): unit_cell[0].position.distance(unit_cell[1].position)
+            }
         elif structure == 'bcc':
             unit_cell = [
                 Atom(atoms[0], 0.0, 0.0, 0.0),
@@ -74,6 +79,9 @@ class UnitCell:
                     [-1.0, 1.0, 1.0]
                 ]
             )
+            self.__ideal_bond_lengths = {
+                (1, 1): unit_cell[0].position.distance(unit_cell[1].position)
+            }
         elif structure == 'sc':
             unit_cell = [Atom(atoms[0], 0.0, 0.0, 0.0)]
             self.__radius = 0.5
@@ -85,6 +93,7 @@ class UnitCell:
                     [0.0, 0.0, 1.0]
                 ]
             )
+            self.__ideal_bond_lengths = {(1, 1): self.__a0}
         elif structure == 'diamond':
             unit_cell = [
                 Atom(atoms[0], 0, 0, 0),
@@ -104,6 +113,9 @@ class UnitCell:
                     [1.0, 1.0, 0.0]
                 ]
             )
+            self.__ideal_bond_lengths = {
+                (1, 1): unit_cell[0].position.distance(unit_cell[4].position)
+            }
         elif structure == 'fluorite':
             if len(atoms) != 2:
                 raise UnitCellValueError(
@@ -130,6 +142,11 @@ class UnitCell:
                     [1.0, 1.0, 0.0]
                 ]
             )
+            self.__ideal_bond_lengths = {
+                (1, 1): unit_cell[0].position.distance(unit_cell[1].position),
+                (1, 2): unit_cell[0].position.distance(unit_cell[4].position),
+                (2, 2): unit_cell[4].position.distance(unit_cell[5].position)
+            }
         elif structure == 'rocksalt':
             if len(atoms) != 2:
                 raise UnitCellValueError(
@@ -153,6 +170,11 @@ class UnitCell:
                     [1.0, 1.0, 0.0]
                 ]
             )
+            self.__ideal_bond_lengths = {
+                (1, 1): unit_cell[0].position.distance(unit_cell[1].position),
+                (1, 2): unit_cell[0].position.distance(unit_cell[4].position),
+                (2, 2): unit_cell[4].position.distance(unit_cell[5].position)
+            }
         elif structure == 'zincblende':
             if len(atoms) != 2:
                 raise UnitCellValueError(
@@ -175,6 +197,11 @@ class UnitCell:
                     [1.0, 1.0, 0.0]
                 ]
             )
+            self.__ideal_bond_lengths = {
+                (1, 1): unit_cell[0].position.distance(unit_cell[1].position),
+                (1, 2): unit_cell[0].position.distance(unit_cell[4].position),
+                (2, 2): unit_cell[4].position.distance(unit_cell[6].position)
+            }
         else:
             raise NotImplementedError(
                 f"Lattice structure {structure} not recognized/implemented")
@@ -194,10 +221,13 @@ class UnitCell:
                 for i in range(len(self.__primitive))
             ]
         ) / vol
+        self.__ideal_bond_lengths = {
+            key: value * self.__a0 for key, value in self.__ideal_bond_lengths.items()
+        }
 
     def init_by_custom(self, unit_cell: np.ndarray,
                        unit_cell_types: str | Sequence[str], a0: float,
-                       reciprocal: np.ndarray) -> None:
+                       reciprocal: np.ndarray, ideal_bond_lengths: dict) -> None:
         """
         Initialize the UnitCell with a custom-built lattice.
 
@@ -210,6 +240,8 @@ class UnitCell:
         :param a0: The lattice parameter in Angstroms.
         :param reciprocal: The reciprocal lattice vectors of the lattice. Requires a
             (3,3) shape.
+        :param ideal_bond_lengths: The ideal bond lengths of the system. One bond length
+            for each unique pair of atoms is needed.
         :raises UnitCellValueError: Exception raised when the reciprocal shape is not
             (3,3).
         """
@@ -231,6 +263,8 @@ class UnitCell:
                 "Incorrect shape for reciprocal vectors. Must be (3,3)")
         self.__reciprocal = reciprocal
 
+        self.__ideal_bond_lengths = ideal_bond_lengths
+
     def positions(self) -> np.ndarray:
         """Returns the positions of the atoms in the UnitCell."""
         return self.__a0 * np.vstack([a.position.asarray() for a in self.__unit_cell])
@@ -243,6 +277,15 @@ class UnitCell:
             return np.hstack([name_int_dict[name] for name in names], dtype=int)
         else:
             return np.hstack([a.name for a in self.__unit_cell])
+
+    def types(self) -> np.ndarray:
+        """
+        Returns an array assigning a 'type' number to each unique atom type.
+        """
+        names = np.array([a['name'] for a in self.__unit_cell])
+        names_dict = {name: idx + 1 for idx, name in enumerate(set(names))}
+        converted_names = np.array([names_dict[name] for name in names])
+        return converted_names
 
     @property
     def reciprocal(self) -> np.ndarray:
@@ -260,6 +303,9 @@ class UnitCell:
             raise UnitCellValueError("Invalid value for a0. Must be > 0.")
         self.__primitive /= self.__a0 / 2.0
         self.__radius /= self.__a0
+        self.__ideal_bond_lengths = {
+            key: value / self.__a0 for key, value in self.__ideal_bond_lengths.items()
+        }
         self.__a0 = value
         self.__primitive *= self.__a0 / 2.0
         self.__radius *= self.__a0
@@ -274,6 +320,9 @@ class UnitCell:
                 for i in range(len(self.__primitive))
             ]
         ) / vol
+        self.__ideal_bond_lengths = {
+            key: value * self.__a0 for key, value in self.__ideal_bond_lengths.items()
+        }
 
     @property
     def radius(self) -> float:
@@ -297,6 +346,11 @@ class UnitCell:
             [tuple(atom['name', 'x', 'y', 'z']) for atom in self.__unit_cell],
             dtype=Atom.atom_dtype
         )
+
+    @property
+    def ideal_bond_lengths(self) -> dict:
+        """Returns the ideal bond lengths for the defined UnitCell."""
+        return self.__ideal_bond_lengths
 
     def __repr__(self):
         structure_info = f"UnitCell with {len(self.__unit_cell)} " + \

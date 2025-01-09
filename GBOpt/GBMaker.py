@@ -96,6 +96,7 @@ class GBMaker:
 
         self.__radius = a0 * self.__unit_cell.radius  # atom radius
         self.__generate_gb()
+        self.__set_gb_region()
         self.__box_dims = self.__calculate_box_dimensions()
 
     # Private class methods
@@ -273,6 +274,18 @@ class GBMaker:
         return self.__get_points_inside_box(
             atoms,
             [self.__x_dim, 0, 0, 2*self.__x_dim, self.__y_dim, self.__z_dim])
+
+    def __set_gb_region(self):
+        """
+        Identifies the atoms in the GB region based on the gb thickness.
+        """
+        left_x_max = max(self.__left_grain['x'])
+        right_x_min = min(self.__right_grain['x'])
+        left_cut = left_x_max - self.__gb_thickness / 2.0
+        right_cut = right_x_min + self.__gb_thickness / 2.0
+        left_gb = self.__left_grain[self.__left_grain['x'] > left_cut]
+        right_gb = self.__right_grain[self.__right_grain['x'] < right_cut]
+        self.__gb_region = np.hstack((left_gb, right_gb))
 
     def __get_points_inside_box(self, atoms: np.ndarray, box_dim: np.ndarray) -> np.ndarray:
         """
@@ -497,9 +510,9 @@ class GBMaker:
         return self.__gb_thickness
 
     @gb_thickness.setter
-    def gb_thickness(self, value: float):
+    def gb_thickness(self, value: Number):
         self.__gb_thickness = self.__validate(
-            value, float, "gb_thickness", positive=True)
+            value, Number, "gb_thickness", positive=True)
         self.__box_dims = self.__calculate_box_dimensions()
 
     @property

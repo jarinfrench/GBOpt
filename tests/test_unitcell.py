@@ -45,6 +45,8 @@ class TestUnitCell(unittest.TestCase):
                 )
             )
         )
+        self.assertTrue(list(cell.ideal_bond_lengths.keys()) == [(1, 1)])
+        self.assertTrue(math.isclose(cell.ideal_bond_lengths[(1, 1)], 1 / np.sqrt(2)))
 
     def test_bcc_initialization(self):
         cell = UnitCell()
@@ -80,6 +82,8 @@ class TestUnitCell(unittest.TestCase):
                 )
             )
         )
+        self.assertTrue(list(cell.ideal_bond_lengths.keys()) == [(1, 1)])
+        self.assertTrue(math.isclose(cell.ideal_bond_lengths[(1, 1)], np.sqrt(3) / 2))
 
     def test_sc_initialization(self):
         cell = UnitCell()
@@ -105,6 +109,8 @@ class TestUnitCell(unittest.TestCase):
                 )
             )
         )
+        self.assertTrue(list(cell.ideal_bond_lengths.keys()) == [(1, 1)])
+        self.assertTrue(math.isclose(cell.ideal_bond_lengths[(1, 1)], 1))
 
     def test_diamond_initialization(self):
         cell = UnitCell()
@@ -146,6 +152,8 @@ class TestUnitCell(unittest.TestCase):
                 )
             )
         )
+        self.assertTrue(list(cell.ideal_bond_lengths.keys()) == [(1, 1)])
+        self.assertTrue(math.isclose(cell.ideal_bond_lengths[(1, 1)], np.sqrt(3) / 4))
 
     def test_fluorite_initialization(self):
         cell = UnitCell()
@@ -195,6 +203,14 @@ class TestUnitCell(unittest.TestCase):
                 )
             )
         )
+        ideal_fluorite_bonds = {
+            (1, 1): 1 / np.sqrt(2),
+            (1, 2): np.sqrt(3) / 4,
+            (2, 2): 0.5
+        }
+        self.assertTrue(cell.ideal_bond_lengths.keys() == ideal_fluorite_bonds.keys())
+        self.assertTrue(all([math.isclose(cell.ideal_bond_lengths[i],
+                        ideal_fluorite_bonds[i]) for i in ideal_fluorite_bonds.keys()]))
 
     def test_rocksalt_initialization(self):
         cell = UnitCell()
@@ -240,6 +256,14 @@ class TestUnitCell(unittest.TestCase):
                 )
             )
         )
+        ideal_rocksalt_bonds = {
+            (1, 1): 1 / np.sqrt(2),
+            (1, 2): 0.5,
+            (2, 2): 1 / np.sqrt(2)
+        }
+        self.assertTrue(cell.ideal_bond_lengths.keys() == ideal_rocksalt_bonds.keys())
+        self.assertTrue(all([math.isclose(cell.ideal_bond_lengths[i],
+                        ideal_rocksalt_bonds[i]) for i in ideal_rocksalt_bonds.keys()]))
 
     def test_zincblende_initialization(self):
         cell = UnitCell()
@@ -285,22 +309,37 @@ class TestUnitCell(unittest.TestCase):
                 )
             )
         )
+        ideal_zincblende_bonds = {
+            (1, 1): 1 / np.sqrt(2),
+            (1, 2): np.sqrt(3) / 4,
+            (2, 2): 1 / np.sqrt(2)
+        }
+        self.assertTrue(cell.ideal_bond_lengths.keys() == ideal_zincblende_bonds.keys())
+        self.assertTrue(all([math.isclose(cell.ideal_bond_lengths[i],
+                        ideal_zincblende_bonds[i]) for i in ideal_zincblende_bonds.keys()]))
 
     def test_custom_initialization(self):
         cell = UnitCell()
         custom_unit_cell = np.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
         custom_reciprocal = np.array([[1.0, 0.0, 0.0],
                                       [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        custom_ideal_bonds = {
+            (1, 1): 1,
+            (1, 2): 1,
+            (2, 2): 1
+        }
         with self.assertRaises(UnitCellValueError):
             cell.init_by_custom(unit_cell=custom_unit_cell,
                                 unit_cell_types='H',
                                 a0=1.0,
-                                reciprocal=custom_reciprocal
+                                reciprocal=custom_reciprocal,
+                                ideal_bond_lengths=custom_ideal_bonds
                                 )
         cell.init_by_custom(unit_cell=custom_unit_cell,
                             unit_cell_types=['H', 'C'],
                             a0=1.0,
-                            reciprocal=custom_reciprocal
+                            reciprocal=custom_reciprocal,
+                            ideal_bond_lengths=custom_ideal_bonds
                             )
         self.assertEqual(cell.a0, 1.0)
         self.assertEqual(len(cell.unit_cell), 2)
@@ -325,6 +364,9 @@ class TestUnitCell(unittest.TestCase):
                 )
             )
         )
+        self.assertTrue(cell.ideal_bond_lengths.keys() == custom_ideal_bonds.keys())
+        self.assertTrue(all([math.isclose(cell.ideal_bond_lengths[i],
+                        custom_ideal_bonds[i]) for i in custom_ideal_bonds.keys()]))
 
     def test_not_implemented_structure(self):
         cell = UnitCell()
@@ -344,11 +386,17 @@ class TestUnitCell(unittest.TestCase):
         cell = UnitCell()
         custom_unit_cell = np.array([[0.1, 0.2, 0.3]])
         custom_reciprocal = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        custom_ideal_bonds = {
+            (1, 1): 1,
+            (1, 2): 1,
+            (2, 2): 1
+        }
         with self.assertRaises(UnitCellValueError):
             cell.init_by_custom(unit_cell=custom_unit_cell,
                                 unit_cell_types='H',
                                 a0=1.0,
-                                reciprocal=custom_reciprocal
+                                reciprocal=custom_reciprocal,
+                                ideal_bond_lengths=custom_ideal_bonds
                                 )
 
     def test_lattice_parameter(self):
@@ -376,11 +424,17 @@ class TestUnitCell(unittest.TestCase):
             "UnitCell with 1 atom\nLattice parameter (a0): 1.000 Å\nRadius: 0.500 Å\n"
             "Atoms: ['H': 0.000, 0.000, 0.000]\nReciprocal lattice:\n[[1. 0. 0.]\n [0. 1. 0.]\n [0. 0. 1.]]"
         )
-
+        custom_ideal_bonds = {
+            (1, 1): 1,
+            (1, 2): 1,
+            (2, 2): 1
+        }
         cell.init_by_custom(unit_cell=[[0, 0, 0]],
                             unit_cell_types='H',
                             a0=1.0,
-                            reciprocal=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+                            reciprocal=[[1.0, 0.0, 0.0], [
+                                0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                            ideal_bond_lengths=custom_ideal_bonds)
         self.assertEqual(
             repr(cell),
             "UnitCell with 1 atom\nLattice parameter (a0): 1.000 Å\nRadius: 0.500 Å\n"
