@@ -391,6 +391,18 @@ class GBMaker:
         right_gb = self.__right_grain[self.__right_grain['x'] < right_cut]
         self.__gb_region = np.hstack((left_gb, right_gb))
 
+    def __set_gb_region(self):
+        """
+        Identifies the atoms in the GB region based on the gb thickness.
+        """
+        left_x_max = max(self.__left_grain['x'])
+        right_x_min = min(self.__right_grain['x'])
+        left_cut = left_x_max - self.__gb_thickness / 2.0
+        right_cut = right_x_min + self.__gb_thickness / 2.0
+        left_gb = self.__left_grain[self.__left_grain['x'] > left_cut]
+        right_gb = self.__right_grain[self.__right_grain['x'] < right_cut]
+        self.__gb_region = np.hstack((left_gb, right_gb))
+
     def __get_points_inside_box(self, atoms: np.ndarray, box_dim: np.ndarray) -> np.ndarray:
         """
         Selects the lattice points that are inside the given box dimensions.
