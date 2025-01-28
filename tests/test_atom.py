@@ -101,15 +101,19 @@ class TestAtom(unittest.TestCase):
         atoms['y'] = np.random.default_rng().random((100,))
         atoms['z'] = np.random.default_rng().random((100,))
         atoms['name'] = np.array(['Cu'] * len(atoms))
-        converted_atoms = Atom.asAtom(atoms)
+        converted_atoms = Atom.as_Atomlist(atoms)
         self.assertTrue(all([isinstance(atom, Atom) for atom in converted_atoms]))
         self.assertFalse(all([isinstance(atom, Atom) for atom in atoms]))
 
-        converted_atoms2 = Atom.asarray(atoms)
+        converted_atoms2 = Atom.as_array(atoms)
         positions = np.vstack((atoms['x'], atoms['y'], atoms['z'])).T
         self.assertEqual(converted_atoms2.shape, (100, 4))
         np.testing.assert_array_almost_equal(
             converted_atoms2[:, 1:], positions)
+
+        converted_atoms3 = Atom.as_recarray(positions, atoms['name'])
+        self.assertTrue(converted_atoms3.dtype == Atom.atom_dtype)
+        self.assertTrue(all([i == j] for i, j in zip(atoms, converted_atoms3)))
 
     def test_setters(self):
         atom = Atom('H', 0.0, 0.0, 0.0)

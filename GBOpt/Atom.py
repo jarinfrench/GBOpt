@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 from numbers import Number
-from typing import Any, Dict, Iterator, Tuple, Union
+from typing import Any, Dict, Iterator, List, Tuple, Union
 
 import numpy as np
 
@@ -153,7 +153,17 @@ class Atom:
         self.__valence_electrons_set_by_user = False
 
     @staticmethod
-    def asAtom(atoms: np.ndarray) -> list:
+    def as_Atomlist(atoms: np.ndarray) -> List['Atom']:
+        """
+        Convert the given structured array (of type Atom.atom_dtype) to a list of Atoms.
+
+        :raises AtomTypeError: Error when the array to convert has an incorrect dtype.
+
+        :returns List['Atom']: A list containing len(atoms) Atom objects.
+        """
+        if not atoms.dtype == Atom.atom_dtype:
+            raise AtomTypeError(f"Cannot convert array with dtype {atoms.dtype}")
+
         converted = [None] * len(atoms)
         for i, atom in enumerate(atoms):
             converted[i] = Atom(*atom)
@@ -161,13 +171,61 @@ class Atom:
         return converted
 
     @staticmethod
-    def asarray(atoms: np.ndarray) -> np.ndarray:
+    def as_array(atoms: np.ndarray) -> np.ndarray:
+        """
+        Convert the given structured array (of type Atom.atom_dtype) to an unstructured
+        array.
+
+        :raises AtomTypeError: Error when the array to convert has an incorrect dtype.
+
+        :returns np.array: An unstructured np array containing the names (as int) and positions.
+        """
+        if not atoms.dtype == Atom.atom_dtype:
+            raise AtomTypeError(f"Cannot convert array with dtype {atoms.dtype}")
+
         converted = np.empty((len(atoms), 4))
         names = atoms['name']
         names_dict = {name: idx + 1 for idx, name in enumerate(set(names))}
         converted_names = np.array([names_dict[name] for name in names])
         positions = np.vstack((atoms['x'], atoms['y'], atoms['z'])).T
         converted = np.hstack((converted_names[:, np.newaxis], positions))
+
+        return converted
+
+    @staticmethod
+    def as_recarray(atoms: np.ndarray, names: Union[str, Sequence] = 'H') -> np.ndarray:
+        """
+        Convert the given nx3 position array (atoms) and the name(s) to the Atom dtype
+        defined in Atom.atom_dtype.
+
+        :param atoms: The array of positions to convert.
+        :param names: The string or array of strings containing the name or names of
+            each atom in the array. If not given, defaults to assigning 'H' to every
+            atom.
+
+        :raises AtomValueError: Error when the length of names is not the same as the
+            length of atoms, or when the atoms array does not have the correct shape.
+        :raises AtomTypeError: Error when 'atoms' has an incorrect type.
+
+        :returns np.ndarray: A structured array containing the atom name and position.
+        """
+        converted = np.zeros(len(atoms), dtype=Atom.atom_dtype)
+        if isinstance(names, str):
+            names = np.array([names] * len(atoms))
+        elif not isinstance(names, np.ndarray):
+            names = np.array(names)
+        if not isinstance(atoms, np.ndarray):
+            raise AtomTypeError("atoms must be a np.array data type.")
+        if atoms.ndim != 2 or atoms.shape[1] != 3:
+            raise AtomValueError("atoms must have a shape (n, 3).")
+        if len(names) != len(atoms):
+            raise AtomValueError(
+                f"Cannot convert {names} to array of length {len(atoms)}.")
+
+        converted['name'] = names
+        converted['x'] = atoms[:, 0]
+        converted['y'] = atoms[:, 1]
+        converted['z'] = atoms[:, 2]
 
         return converted
 
