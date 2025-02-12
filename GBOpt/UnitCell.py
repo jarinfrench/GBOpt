@@ -178,6 +178,8 @@ class UnitCell:
         else:
             raise NotImplementedError(
                 f"Lattice structure {structure} not recognized/implemented")
+        for i in range(len(unit_cell)):
+            unit_cell[i]['position'] *= a0
         self.__unit_cell = unit_cell
         self.__radius *= self.__a0
         self.__primitive *= self.__a0 / 2.0
