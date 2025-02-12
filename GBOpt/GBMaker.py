@@ -96,10 +96,11 @@ class GBMaker:
 
         self.__radius = a0 * self.__unit_cell.radius  # atom radius
         self.__generate_gb()
+        self.__set_gb_region()
         self.__box_dims = self.__calculate_box_dimensions()
 
     # Private class methods
-    def __approximate_rotation_matrix_as_int(self, m: np.ndarray, precision: float = 5) -> np.ndarray:
+    def __approximate_rotation_matrix_as_int(self, m: np.ndarray, precision: int = 5) -> np.ndarray:
         """
         Approximate a rotation matrix in integer format given the original matrix and
         the desired precision.
@@ -274,6 +275,18 @@ class GBMaker:
             atoms,
             [self.__x_dim, 0, 0, 2*self.__x_dim, self.__y_dim, self.__z_dim])
 
+    def __set_gb_region(self):
+        """
+        Identifies the atoms in the GB region based on the gb thickness.
+        """
+        left_x_max = max(self.__left_grain['x'])
+        right_x_min = min(self.__right_grain['x'])
+        left_cut = left_x_max - self.__gb_thickness / 2.0
+        right_cut = right_x_min + self.__gb_thickness / 2.0
+        left_gb = self.__left_grain[self.__left_grain['x'] > left_cut]
+        right_gb = self.__right_grain[self.__right_grain['x'] < right_cut]
+        self.__gb_region = np.hstack((left_gb, right_gb))
+
     def __get_points_inside_box(self, atoms: np.ndarray, box_dim: np.ndarray) -> np.ndarray:
         """
         Selects the lattice points that are inside the given box dimensions.
@@ -419,7 +432,8 @@ class GBMaker:
         atoms: np.ndarray = None,
         box_sizes: np.ndarray = None,
         *,
-        type_as_int: bool = False
+        type_as_int: bool = False,
+        precision: int = 6
     ) -> None:
         """
         Writes the atom positions with the given box dimensions to a LAMMPS input file.
@@ -455,12 +469,12 @@ class GBMaker:
             fdata.write('{} atoms\n'.format(len(atoms)))
             fdata.write('{} atom types\n'.format(len(set(atoms['name']))))
             # Specify box dimensions
-            fdata.write('{} {} xlo xhi\n'.format(
-                box_sizes[0][0], box_sizes[0][1]))
-            fdata.write('{} {} ylo yhi\n'.format(
-                box_sizes[1][0], box_sizes[1][1]))
-            fdata.write('{} {} zlo zhi\n'.format(
-                box_sizes[2][0], box_sizes[2][1]))
+            fdata.write(
+                f'{box_sizes[0][0]:.{precision}f} {box_sizes[0][1]:.{precision}f} xlo xhi\n')
+            fdata.write(
+                f'{box_sizes[1][0]:.{precision}f} {box_sizes[1][1]:.{precision}f} ylo yhi\n')
+            fdata.write(
+                f'{box_sizes[2][0]:.{precision}f} {box_sizes[2][1]:.{precision}f} zlo zhi\n')
 
             if not type_as_int:
                 fdata.write('\nAtom Type Labels\n\n')
@@ -473,11 +487,12 @@ class GBMaker:
             # Write each position.
             if type_as_int:
                 for i, (name, *pos) in enumerate(atoms):
-                    fdata.write('{} {:n} {} {} {}\n'.format(
-                        i+1, name_to_int[name], *pos))
+                    fdata.write(
+                        f'{i+1} {name_to_int[name]:n} {pos[0]:.{precision}f} {pos[1]:.{precision}f} {pos[2]:.{precision}f}\n')
             else:
                 for i, (name, *pos) in enumerate(atoms):
-                    fdata.write('{} {} {} {} {}\n'.format(i+1, name, *pos))
+                    fdata.write(
+                        f'{i+1} {name} {pos[0]:.{precision}f} {pos[1]:.{precision}f} {pos[2]:.{precision}f}\n')
 
     # Properties with getters and setters. Automatic updates for related parameters are
     # automatically taken care of.
@@ -497,9 +512,9 @@ class GBMaker:
         return self.__gb_thickness
 
     @gb_thickness.setter
-    def gb_thickness(self, value: float):
+    def gb_thickness(self, value: Number):
         self.__gb_thickness = self.__validate(
-            value, float, "gb_thickness", positive=True)
+            value, Number, "gb_thickness", positive=True)
         self.__box_dims = self.__calculate_box_dimensions()
 
     @property

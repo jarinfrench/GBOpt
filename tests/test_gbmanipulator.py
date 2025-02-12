@@ -26,10 +26,26 @@ from GBOpt.GBManipulator import (
 from GBOpt.UnitCell import UnitCell
 
 
+def structured_array_equal(array1, array2):
+    if array1.dtype != array2.dtype:
+        return False
+
+    for field in array1.dtype.names:
+        if np.issubdtype(array1[field].dtype, np.number):
+            if not np.allclose(array1[field], array2[field]):
+                return False
+        else:
+            if not np.array_equal(array1[field], array2[field]):
+                return False
+
+    return True
+
+
 class TestGBManipulator(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         theta = math.radians(36.869898)
+        cls.seed = 100
         cls.tilt = GBMaker(
             a0=1.0,
             structure='fcc',
@@ -48,6 +64,8 @@ class TestGBManipulator(unittest.TestCase):
             interaction_distance=1,
             repeat_factor=2
         )
+        cls.manipulator_tilt = GBManipulator(cls.tilt, seed=cls.seed)
+        cls.manipulator_twist = GBManipulator(cls.twist, seed=cls.seed)
 
     def setUp(self):
         self.a0 = 1.0
@@ -57,13 +75,11 @@ class TestGBManipulator(unittest.TestCase):
         self.misorientation = [math.radians(36.869898), 0, 0, 0, 0]
         self.file1 = "tests/inputs/test1.txt"
         self.file2 = "tests/inputs/test2.txt"
-        self.seed = 100
 
     def test_init_with_one_gbmaker_parent(self):
-        manipulator = GBManipulator(self.tilt)
-        self.assertIsNotNone(manipulator.parents[0])
-        self.assertIsNone(manipulator.parents[1])
-        self.assertTrue(manipulator._GBManipulator__one_parent)
+        self.assertIsNotNone(self.manipulator_tilt.parents[0])
+        self.assertIsNone(self.manipulator_tilt.parents[1])
+        self.assertTrue(self.manipulator_tilt._GBManipulator__one_parent)
 
     def test_init_with_two_gbmaker_parents(self):
         manipulator = GBManipulator(self.tilt, self.tilt)
@@ -110,8 +126,7 @@ class TestGBManipulator(unittest.TestCase):
             manipulator3.parents[0].gb_thickness, manipulator3.parents[1].gb_thickness)
 
     def test_grain_translation(self):
-        manipulator = GBManipulator(self.tilt)
-        new_system = manipulator.translate_right_grain(1.0, 0.5)
+        new_system = self.manipulator_tilt.translate_right_grain(1.0, 0.5)
         self.assertTrue(np.allclose(self.tilt.whole_system['x'], new_system['x']))
         self.assertTrue(not np.allclose(self.tilt.whole_system['y'], new_system['y']))
         self.assertTrue(not np.allclose(self.tilt.whole_system['z'], new_system['z']))
@@ -128,51 +143,48 @@ class TestGBManipulator(unittest.TestCase):
         self.assertFalse(all(self.tilt.whole_system == new_system))
 
     def test_slice_and_merge_error(self):
-        manipulator = GBManipulator(self.tilt, seed=self.seed)
         with self.assertRaises(GBManipulatorValueError):
-            _ = manipulator.slice_and_merge()
+            _ = self.manipulator_tilt.slice_and_merge()
 
     @pytest.mark.slow
     def test_remove_atoms(self):
-        manipulator = GBManipulator(self.tilt, seed=self.seed)
-        new_system = manipulator.remove_atoms(gb_fraction=0.10)
+        new_system = self.manipulator_tilt.remove_atoms(gb_fraction=0.10)
         self.assertGreater(len(self.tilt.whole_system), len(new_system))
 
     @pytest.mark.slow
     def test_remove_atoms_fraction_error(self):
-        manipulator = GBManipulator(self.tilt, seed=self.seed)
         with self.assertRaises(GBManipulatorValueError):
-            _ = manipulator.remove_atoms(gb_fraction=0.50)
+            _ = self.manipulator_tilt.remove_atoms(gb_fraction=0.50)
 
     @pytest.mark.slow
     def test_remove_atoms_2_parent_warning(self):
         manipulator = GBManipulator(self.tilt, self.tilt, seed=self.seed)
         with self.assertWarns(UserWarning):
             _ = manipulator.remove_atoms(gb_fraction=0.10)
+            _ = manipulator.remove_atoms(gb_fraction=0.10)
 
     @pytest.mark.slow
     def test_remove_atoms_calculated_fraction_warning(self):
-        manipulator = GBManipulator(self.tilt, seed=self.seed)
         with self.assertWarns(UserWarning):
-            _ = manipulator.remove_atoms(gb_fraction=0.0000001)
+            _ = self.manipulator_tilt.remove_atoms(gb_fraction=1e-7)
 
     @pytest.mark.slow
     def test_remove_atoms_with_specific_number(self):
-        manipulator = GBManipulator(self.tilt, seed=self.seed)
-        new_system = manipulator.remove_atoms(num_to_remove=1)
+        new_system = self.manipulator_tilt.remove_atoms(num_to_remove=1)
         self.assertEqual(len(self.tilt.whole_system)-1, len(new_system))
 
     def test_insert_atoms(self):
-        manipulator = GBManipulator(self.tilt, seed=self.seed)
-        new_system1 = manipulator.insert_atoms(fill_fraction=0.10, method='delaunay')
-        self.assertGreater(len(new_system1), len(self.tilt.whole_system))
-        new_system2 = manipulator.insert_atoms(fill_fraction=0.10, method='grid')
-        self.assertGreater(len(new_system2), len(self.tilt.whole_system))
+        new_system_delaunay = self.manipulator_tilt.insert_atoms(
+            fill_fraction=0.10, method='delaunay')
+        self.assertGreater(len(new_system_delaunay), len(self.tilt.whole_system))
+        new_system_grid = self.manipulator_tilt.insert_atoms(
+            fill_fraction=0.10, method='grid')
+        self.assertGreater(len(new_system_grid), len(self.tilt.whole_system))
 
     def test_insert_atoms_fraction_error(self):
-        manipulator = GBManipulator(self.tilt, seed=self.seed)
         with self.assertRaises(GBManipulatorValueError):
-            _ = manipulator.insert_atoms(fill_fraction=0.50, method='delaunay')
+            _ = self.manipulator_tilt.insert_atoms(
+                fill_fraction=0.50, method='delaunay')
 
     def test_insert_atoms_2_parent_warning(self):
         manipulator = GBManipulator(self.tilt, self.tilt, seed=self.seed)
@@ -180,29 +192,102 @@ class TestGBManipulator(unittest.TestCase):
             _ = manipulator.insert_atoms(fill_fraction=0.10, method='delaunay')
 
     def test_insert_atoms_calculated_fraction_warning(self):
-        manipulator = GBManipulator(self.tilt, seed=self.seed)
         with self.assertWarns(UserWarning):
-            _ = manipulator.insert_atoms(fill_fraction=0.0000001, method='delaunay')
+            _ = self.manipulator_tilt.insert_atoms(
+                fill_fraction=1e-7, method='delaunay')
 
         with self.assertWarns(UserWarning):
-            _ = manipulator.insert_atoms(fill_fraction=0.0000001, method='grid')
+            _ = self.manipulator_tilt.insert_atoms(
+                fill_fraction=1e-7, method='grid')
 
     def test_insert_atoms_invalid_method(self):
-        manipulator = GBManipulator(self.tilt, seed=self.seed)
         with self.assertRaises(GBManipulatorValueError):
-            _ = manipulator.insert_atoms(fill_fraction=0.10, method='invalid')
+            _ = self.manipulator_tilt.insert_atoms(fill_fraction=0.10, method='invalid')
 
     def test_insert_atoms_with_specific_number(self):
-        manipulator = GBManipulator(self.tilt, seed=self.seed)
-        new_system1 = manipulator.insert_atoms(method='delaunay', num_to_insert=1)
-        self.assertEqual(len(self.tilt.whole_system) + 1, len(new_system1))
-        new_system2 = manipulator.insert_atoms(method='delaunay', num_to_insert=1)
-        self.assertEqual(len(self.tilt.whole_system) + 1, len(new_system2))
+        new_system_delaunay = self.manipulator_tilt.insert_atoms(
+            method='delaunay', num_to_insert=1)
+        self.assertEqual(len(self.tilt.whole_system) + 1, len(new_system_delaunay))
+        new_system_grid = self.manipulator_tilt.insert_atoms(
+            method='grid', num_to_insert=1)
+        self.assertEqual(len(self.tilt.whole_system) + 1, len(new_system_grid))
 
-    def test_displace_along_soft_modes(self):
-        manipulator = GBManipulator(self.tilt, seed=self.seed)
-        with self.assertRaises(NotImplementedError):
-            _ = manipulator.displace_along_soft_modes()
+    @pytest.mark.slow
+    def test_displace_along_soft_modes_base(self):
+        # test the base case
+        child = self.manipulator_tilt.displace_along_soft_modes()
+        self.assertEqual(len(child), 1)
+        self.assertFalse(structured_array_equal(
+            child[0], self.manipulator_tilt.parents[0].whole_system))
+
+    @pytest.mark.slow
+    def test_displace_along_soft_modes_with_displacement_threshold(self):
+        # test the case with a displacement threshold specified
+        child = self.manipulator_tilt.displace_along_soft_modes(1.0)
+        self.assertEqual(len(child), 1)
+        self.assertFalse(structured_array_equal(
+            child[0], self.manipulator_tilt.parents[0].whole_system))
+
+    @pytest.mark.slow
+    def test_displace_along_soft_modes_diff_mesh(self):
+        # test differing mesh size
+        child = self.manipulator_tilt.displace_along_soft_modes(mesh_size=2)
+        self.assertEqual(len(child), 1)
+        self.assertFalse(structured_array_equal(
+            child[0], self.manipulator_tilt.parents[0].whole_system))
+
+    @pytest.mark.slow
+    def test_displace_along_soft_modes_num_q_vecs(self):
+        # test number of q vectors
+        child = self.manipulator_tilt.displace_along_soft_modes(num_q=20)
+        self.assertEqual(len(child), 1)
+        self.assertFalse(structured_array_equal(
+            child[0], self.manipulator_tilt.parents[0].whole_system))
+
+    @pytest.mark.slow
+    def test_displace_along_soft_modes_num_child_structures(self):
+        # test number of child structures
+        children = self.manipulator_tilt.displace_along_soft_modes(num_children=2)
+        self.assertEqual(len(children), 2)
+        self.assertFalse(structured_array_equal(
+            children[0], self.manipulator_tilt.parents[0].whole_system))
+        self.assertFalse(structured_array_equal(
+            children[1], self.manipulator_tilt.parents[0].whole_system))
+        self.assertFalse(structured_array_equal(children[0], children[1]))
+
+    @pytest.mark.slow
+    def test_displace_along_soft_modes_simple_case(self):
+        # While we end up using the indicated file for the actual atomic configuration,
+        # that configuration was developed using this set of parameters
+        GB = GBMaker(
+            3.54, 'fcc', 5.0, np.array([0, 0, 0, 0, 0]), atom_types='Cu',
+            repeat_factor=6, x_dim=10, vacuum=10, interaction_distance=5
+        )
+        manipulator = GBManipulator(
+            './tests/inputs/Cu_single_crystal_with_displaced_atom.txt', unit_cell=GB.unit_cell, gb_thickness=5)
+        child1 = manipulator.displace_along_soft_modes()[0]
+        child2 = manipulator.displace_along_soft_modes(subtract_displacement=True)[0]
+        self.assertFalse(structured_array_equal(child1, child2))
+
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            GB.write_lammps(temp_file.name, child1, GB.box_dims)
+            self.assertTrue(
+                filecmp.cmp(
+                    temp_file.name,
+                    './tests/gold/soft_phonon_mode_displacement_added.txt',
+                    shallow=False
+                )
+            )
+
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            GB.write_lammps(temp_file.name, child2, GB.box_dims)
+            self.assertTrue(
+                filecmp.cmp(
+                    temp_file.name,
+                    './tests/gold/soft_phonon_mode_displacement_subtracted.txt',
+                    shallow=False
+                )
+            )
 
     def test_apply_group_symmetry(self):
         manipulator = GBManipulator(self.tilt, seed=self.seed)
@@ -266,7 +351,7 @@ class TestParent(unittest.TestCase):
         self.unit_cell = UnitCell()
         self.unit_cell.init_by_structure('fcc', 1.0, 'Cu')
         self.GB = GBMaker(a0=1.0, structure='fcc', gb_thickness=10.0, misorientation=[
-            math.radians(36.869898), 0, 0, 0, 0], atom_types='Cu', repeat_factor=1)
+            math.radians(36.869898), 0, 0, 0, 0], atom_types='Cu', repeat_factor=2, interaction_distance=1)
         self.parent = Parent(self.GB)
         self.file = 'tests/inputs/test1.txt'
 
@@ -351,7 +436,7 @@ class TestParentProxy(unittest.TestCase):
 
     def test_setitem(self):
         new_parent = Parent(GBMaker(a0=3.61, structure='fcc', gb_thickness=10.0, misorientation=[
-            math.radians(36.869898), 0, 0, 0, 0], atom_types='Cu', repeat_factor=1))
+            math.radians(36.869898), 0, 0, 0, 0], atom_types='Cu', repeat_factor=2, interaction_distance=1))
         self.parents_proxy[0] = new_parent
         self.assertIs(self.parents_proxy[0], new_parent)
 
@@ -361,7 +446,7 @@ class TestParentProxy(unittest.TestCase):
     def test_setitem_errors(self):
         self.parents_proxy[0] = None
         new_parent = Parent(GBMaker(a0=1.0, structure='fcc', gb_thickness=10.0, misorientation=[
-            math.radians(36.869898), 0, 0, 0, 0], atom_types='Cu', repeat_factor=1))
+            math.radians(36.869898), 0, 0, 0, 0], atom_types='Cu', repeat_factor=2, interaction_distance=1))
         with self.assertRaises(ParentsProxyValueError):
             self.parents_proxy[1] = new_parent
         self.parents_proxy[0] = new_parent
