@@ -2,16 +2,16 @@
 
 import filecmp
 import math
-import tempfile
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 
-from GBOpt.Atom import Atom, AtomValueError
+from GBOpt.Atom import AtomValueError
 from GBOpt.GBMaker import GBMaker, GBMakerTypeError, GBMakerValueError
 from GBOpt.UnitCell import UnitCell
+from GBOpt.Utils import approximate_rotation_matrix_as_int
 
 
 class TestGBMaker(unittest.TestCase):
@@ -130,17 +130,6 @@ class TestGBMaker(unittest.TestCase):
         self.gbm.misorientation = np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0])
         self.assertNotEqual(initial_spacing, self.gbm.spacing)
 
-    def test_write_lammps(self):
-        atoms = self.gbm.whole_system
-        box_sizes = self.gbm.box_dims
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(temp_file.name, atoms, box_sizes)
-            with open(temp_file.name, "r") as f:
-                content = f.readlines()
-            self.assertGreater(len(content), 0)
-            self.assertIn("atoms", content[2].lower())
-            self.assertIn("atom types", content[3].lower())
-
     # Tests for setters
     def test_box_dimensions_after_updates(self):
         original_box_dims = self.gbm.box_dims.copy()
@@ -212,20 +201,6 @@ class TestGBMaker(unittest.TestCase):
         self.assertGreater(self.gbm.box_dims[0][1], 50.0)
 
     # Tests for private methods
-    def test_approximate_rotation_matrix_as_int(self):
-        rotation_matrix = np.array([[0.70710678, 0.5, 0.5],
-                                    [0.70710678, -0.5, -0.5],
-                                    [0.0, 0.70710678, -0.70710678]])
-
-        approx_matrix = self.gbm._GBMaker__approximate_rotation_matrix_as_int(
-            rotation_matrix)
-
-        expected_matrix = np.array([[27720,  19601,  19601],
-                                    [27720, -19601, -19601],
-                                    [0,      1,     -1]])
-
-        np.testing.assert_array_equal(approx_matrix, expected_matrix)
-
     def test_calculate_periodic_spacing_logic(self):
         with patch.object(GBMaker, "_GBMaker__calculate_periodic_spacing", return_value={"x": 5.0, "y": 10.0, "z": 15.0}):
             self.gbm.update_spacing()
@@ -247,7 +222,7 @@ class TestGBMaker(unittest.TestCase):
 
     def test_non_periodic_boundary_warning(self):
         with self.assertWarns(UserWarning):
-            self.gbm._GBMaker__approximate_rotation_matrix_as_int(
+            approximate_rotation_matrix_as_int(
                 np.array(
                     [
                         [0.123456789, 0.56789123, -0.918273645],
@@ -256,66 +231,6 @@ class TestGBMaker(unittest.TestCase):
                     ]
                 )
             )
-
-    # Additional tests
-    # Output data file format is as expected.
-    def test_lammps_file_formatting(self):
-        atoms = np.array([("Cu", 0.0, 0.0, 0.0), ("H", 1.0, 1.0, 1.0)],
-                         dtype=Atom.atom_dtype)
-        box_sizes = np.array([[0.0, 10.0], [0.0, 10.0], [0.0, 10.0]])
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(temp_file.name, atoms, box_sizes)
-            with open(temp_file.name, "r") as f:
-                content = f.readlines()
-            self.assertEqual(content[2].strip(), "2 atoms")
-            self.assertEqual(content[3].strip(), "2 atom types")
-
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(temp_file.name, atoms, box_sizes, type_as_int=False)
-            with open(temp_file.name, "r") as f:
-                content = f.readlines()
-
-            self.assertEqual(content[8].strip(), "Atom Type Labels")
-            self.assertEqual(content[10].strip(), "1 Cu")
-            self.assertEqual(content[11].strip(), "2 H")
-
-    def test_lammps_file_formatting_with_charge(self):
-        atoms = np.array(
-            [
-                ('U', 0.0, 0.0, 0.0),
-                ('O', 0.25, 0.25, 0.25),
-                ('O', 0.25, 0.25, 0.75)
-            ],
-            dtype=Atom.atom_dtype
-        )
-        charges = {'U': 2.4, 'O': -1.2}
-        box_sizes = np.array([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]])
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(temp_file.name, atoms, box_sizes, charges=charges)
-            with open(temp_file.name, 'r') as f:
-                content = f.readlines()
-            self.assertEqual(content[2].strip(), '3 atoms')
-            self.assertEqual(content[3].strip(), '2 atom types')
-            self.assertEqual(content[15].strip(),
-                             '1 U 2.400000 0.000000 0.000000 0.000000')
-            self.assertEqual(content[16].strip(),
-                             '2 O -1.200000 0.250000 0.250000 0.250000')
-            self.assertEqual(content[17].strip(),
-                             '3 O -1.200000 0.250000 0.250000 0.750000')
-
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(temp_file.name, atoms, box_sizes,
-                                  charges=charges, type_as_int=True)
-            with open(temp_file.name, 'r') as f:
-                content = f.readlines()
-            self.assertEqual(content[2].strip(), '3 atoms')
-            self.assertEqual(content[3].strip(), '2 atom types')
-            self.assertEqual(content[10].strip(),
-                             '1 2 2.400000 0.000000 0.000000 0.000000')
-            self.assertEqual(content[11].strip(),
-                             '2 1 -1.200000 0.250000 0.250000 0.250000')
-            self.assertEqual(content[12].strip(),
-                             '3 1 -1.200000 0.250000 0.250000 0.750000')
 
     def test_data_integrity_in_gb(self):
         left_grain = self.gbm.left_grain

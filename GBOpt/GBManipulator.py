@@ -1148,6 +1148,30 @@ class GBManipulator:
             specified.
         :return: Atom positions after atom insertion.
         """
+        if not fill_fraction and not num_to_insert:
+            raise GBManipulatorValueError(
+                "fill_fraction or num_to_insert must be specified.")
+
+        if not self.__one_parent:
+            warnings.warn("Atom insertion only occurring based on parent 1.")
+        parent = self.__parents[0]
+        gb_atoms = Atom.as_array(parent.gb_atoms)
+
+        if fill_fraction is not None and (fill_fraction <= 0 or fill_fraction > 0.25):
+            raise GBManipulatorValueError("Invalid value for fill_fraction ("
+                                          f"{fill_fraction=}). Must be 0 < "
+                                          "fill_fraction <= 0.25")
+
+        if (num_to_insert is not None and
+            (
+                        num_to_insert < 1 or
+                        num_to_insert > int(0.25 * len(gb_atoms))
+                    )
+            ):
+            raise GBManipulatorValueError(
+                "Invalid num_to_insert value. Must be >= 1, and must be less than or "
+                "equal to 25% of the total number of atoms in the GB region")
+
         def Delaunay_approach(
             gb_atoms: np.ndarray,
             atom_radius: float,
@@ -1639,3 +1663,14 @@ class GBManipulator:
                 "Both items in the parents list must be None or instances of Parent")
 
         self.__parents = value
+
+
+if __name__ == "__main__":
+    from .Utils import write_lammps
+    theta = math.radians(36.869898)
+    GB = GBMaker(a0=1.0, structure='fcc', gb_thickness=10.0,
+                 misorientation=[theta, 0, 0, 0, -theta/2], repeat_factor=4)
+    GBManip = GBManipulator(GB)
+    write_lammps(GB.gb, GB.box_dims, 'test1.dat')
+    write_lammps(GBManip.translate_right_grain(
+        0.5, 1.0), GB.box_dims, 'test2.dat')

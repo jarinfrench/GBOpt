@@ -3,7 +3,6 @@
 
 import math
 import warnings
-from fractions import Fraction
 from numbers import Number
 from typing import Any, Sequence, Tuple, Union
 
@@ -11,6 +10,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from GBOpt.UnitCell import UnitCell
+from GBOpt.Utils import approximate_rotation_matrix_as_int, get_points_inside_box
 
 
 class GBMakerError(Exception):
@@ -100,121 +100,6 @@ class GBMaker:
         self.__box_dims = self.__calculate_box_dimensions()
 
     # Private class methods
-    def __approximate_rotation_matrix_as_int(
-        self, m: np.ndarray, precision: float = 5
-    ) -> np.ndarray:
-        """
-        Approximate a rotation matrix in integer format given the original matrix and
-        the desired precision.
-
-        :param m: The matrix to approximate
-        :param precision: Decimal precision to use during calculations, defaults to 5
-        :return: Integer approximation of the rotation matrix m
-        """
-        # first round the matrix to the desired precision
-        R0 = np.linalg.norm(Rotation.from_matrix(m).as_rotvec(degrees=True))
-
-        def gcd_reduce(matrix):
-            gcds = np.gcd.reduce(matrix, axis=1)
-            return matrix / gcds[:, np.newaxis]
-
-        def get_angle(matrix):
-            return np.linalg.norm(
-                Rotation.from_matrix(
-                    matrix / np.linalg.norm(matrix, axis=1)[:, np.newaxis]
-                ).as_rotvec(degrees=True)
-            )
-
-        def get_magnitude_sum(matrix):
-            abs_m = np.abs(matrix)
-            non_zero_elements = abs_m[abs_m > 0]
-            log_magnitudes = np.log(non_zero_elements)
-            return np.sum(log_magnitudes)
-
-        def calculate_best_approx(metrics1, metrics2, m1, m2):
-            diffs = [metrics1["angle"], metrics2["angle"]]
-            keys = list(metrics1.keys())
-
-            # Normalize each metric. Note that the if statement essentially only catches
-            # when both matrices gives essentially the same rotation as the original
-            # (as calculated by the get_angle function above).
-            metric1_norms = np.array(
-                [
-                    metrics1[key] / max(metrics1[key], metrics2[key])
-                    if not max(metrics1[key], metrics2[key]) == 0
-                    else 0
-                    for key in keys
-                ]
-            )
-            metric2_norms = np.array(
-                [
-                    metrics2[key] / max(metrics1[key], metrics2[key])
-                    if not max(metrics1[key], metrics2[key]) == 0
-                    else 0
-                    for key in keys
-                ]
-            )
-
-            # These weights *seem* to work, but there should be a better way to
-            # determine these (these were determine through trial and error for the
-            # R_right matrix for the misorientation matrix of [0.3, 0.4, 0.5, 0.6, 0.7])
-            # In a general sense, placing most of the weighting on the magnitude, then
-            # most of the rest on the condition, with the rest on the angle should give
-            # a good representation, at least based on the generated matrix mentioned.
-            weights = {"angle": 0.1, "condition": 0.3, "magnitude": 0.6}
-            weights = np.array([weights[key] for key in keys])  # keep order the same
-            metric1_overall = np.sum(metric1_norms * weights) / np.sum(weights)
-            metric2_overall = np.sum(metric2_norms * weights) / np.sum(weights)
-
-            if metric1_overall < metric2_overall:
-                return m1, diffs[0]
-            else:
-                return m2, diffs[1]
-
-        # Approximation with the least common multiple of denominators in their
-        # fraction representation
-        m_as_fractions = np.vectorize(
-            lambda val: Fraction(val).limit_denominator(10**precision)
-        )(m)
-        denominators = np.array(
-            [[f.denominator for f in row] for row in m_as_fractions]
-        )
-        scaling_factors = np.array([np.lcm.reduce(row) for row in denominators])
-        scaled_matrix = m * scaling_factors[:, np.newaxis]
-        approx_m_from_fractions = gcd_reduce(np.round(scaled_matrix).astype(int))
-        approx_m_from_fractions_metrics = {
-            "angle": abs(R0-get_angle(approx_m_from_fractions)),
-            "condition": np.linalg.cond(approx_m_from_fractions),
-            "magnitude": get_magnitude_sum(approx_m_from_fractions)
-        }
-
-        # Approximation by taking the ratio of the row values divided by the smallest
-        # values, scaling these ratios up by 10**precision, truncating the values,
-        # then simplifying.
-        min_by_row_excluding_0 = np.ma.amin(
-            np.ma.masked_less(np.abs(m), 10**-precision), axis=1).data
-        m_ratio = m / min_by_row_excluding_0[:, np.newaxis]  # ratios of values to mins
-        m_rounded = np.round(m_ratio, precision)  # round to the desired precision
-        m_scaled = (10**precision * m_rounded).astype(int)  # scale by 10**precision
-        approx_m_from_scaling = gcd_reduce(m_scaled)
-        approx_m_from_scaling_metrics = {
-            "angle": abs(R0-get_angle(approx_m_from_scaling)),
-            "condition": np.linalg.cond(approx_m_from_scaling),
-            "magnitude": get_magnitude_sum(approx_m_from_scaling)
-        }
-
-        result, diff = calculate_best_approx(
-            approx_m_from_fractions_metrics,
-            approx_m_from_scaling_metrics,
-            approx_m_from_fractions,
-            approx_m_from_scaling
-        )
-
-        if diff > 0.5:
-            warnings.warn(
-                "Approximated rotation matrix error is greater than 0.5 degrees.")
-        return result.astype(int)
-
     def __assign_orientations(self, misorientation: np.ndarray) -> None:
         """
         Private method to separate the misorientation and inclination from the passed in
@@ -256,7 +141,7 @@ class GBMaker:
 
     def __calculate_periodic_spacing(self, threshold: float = None) -> dict:
         """
-        Calculate the periodic spacing based on the rotation matrix.
+        Calculate the periodic spacing based on the rotation matrices.
 
         :param threshold: The maximum allowed value that any spacing can take. Default
             is 15 * a0.
@@ -270,39 +155,30 @@ class GBMaker:
         R_left = self.__Rincl
         R_right = np.dot(self.__Rmis, self.__Rincl)
         # # We store the approximate matrices as objects to allow for large numbers
-        R_left_approx = self.__approximate_rotation_matrix_as_int(R_left).astype(object)
-        R_right_approx = self.__approximate_rotation_matrix_as_int(R_right).astype(
-            object
-        )
+        R_left_approx = approximate_rotation_matrix_as_int(R_left).astype(object)
+        R_right_approx = approximate_rotation_matrix_as_int(R_right).astype(object)
+        # The rows of the approximated matrix gives the Miller indices of the directions
+        # that are now aligned along the x, y, and z axes. We calculate the interplanar
+        # spacings using the usual formula: d = a / sqrt(h**2+k**2+l**2)
+        interplanar_spacings_left = self.__a0 / \
+            np.linalg.norm(np.array(R_left_approx, np.float64), axis=0)
+        interplanar_spacings_right = self.__a0 / \
+            np.linalg.norm(np.array(R_right_approx, np.float64), axis=0)
 
-        # The periodic distance in each direction is the lattice parameter multiplied by
-        # norm of the Miller indices in that direction. This is determined using the
-        # usual formula for the interplanar spacing: d = a / sqrt(h**2+k**2+l**2). The
-        # square of the denominator here is the number of planes needed before
-        # periodicity. Thus, if we multiply that distance by the interplanar spacing we
-        # will get the interplanar spacing. This simplifies to
-        # (a0**2/d**2)*d = a0**2/d --> spacing = a0 * sqrt(h**2+k**2+l**2)
-        spacing_left = {
-            axis: self.__a0 * np.linalg.norm(vec)
-            for axis, vec in zip(["x", "y", "z"], R_left_approx)
-        }
-        spacing_right = {
-            axis: self.__a0 * np.linalg.norm(vec)
-            for axis, vec in zip(["x", "y", "z"], R_right_approx)
-        }
+        # The number of planes before periodicity is the square of the denominator in
+        # the interplanar_spacings calculation above. Thus, the total periodic distance
+        # is going to be (a / d) ** 2 * 2 = a**2 / d
+        # spacing_left = {axis: min(val, threshold) for axis, val in zip(
+        #     ['x', 'y', 'z'], self.__a0**2 / interplanar_spacings_left)}
+        # spacing_right = {axis: min(val, threshold) for axis, val in zip(
+        #     ['x', 'y', 'z'], self.__a0**2 / interplanar_spacings_right)}
+        spacing_left = {axis: val for axis, val in zip(
+            ['x', 'y', 'z'], self.__a0**2 / interplanar_spacings_left)}
+        spacing_right = {axis: val for axis, val in zip(
+            ['x', 'y', 'z'], self.__a0**2 / interplanar_spacings_right)}
 
-        spacing = {"x": {"left": spacing_left["x"], "right": spacing_right["x"]}}
-        self.__left_x = math.ceil(
-            self.__x_dim_min / spacing["x"]["left"]) * spacing["x"]["left"]
-        self.__right_x = math.ceil(
-            self.__x_dim_min / spacing["x"]["right"]) * spacing["x"]["right"]
-        self.__x_dim = self.__left_x + self.__right_x
-        spacing.update(
-            {
-                axis: max(spacing_left[axis], spacing_right[axis])
-                for axis in ["y", "z"]
-            }
-        )
+        spacing = {axis: max(spacing_left[axis], spacing_right[axis])
+                   for axis in ['x', 'y', 'z']}
 
         warnings.simplefilter("once", UserWarning)
         for key, val in spacing.items():
@@ -344,7 +220,7 @@ class GBMaker:
         atoms["x"], atoms["y"], atoms["z"] = rotated_positions.T
         atoms["x"] += self.__vacuum_thickness
 
-        return self.__get_points_inside_box(
+        return get_points_inside_box(
             atoms,
             [
                 self.__vacuum_thickness, 0, 0,
@@ -369,9 +245,9 @@ class GBMaker:
         R = np.dot(self.__Rincl, self.__Rmis)
         positions = np.vstack((atoms["x"], atoms["y"], atoms["z"])).T
         rotated_positions = np.dot(positions, R.T)
-        atoms["x"], atoms["y"], atoms["z"] = rotated_positions.T
-        atoms["x"] += np.amax(self.__left_grain["x"]) + self.__vacuum_thickness
-        return self.__get_points_inside_box(
+        atoms['x'], atoms['y'], atoms['z'] = rotated_positions.T
+        atoms['x'] += np.amax(self.__left_grain['x'])
+        return get_points_inside_box(
             atoms,
             [
                 self.__left_x + self.__vacuum_thickness, 0, 0,
@@ -391,28 +267,7 @@ class GBMaker:
         right_gb = self.__right_grain[self.__right_grain['x'] < right_cut]
         self.__gb_region = np.hstack((left_gb, right_gb))
 
-    def __get_points_inside_box(self, atoms: np.ndarray, box_dim: np.ndarray) -> np.ndarray:
-        """
-        Selects the lattice points that are inside the given box dimensions.
-
-        :param atoms: Atoms to check. 4xm array containing types and positions.
-        :param box_dim: Dimensions of box (x_min, y_min, z_min, x_max, y_max, z_max).
-        :return: 4xn array containing the Atom positions inside the given box.
-        """
-        x_min, y_min, z_min, x_max, y_max, z_max = box_dim
-
-        # We use '<' for the y and z directions to not duplicate atoms across the
-        # periodic boundary. For the x direction this doesn't matter as much because we
-        # do not have periodic boundaries in this direction, but '<=' causes more atoms
-        # to be placed.
-        inside_box = (
-            (atoms["x"] >= x_min) & (atoms["x"] < x_max) &
-            (atoms["y"] >= y_min) & (atoms["y"] < y_max) &
-            (atoms["z"] >= z_min) & (atoms["z"] < z_max)
-        )
-        return atoms[inside_box]
-
-    def __update_dims(self) -> None:
+    def __update_periodic_dims(self) -> None:
         """
         Updates the y_dim and z_dim parameters after a relevant parameter has been
         changed.
@@ -557,101 +412,6 @@ class GBMaker:
         :param threshold: The maximum allowed value that any spacing can take
         """
         self.__spacing = self.__calculate_periodic_spacing(threshold)
-
-    def write_lammps(
-        self,
-        file_name: str,
-        atoms: np.ndarray = None,
-        box_sizes: np.ndarray = None,
-        *,
-        type_as_int: bool = False,
-        precision: int = 6,
-        charges: dict = None
-    ) -> None:
-        """
-        Writes the atom positions with the given box dimensions to a LAMMPS input file.
-
-        :param str file_name: The filename to save the data
-        :param np.ndarray atoms: The numpy array containing the atom data.
-        :param np.ndarray box_sizes: 3x2 array containing the min and max dimensions for
-            each of the x, y, and z dimensions.
-        :param type_as_int: Whether to write the atom types as a chemical name or a
-            number. Keyword argument, optional, defaults to False (write as a chemical
-            name).
-        :param precision: The decimal precision to use when writing float values,
-            optional, default = 6.
-        :param charges: dict containing the charge values for each type. Keys are
-            expected to be integers, values are expected to be numeric. Optional,
-            default is None.
-        """
-        if not isinstance(file_name, str):
-            raise GBMakerTypeError("file_name must be of type str")
-        if atoms is None and box_sizes is None:
-            atoms = self.__whole_system
-            box_sizes = self.__box_dims
-        elif (atoms is None and box_sizes is not None) or (
-            atoms is not None and box_sizes is None
-        ):
-            raise GBMakerValueError(
-                "'atoms' and 'box_sizes' must be specified together."
-            )
-
-        name_to_int = {name: i + 1 for i, name in enumerate(np.unique(atoms["name"]))}
-
-        if charges is not None:
-            if not all([isinstance(i, int) or isinstance(i, str) for i in charges.keys()]):
-                raise GBMakerValueError(
-                    "'charges' keys are required to be integers or strings.")
-            if not all([isinstance(i, Number) for i in charges.values()]):
-                raise GBMakerValueError("'charges' values are required to be numeric.")
-            if type_as_int:
-                if all([isinstance(i, str) for i in charges.keys()]):
-                    for name in np.unique(atoms["name"]):
-                        charges[name_to_int[name]] = charges[name]
-
-        def format_atom_line(index, name, pos, charge=None):
-            if type_as_int:
-                name = name_to_int[name]
-            if charge is not None:
-                return (f"{index} {name} {charge:.{precision}f} " +
-                        f"{pos[0]:.{precision}f} {pos[1]:.{precision}f} " +
-                        f"{pos[2]:.{precision}f}\n")
-            else:
-                return (f"{index} {name} {pos[0]:.{precision}f} " +
-                        f"{pos[1]:.{precision}f} {pos[2]:.{precision}f}\n")
-
-        # Write LAMMPS data file
-        with open(file_name, "w") as fdata:
-            # First line is a comment line
-            fdata.write(f"Crystalline {"".join(np.unique(atoms["name"]))} atoms\n\n")
-
-            # --- Header ---#
-            # Specify number of atoms and atom types
-            fdata.write("{} atoms\n".format(len(atoms)))
-            fdata.write("{} atom types\n".format(len(set(atoms["name"]))))
-            # Specify box dimensions
-            fdata.write(
-                f'{box_sizes[0][0]:.{precision}f} {box_sizes[0][1]:.{precision}f} xlo xhi\n')
-            fdata.write(
-                f'{box_sizes[1][0]:.{precision}f} {box_sizes[1][1]:.{precision}f} ylo yhi\n')
-            fdata.write(
-                f'{box_sizes[2][0]:.{precision}f} {box_sizes[2][1]:.{precision}f} zlo zhi\n')
-
-            if not type_as_int:
-                fdata.write("\nAtom Type Labels\n\n")
-                for name, value in name_to_int.items():
-                    fdata.write(f"{value} {name}\n")
-
-            # Atoms section
-            fdata.write("\nAtoms\n\n")
-
-            # Write each position.
-            for i, (name, *pos) in enumerate(atoms):
-                if charges is not None:
-                    charge = charges[name_to_int[name]]if type_as_int else charges[name]
-                else:
-                    charge = None
-                fdata.write(format_atom_line(i + 1, name, pos, charge))
 
     # Properties with getters and setters. Automatic updates for related parameters are
     # automatically taken care of.
@@ -803,13 +563,10 @@ class GBMaker:
         return self.__z_dim
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+    from .Utils import write_lammps
     theta = math.radians(36.869898)
-    G = GBMaker(
-        a0=3.61,
-        structure="fcc",
-        gb_thickness=10.0,
-        misorientation=[theta, 0, 0, 0, -theta / 2],
-        repeat_factor=[3, 9],
-    )
-    G.write_lammps(np.vstack((G.left_grain, G.right_grain)), G.box_dims, "test1.dat")
+    G = GBMaker(a0=3.61, structure='fcc', gb_thickness=10.0,
+                misorientation=[theta, 0, 0, 0, -theta/2], repeat_factor=[3, 9])
+    write_lammps(np.vstack((G.left_grain, G.right_grain)),
+                 G.box_dims, "test1.dat")

@@ -26,6 +26,7 @@ from GBOpt.GBManipulator import (
     _ParentsProxy,
 )
 from GBOpt.UnitCell import UnitCell
+from GBOpt.Utils import write_lammps
 
 
 def structured_array_equal(array1, array2):
@@ -338,10 +339,10 @@ class TestGBManipulator(unittest.TestCase):
         p3 = manipulator1.insert_atoms(fill_fraction=0.2, method='delaunay')
         # p4 = manipulator1.remove_atoms(0.2)
         with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.tilt.write_lammps(temp_file.name, p1, self.tilt.box_dims)
-            self.tilt.write_lammps(temp_file.name, p2, self.tilt.box_dims)
-            self.tilt.write_lammps(temp_file.name, p3, self.tilt.box_dims)
-            # self.tilt.write_lammps(temp_file.name, p4, self.tilt.box_dims)
+            write_lammps(temp_file.name, atoms=p1, box_sizes=self.tilt.box_dims)
+            write_lammps(temp_file.name, atoms=p2, box_sizes=self.tilt.box_dims)
+            write_lammps(temp_file.name, atoms=p3, box_sizes=self.tilt.box_dims)
+            # write_lammps(temp_file.name, p4, self.tilt.box_dims)
 
     def test_created_gbs(self):
         manipulator = GBManipulator(self.tilt, self.tilt)
@@ -352,10 +353,10 @@ class TestGBManipulator(unittest.TestCase):
         p3 = manipulator.slice_and_merge()
         # p4 = manipulator.remove_atoms(0.2)
         with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.tilt.write_lammps(temp_file.name, type_as_int=True)
+            write_lammps(temp_file.name, self.tilt, type_as_int=True)
             self.assertTrue(filecmp.cmp("./tests/gold/sigma5_tilt.txt",
                             temp_file.name, shallow=False))
-            self.twist.write_lammps(temp_file.name, type_as_int=True)
+            write_lammps(temp_file.name, self.twist, type_as_int=True)
             self.assertTrue(filecmp.cmp("./tests/gold/sigma5_twist.txt",
                             temp_file.name, shallow=False))
 

@@ -6,7 +6,7 @@ from typing import Sequence, Tuple, Union
 import numpy as np
 from scipy.spatial import KDTree
 
-from GBOpt import Atom
+from GBOpt.Atom import Atom
 
 
 class UnitCellError(Exception):
