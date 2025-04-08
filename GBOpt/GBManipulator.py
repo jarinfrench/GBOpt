@@ -1435,7 +1435,7 @@ class GBManipulator:
         threshold: float = None,
         *,
         mesh_size: int = 4,
-        num_q: int = 50,
+        num_q: int = 1,
         num_children: int = 1,
         subtract_displacement: bool = False
     ) -> np.ndarray:
@@ -1448,7 +1448,7 @@ class GBManipulator:
             identifying unique q points. Optional. Defaults to 4.
         :param num_q: Keyword argument. Specifies the number of unique q points to use
             when calculating the dynamical matrix and determining the displacements.
-            Optional. Defaults to 50.
+            Optional. Defaults to 1 (the Gamma point).
         :param num_children: Keyword argument. Specifies the number of children to
             create from the parent structure. Optional. Defaults to 1.
         :param subtract_displacement: Keyword argument. Flag for subtracting, rather
@@ -1505,7 +1505,7 @@ class GBManipulator:
 
         n_atoms = len(parent.gb_indices)
         num_q = len(unique_q_points)
-        sparse_threshold = 10000
+        sparse_threshold = 10000  # TODO: This needs to be tuned.
 
         # initialize the arrays to save the eigenvalues (frequencies) and eigenvectors
         # (displacements)
@@ -1518,7 +1518,7 @@ class GBManipulator:
             dynamical_matrix = _calculate_dynamical_matrix(
                 hardness, positions, parent.gb_indices, neighbor_list_typed, q_vec)
             if 3 * n_atoms <= sparse_threshold:
-                freq_vals, disp_vals = np.linalg.eigh(dynamical_matrix)
+                freq_vals, disp_vals = np.linalg.eig(dynamical_matrix)
             else:
                 sparse_matrix = sps.csc_matrix(dynamical_matrix)
                 # scipy.sparse.linalg.eigsh can only calculate a small subset of the
@@ -1544,6 +1544,7 @@ class GBManipulator:
         # 0, as these are associated with translational or rotational (acoustic) modes
 
         # TODO: Look into combining the eigenvectors of the multiple q points. AiVA suggests that weighted averages or using principle component analysis might work well in this regard.
+        # NOTE: this assumes we're only using the Gamma point!
         non_acoustic_indices = np.where(~np.isclose(freqs, 0))
 
         # TODO: Look into further filtering this so we only consider unique displacements. Do equivalent eigenvalues results in the same eigenvectors for different q values? What about within the same q vector?
