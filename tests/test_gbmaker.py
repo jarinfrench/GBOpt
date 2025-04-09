@@ -192,7 +192,7 @@ class TestGBMaker(unittest.TestCase):
             self.gbm.repeat_factor = [1.5, 2.0]
 
         self.gbm.x_dim_min = 80.0
-        self.assertGreaterEqual(self.gbm.x_dim, 80.0)
+        self.assertEqual(self.gbm.x_dim_min, 80.0)
 
         self.gbm.vacuum_thickness = 15.0
         self.assertEqual(self.gbm.vacuum_thickness, 15.0)
@@ -218,9 +218,9 @@ class TestGBMaker(unittest.TestCase):
         approx_matrix = self.gbm._GBMaker__approximate_rotation_matrix_as_int(
             rotation_matrix)
 
-        expected_matrix = np.array([[27720, 19601, 19601],
+        expected_matrix = np.array([[27720,  19601,  19601],
                                     [27720, -19601, -19601],
-                                    [0, 1, -1]])
+                                    [0,      1,     -1]])
 
         np.testing.assert_array_equal(approx_matrix, expected_matrix)
 
@@ -246,7 +246,14 @@ class TestGBMaker(unittest.TestCase):
     def test_non_periodic_boundary_warning(self):
         with self.assertWarns(UserWarning):
             self.gbm._GBMaker__approximate_rotation_matrix_as_int(
-                np.array([[0.123456789, 0.56789123, -0.918273645], [-0.135792468, 0.246813579, 0.1], [0.159283746, -0.2, 0.1]]))
+                np.array(
+                    [
+                        [0.123456789, 0.56789123, -0.918273645],
+                        [-0.135792468, 0.246813579, 0.1],
+                        [0.159283746, -0.2, 0.1]
+                    ]
+                )
+            )
 
     # Additional tests
     # Output data file format is as expected.
@@ -283,7 +290,7 @@ class TestGBMaker(unittest.TestCase):
             GBMaker(self.a0, self.structure, -5.0,
                     self.misorientation, self.atom_types)  # Negative thickness
 
-    @pytest.mark.known_bug
+    @pytest.mark.xfail(reason="Fails due to issue #39")
     def test_single_grain_creation(self):
         gbm_single = GBMaker(3.54, "fcc", 5.0,
                              np.array([0, 0, 0, 0, 0]), "Cu",
