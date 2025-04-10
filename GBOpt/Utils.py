@@ -41,7 +41,8 @@ def write_lammps(
     atoms: Optional[np.ndarray] = None,
     box_sizes: Optional[np.ndarray] = None,
     *,
-    type_as_int: bool = False
+    type_as_int: bool = False,
+    charges: dict = None
 ) -> None:
     """
     Writes the atom positions with the given box dimensions to a LAMMPS input file.
@@ -53,6 +54,7 @@ def write_lammps(
         x, y, and z dimensions.
     :param type_as_int: Whether to write the atom types as a chemical name or a number.
         Keyword argument, optional, defaults to False (write as a chemical name).
+    :param charges: dict containing the charge values for each type:
     """
     if not isinstance(file_name, str):
         raise TypeError("file_name must be of type str")
@@ -66,6 +68,16 @@ def write_lammps(
         raise ValueError("'atoms' and 'box_sizes' must be specified together.")
 
     name_to_int = {name: i+1 for i, name in enumerate(np.unique(atoms['name']))}
+    if charges is None:
+        if type_as_int:
+            atom_format = '{} {:n} {} {} {}\n'
+        else:
+            atom_format = '{} {} {} {} {}\n'
+    else:
+        if type_as_int:
+            atom_format = '{} {:n} {} {} {} {}\n'
+        else:
+            atom_format = '{} {} {} {} {} {}\n'
 
     # Write LAMMPS data file
     with open(file_name, 'w') as fdata:
@@ -93,13 +105,12 @@ def write_lammps(
         fdata.write('\nAtoms\n\n')
 
         # Write each position.
-        if type_as_int:
-            for i, (name, *pos) in enumerate(atoms):
-                fdata.write('{} {:n} {} {} {}\n'.format(
-                    i+1, name_to_int[name], *pos))
-        else:
-            for i, (name, *pos) in enumerate(atoms):
-                fdata.write('{} {} {} {} {}\n'.format(i+1, name, *pos))
+        for i, (name, *pos) in enumerate(atoms):
+            args = [i+1, name_to_int[name] if type_as_int else name]
+            if charges is not None:
+                args.append(charges.get(name, name_to_int[name]))
+            args.extend(pos)
+            fdata.write(atom_format.format(*args))
 
 
 def approximate_rotation_matrix_as_int(
