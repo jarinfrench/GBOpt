@@ -397,8 +397,7 @@ class GBMaker:
                             "repeat_factor must be a sequence of type int.")
                     if val < 2:
                         warnings.warn("Recommended repeat distance is at least 2.")
-                if not isinstance(value, list):
-                    value = list(value)
+                value = list(value)
         return value
 
     # Public methods
