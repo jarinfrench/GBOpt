@@ -47,6 +47,9 @@ class UnitCell:
             bcc, sc, diamond, fluorite, rocksalt, and zincblende. Other structures can
             be added upon request.
         :param a0: The lattice parameter in Angstroms.
+        :param atoms: The types of atoms in the system. A single string assigns the same
+            atom type to each atom in the unit cell. A tuple is required for the
+            "fluorite", "rocksalt", and "zincblende" structures.
         :raises NotImplementedError: Exception raised if the specified structure has not
             been implemented.
         """

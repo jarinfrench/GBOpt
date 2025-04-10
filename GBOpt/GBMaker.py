@@ -475,16 +475,16 @@ class GBMaker:
         """
         Writes the atom positions with the given box dimensions to a LAMMPS input file.
 
-        :param str filename: The filename to save the data
-        :param np.ndarray positions: The positions of the atoms. Keyword argument,
-            defaults to None.
+        :param str file_name: The filename to save the data
+        :param np.ndarray atoms: The numpy array containing the atom data.
         :param np.ndarray box_sizes: 3x2 array containing the min and max dimensions for
-            each of the x, y, and z dimensions. Keyword argument, defaults to None.
+            each of the x, y, and z dimensions.
         :param bool type_as_int: Whether to write the atom types as a chemical name or a
             number. Keyword argument, optional, defaults to False (write as a chemical
             name).
         """
-
+        if not isinstance(file_name, str):
+            raise GBMakerTypeError("file_name must be of type str")
         if atoms is None and box_sizes is None:
             atoms = self.__whole_system
             box_sizes = self.__box_dims
