@@ -434,6 +434,7 @@ class GBMaker:
                         )
                     if val < 2:
                         warnings.warn("Recommended repeat distance is at least 2.")
+                value = list(value)
         return value
 
     # Public methods
