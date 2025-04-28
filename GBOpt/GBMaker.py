@@ -1,5 +1,6 @@
 import math
 import warnings
+from fractions import Fraction
 from numbers import Number
 from typing import Any, Sequence, Tuple, Union
 
@@ -40,8 +41,8 @@ class GBMaker:
         directions, optional, defaults to 2. A single integer value is assumed to be
         used for both directions, while a list of length 2 is assumed to apply
         sequentially to y and z. Values less than 2 give a warning.
-    :param x_dim: Size of one grain in the x dimension (Angstroms), optional, defaults
-        to 50.
+    :param x_dim_min: Minimum size of one grain in the x dimension (Angstroms),
+        optional, defaults to 50.
     :param vacuum: Thickness of the vacuum region around the grains in the x dimension
         (Angstroms), optional, defaults to 10.
     :param interaction_distance: The maximum distance that atoms interact with each
@@ -51,20 +52,11 @@ class GBMaker:
     :param gb_id: The identifier for the created GB system, optional, defaults to 0.
     """
 
-    def __init__(
-        self,
-        a0: float,
-        structure: str,
-        gb_thickness: float,
-        misorientation: np.ndarray,
-        atom_types: str | Tuple[str, ...],
-        *,
-        repeat_factor: Union[int, Sequence[int]] = 2,
-        x_dim: float = 50,
-        vacuum: float = 10,
-        interaction_distance: float = 15.0,
-        gb_id: int = 1,
-    ):
+    def __init__(self, a0: float, structure: str, gb_thickness: float,
+                 misorientation: np.ndarray, atom_types: str | Tuple[str, ...], *,
+                 repeat_factor: Union[int, Sequence[int]] = 2, x_dim_min: float = 50,
+                 vacuum: float = 10, interaction_distance: float = 15.0,
+                 gb_id: int = 1):
         self.__a0 = self.__validate(a0, Number, "a0", positive=True)
         self.__structure = self.__validate(structure, str, "structure")
         self.__gb_thickness = self.__validate(
@@ -85,7 +77,8 @@ class GBMaker:
             expected_length=2,
             positive=True,
         )
-        self.__x_dim = self.__validate(x_dim, Number, "x_dim", positive=True)
+        self.__x_dim_min = self.__validate(
+            x_dim_min, Number, "x_dim_min", positive=True)
         self.__vacuum_thickness = self.__validate(
             vacuum, Number, "vacuum_thickness", positive=True
         )
@@ -96,7 +89,7 @@ class GBMaker:
 
         self.__unit_cell = self.__init_unit_cell(atom_types)
         self.__spacing = self.__calculate_periodic_spacing()  # periodic distances dict
-        self.__update_periodic_dims()
+        self.__update_dims()
 
         self.__radius = a0 * self.__unit_cell.radius  # atom radius
         self.__generate_gb()
@@ -117,25 +110,107 @@ class GBMaker:
         """
         # first round the matrix to the desired precision
         R0 = np.linalg.norm(Rotation.from_matrix(m).as_rotvec(degrees=True))
-        min_by_row_excluding_0 = np.ma.amin(np.ma.masked_equal(np.abs(m), 0), axis=1)
-        ratio = m / min_by_row_excluding_0[:, np.newaxis]
 
-        rounded = np.round(ratio, precision)
-        scaled = (10**precision * rounded).astype(int)
-        gcds = np.gcd.reduce(scaled, axis=1)
-        approx_m = scaled / gcds[:, None]
+        def gcd_reduce(matrix):
+            gcds = np.gcd.reduce(matrix, axis=1)
+            return matrix / gcds[:, np.newaxis]
 
-        R_approx_normed = np.linalg.norm(
-            Rotation.from_matrix(
-                approx_m / np.linalg.norm(approx_m, axis=1)[:, None]
-            ).as_rotvec(degrees=True)
+        def get_angle(matrix):
+            return np.linalg.norm(
+                Rotation.from_matrix(
+                    matrix / np.linalg.norm(matrix, axis=1)[:, np.newaxis]
+                ).as_rotvec(degrees=True)
+            )
+
+        def get_magnitude_sum(matrix):
+            abs_m = np.abs(matrix)
+            non_zero_elements = abs_m[abs_m > 0]
+            log_magnitudes = np.log(non_zero_elements)
+            return np.sum(log_magnitudes)
+
+        def calculate_best_approx(metrics1, metrics2, m1, m2):
+            diffs = [metrics1["angle"], metrics2["angle"]]
+            keys = list(metrics1.keys())
+
+            # Normalize each metric. Note that the if statement essentially only catches
+            # when both matrices gives essentially the same rotation as the original
+            # (as calculated by the get_angle function above).
+            metric1_norms = np.array(
+                [
+                    metrics1[key] / max(metrics1[key], metrics2[key])
+                    if not max(metrics1[key], metrics2[key]) == 0
+                    else 0
+                    for key in keys
+                ]
+            )
+            metric2_norms = np.array(
+                [
+                    metrics2[key] / max(metrics1[key], metrics2[key])
+                    if not max(metrics1[key], metrics2[key]) == 0
+                    else 0
+                    for key in keys
+                ]
+            )
+
+            # These weights *seem* to work, but there should be a better way to
+            # determine these (these were determine through trial and error for the
+            # R_right matrix for the misorientation matrix of [0.3, 0.4, 0.5, 0.6, 0.7])
+            # In a general sense, placing most of the weighting on the magnitude, then
+            # most of the rest on the condition, with the rest on the angle should give
+            # a good representation, at least based on the generated matrix mentioned.
+            weights = {"angle": 0.1, "condition": 0.3, "magnitude": 0.6}
+            weights = np.array([weights[key] for key in keys])  # keep order the same
+            metric1_overall = np.sum(metric1_norms * weights) / np.sum(weights)
+            metric2_overall = np.sum(metric2_norms * weights) / np.sum(weights)
+
+            if metric1_overall < metric2_overall:
+                return m1, diffs[0]
+            else:
+                return m2, diffs[1]
+
+        # Approximation with the least common multiple of denominators in their
+        # fraction representation
+        m_as_fractions = np.vectorize(
+            lambda val: Fraction(val).limit_denominator(10**precision)
+        )(m)
+        denominators = np.array(
+            [[f.denominator for f in row] for row in m_as_fractions]
+        )
+        scaling_factors = np.array([np.lcm.reduce(row) for row in denominators])
+        scaled_matrix = m * scaling_factors[:, np.newaxis]
+        approx_m_from_fractions = gcd_reduce(np.round(scaled_matrix).astype(int))
+        approx_m_from_fractions_metrics = {
+            "angle": abs(R0-get_angle(approx_m_from_fractions)),
+            "condition": np.linalg.cond(approx_m_from_fractions),
+            "magnitude": get_magnitude_sum(approx_m_from_fractions)
+        }
+
+        # Approximation by taking the ratio of the row values divided by the smallest
+        # values, scaling these ratios up by 10**precision, truncating the values,
+        # then simplifying.
+        min_by_row_excluding_0 = np.ma.amin(
+            np.ma.masked_less(np.abs(m), 10**-precision), axis=1).data
+        m_ratio = m / min_by_row_excluding_0[:, np.newaxis]  # ratios of values to mins
+        m_rounded = np.round(m_ratio, precision)  # round to the desired precision
+        m_scaled = (10**precision * m_rounded).astype(int)  # scale by 10**precision
+        approx_m_from_scaling = gcd_reduce(m_scaled)
+        approx_m_from_scaling_metrics = {
+            "angle": abs(R0-get_angle(approx_m_from_scaling)),
+            "condition": np.linalg.cond(approx_m_from_scaling),
+            "magnitude": get_magnitude_sum(approx_m_from_scaling)
+        }
+
+        result, diff = calculate_best_approx(
+            approx_m_from_fractions_metrics,
+            approx_m_from_scaling_metrics,
+            approx_m_from_fractions,
+            approx_m_from_scaling
         )
 
-        if abs(R0 - R_approx_normed) > 0.5:
+        if diff > 0.5:
             warnings.warn(
-                "Approximated rotation matrix error is greater than 0.5 degrees."
-            )
-        return approx_m.astype(int)
+                "Approximated rotation matrix error is greater than 0.5 degrees.")
+        return result.astype(int)
 
     def __assign_orientations(self, misorientation: np.ndarray) -> None:
         """
@@ -162,7 +237,7 @@ class GBMaker:
         """
         return np.array(
             [
-                [-self.__vacuum_thickness, 2 * self.__x_dim + self.__vacuum_thickness],
+                [0, self.__x_dim + 2 * self.__vacuum_thickness],
                 [0, self.__y_dim],
                 [0, self.__z_dim],
             ]
@@ -213,13 +288,23 @@ class GBMaker:
             for axis, vec in zip(["x", "y", "z"], R_right_approx)
         }
 
-        spacing = {
-            axis: max(spacing_left[axis], spacing_right[axis])
-            for axis in ["x", "y", "z"]
-        }
+        spacing = {"x": {"left": spacing_left["x"], "right": spacing_right["x"]}}
+        self.__left_x = math.ceil(
+            self.__x_dim_min / spacing["x"]["left"]) * spacing["x"]["left"]
+        self.__right_x = math.ceil(
+            self.__x_dim_min / spacing["x"]["right"]) * spacing["x"]["right"]
+        self.__x_dim = self.__left_x + self.__right_x
+        spacing.update(
+            {
+                axis: max(spacing_left[axis], spacing_right[axis])
+                for axis in ["y", "z"]
+            }
+        )
 
         warnings.simplefilter("once", UserWarning)
         for key, val in spacing.items():
+            if key == 'x':
+                continue
             if threshold < val:
                 spacing[key] = threshold
                 warnings.warn("Resulting boundary is non-periodic.")
@@ -244,7 +329,7 @@ class GBMaker:
         :return: 4xn array containing the atom data (type and position) for the left
             grain.
         """
-        body_diagonal = np.linalg.norm([self.__x_dim, self.__y_dim, self.__z_dim])
+        body_diagonal = np.linalg.norm([self.__left_x, self.__y_dim, self.__z_dim])
         body_diagonal -= body_diagonal % self.__a0
         X = np.arange(-body_diagonal, body_diagonal, self.__a0)
 
@@ -254,9 +339,14 @@ class GBMaker:
         positions = np.vstack((atoms["x"], atoms["y"], atoms["z"])).T
         rotated_positions = np.dot(positions, self.__Rincl.T)
         atoms["x"], atoms["y"], atoms["z"] = rotated_positions.T
+        atoms["x"] += self.__vacuum_thickness
 
         return self.__get_points_inside_box(
-            atoms, [0, 0, 0, self.__x_dim, self.__y_dim, self.__z_dim]
+            atoms,
+            [
+                self.__vacuum_thickness, 0, 0,
+                self.__left_x + self.__vacuum_thickness, self.__y_dim, self.__z_dim
+            ]
         )
 
     def __generate_right_grain(self) -> np.ndarray:
@@ -266,7 +356,7 @@ class GBMaker:
         :return: 4xn array containing the atom data (type and position) for the right
             grain.
         """
-        body_diagonal = np.linalg.norm([2 * self.__x_dim, self.__y_dim, self.__z_dim])
+        body_diagonal = np.linalg.norm([self.__right_x, self.__y_dim, self.__z_dim])
         body_diagonal -= body_diagonal % self.__a0
         X = np.arange(-body_diagonal, body_diagonal, self.__a0)
 
@@ -277,9 +367,13 @@ class GBMaker:
         positions = np.vstack((atoms["x"], atoms["y"], atoms["z"])).T
         rotated_positions = np.dot(positions, R.T)
         atoms["x"], atoms["y"], atoms["z"] = rotated_positions.T
-        atoms["x"] += np.amax(self.__left_grain["x"])
+        atoms["x"] += np.amax(self.__left_grain["x"]) + self.__vacuum_thickness
         return self.__get_points_inside_box(
-            atoms, [self.__x_dim, 0, 0, 2 * self.__x_dim, self.__y_dim, self.__z_dim]
+            atoms,
+            [
+                self.__left_x + self.__vacuum_thickness, 0, 0,
+                self.__x_dim + self.__vacuum_thickness, self.__y_dim, self.__z_dim
+            ]
         )
 
     def __set_gb_region(self):
@@ -306,19 +400,16 @@ class GBMaker:
 
         # We use '<' for the y and z directions to not duplicate atoms across the
         # periodic boundary. For the x direction this doesn't matter as much because we
-        # do not have periodic boundaries in this direction, but '<=' allows for more
-        # atoms to be placed.
+        # do not have periodic boundaries in this direction, but '<=' causes more atoms
+        # to be placed.
         inside_box = (
-            (atoms["x"] >= x_min)
-            & (atoms["x"] <= x_max)
-            & (atoms["y"] >= y_min)
-            & (atoms["y"] < y_max)
-            & (atoms["z"] >= z_min)
-            & (atoms["z"] < z_max)
+            (atoms["x"] >= x_min) & (atoms["x"] < x_max) &
+            (atoms["y"] >= y_min) & (atoms["y"] < y_max) &
+            (atoms["z"] >= z_min) & (atoms["z"] < z_max)
         )
         return atoms[inside_box]
 
-    def __update_periodic_dims(self) -> None:
+    def __update_dims(self) -> None:
         """
         Updates the y_dim and z_dim parameters after a relevant parameter has been
         changed.
@@ -571,9 +662,8 @@ class GBMaker:
     @interaction_distance.setter
     def interaction_distance(self, value: Number) -> None:
         self.__interaction_distance = self.__validate(
-            value, Number, "interaction_distance", positive=True
-        )
-        self.__update_periodic_dims()
+            value, Number, "interaction_distance", positive=True)
+        self.__update_dims()
 
     @property
     def misorientation(self) -> np.ndarray:
@@ -600,9 +690,8 @@ class GBMaker:
     @repeat_factor.setter
     def repeat_factor(self, value: int):
         self.__repeat_factor = self.__validate(
-            value, (int, Sequence), "repeat_factor", positive=True
-        )
-        self.__update_periodic_dims()
+            value, (int, Sequence), "repeat_factor", positive=True)
+        self.__update_dims()
 
     @property
     def structure(self) -> str:
@@ -634,12 +723,13 @@ class GBMaker:
         self.__box_dims = self.__calculate_box_dimensions()
 
     @property
-    def x_dim(self) -> int:
-        return self.__x_dim
+    def x_dim_min(self) -> np.ndarray:
+        return self.__x_dim_min
 
-    @x_dim.setter
-    def x_dim(self, value: Number):
-        self.__x_dim = self.__validate(value, Number, "x_dim", positive=True)
+    @x_dim_min.setter
+    def x_dim_min(self, value: Number):
+        self.__x_dim_min = self.__validate(value, Number, "x_dim_min", positive=True)
+        self.update_spacing()
         self.__box_dims = self.__calculate_box_dimensions()
 
     # Additional getters for other class properties
@@ -672,11 +762,15 @@ class GBMaker:
         return self.__unit_cell
 
     @property
-    def y_dim(self) -> int:
+    def x_dim(self) -> float:
+        return self.__x_dim
+
+    @property
+    def y_dim(self) -> float:
         return self.__y_dim
 
     @property
-    def z_dim(self) -> int:
+    def z_dim(self) -> float:
         return self.__z_dim
 
 
