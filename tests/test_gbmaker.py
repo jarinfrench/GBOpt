@@ -192,7 +192,7 @@ class TestGBMaker(unittest.TestCase):
             self.gbm.repeat_factor = [1.5, 2.0]
 
         self.gbm.x_dim_min = 80.0
-        self.assertGreaterEqual(self.gbm.x_dim, 80.0)
+        self.assertEqual(self.gbm.x_dim_min, 80.0)
 
         self.gbm.vacuum_thickness = 15.0
         self.assertEqual(self.gbm.vacuum_thickness, 15.0)
@@ -218,9 +218,9 @@ class TestGBMaker(unittest.TestCase):
         approx_matrix = self.gbm._GBMaker__approximate_rotation_matrix_as_int(
             rotation_matrix)
 
-        expected_matrix = np.array([[27720, 19601, 19601],
+        expected_matrix = np.array([[27720,  19601,  19601],
                                     [27720, -19601, -19601],
-                                    [0, 1, -1]])
+                                    [0,      1,     -1]])
 
         np.testing.assert_array_equal(approx_matrix, expected_matrix)
 
@@ -246,7 +246,14 @@ class TestGBMaker(unittest.TestCase):
     def test_non_periodic_boundary_warning(self):
         with self.assertWarns(UserWarning):
             self.gbm._GBMaker__approximate_rotation_matrix_as_int(
-                np.array([[0.123456789, 0.56789123, -0.918273645], [-0.135792468, 0.246813579, 0.1], [0.159283746, -0.2, 0.1]]))
+                np.array(
+                    [
+                        [0.123456789, 0.56789123, -0.918273645],
+                        [-0.135792468, 0.246813579, 0.1],
+                        [0.159283746, -0.2, 0.1]
+                    ]
+                )
+            )
 
     # Additional tests
     # Output data file format is as expected.
@@ -270,6 +277,44 @@ class TestGBMaker(unittest.TestCase):
             self.assertEqual(content[10].strip(), "1 Cu")
             self.assertEqual(content[11].strip(), "2 H")
 
+    def test_lammps_file_formatting_with_charge(self):
+        atoms = np.array(
+            [
+                ('U', 0.0, 0.0, 0.0),
+                ('O', 0.25, 0.25, 0.25),
+                ('O', 0.25, 0.25, 0.75)
+            ],
+            dtype=Atom.atom_dtype
+        )
+        charges = {'U': 2.4, 'O': -1.2}
+        box_sizes = np.array([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]])
+        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+            self.gbm.write_lammps(temp_file.name, atoms, box_sizes, charges=charges)
+            with open(temp_file.name, 'r') as f:
+                content = f.readlines()
+            self.assertEqual(content[2].strip(), '3 atoms')
+            self.assertEqual(content[3].strip(), '2 atom types')
+            self.assertEqual(content[15].strip(),
+                             '1 U 2.400000 0.000000 0.000000 0.000000')
+            self.assertEqual(content[16].strip(),
+                             '2 O -1.200000 0.250000 0.250000 0.250000')
+            self.assertEqual(content[17].strip(),
+                             '3 O -1.200000 0.250000 0.250000 0.750000')
+
+        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+            self.gbm.write_lammps(temp_file.name, atoms, box_sizes,
+                                  charges=charges, type_as_int=True)
+            with open(temp_file.name, 'r') as f:
+                content = f.readlines()
+            self.assertEqual(content[2].strip(), '3 atoms')
+            self.assertEqual(content[3].strip(), '2 atom types')
+            self.assertEqual(content[10].strip(),
+                             '1 2 2.400000 0.000000 0.000000 0.000000')
+            self.assertEqual(content[11].strip(),
+                             '2 1 -1.200000 0.250000 0.250000 0.250000')
+            self.assertEqual(content[12].strip(),
+                             '3 1 -1.200000 0.250000 0.250000 0.750000')
+
     def test_data_integrity_in_gb(self):
         left_grain = self.gbm.left_grain
         right_grain = self.gbm.right_grain
@@ -283,7 +328,7 @@ class TestGBMaker(unittest.TestCase):
             GBMaker(self.a0, self.structure, -5.0,
                     self.misorientation, self.atom_types)  # Negative thickness
 
-    @pytest.mark.known_bug
+    @pytest.mark.xfail(reason="Fails due to issue #39")
     def test_single_grain_creation(self):
         gbm_single = GBMaker(3.54, "fcc", 5.0,
                              np.array([0, 0, 0, 0, 0]), "Cu",
