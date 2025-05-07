@@ -377,7 +377,7 @@ class UnitCell:
         Returns an array assigning a "type" number to each unique atom type.
         """
         names = np.array([a["name"] for a in self.__unit_cell])
-        converted_names = np.array([self.type_map[name] for name in np.unique(names)])
+        converted_names = np.array([self.type_map[name] for name in names])
 
         return converted_names
 

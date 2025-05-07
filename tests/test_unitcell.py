@@ -783,9 +783,9 @@ class TestUnitCell(unittest.TestCase):
     def test_types_method(self):
         cell = UnitCell()
         cell.init_by_structure("fluorite", 5.52, ["Ca", "F"])
-        self.assertTrue(all(cell.types() == [1, 2]))
+        self.assertTrue(all(cell.types() == [1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2]))
         cell.type_map = {"F": 1, "Ca": 2}
-        self.assertTrue(all(cell.types() == [2, 1]))
+        self.assertTrue(all(cell.types() == [2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1]))
 
 
 if __name__ == '__main__':

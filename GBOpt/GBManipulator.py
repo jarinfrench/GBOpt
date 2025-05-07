@@ -983,6 +983,8 @@ class GBManipulator:
                 parent.unit_cell.nn_distance(2) + parent.unit_cell.nn_distance(1)
             ) / 2
             neighbor_list = _create_neighbor_list(cutoff, positions)
+            Delta = 0.05  # Bin size to calculate the fingerprint vector.
+            Rmax = 15  # Max distance allowed to be a neighbor
             args_list = [
                 (
                     atoms[atom_idx],
@@ -990,8 +992,8 @@ class GBManipulator:
                     parent.unit_cell.names(asint=True),
                     parent.unit_cell.a0,
                     len(parent.unit_cell.unit_cell),
-                    0.05,
-                    15
+                    Delta,
+                    Rmax
                 )
                 for idx, atom_idx in enumerate(gb_atom_indices)
             ]
