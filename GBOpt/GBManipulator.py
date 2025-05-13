@@ -962,10 +962,10 @@ class GBManipulator:
             )
 
         if (num_to_remove is not None and
-                (
-                    num_to_remove < 1 or num_to_remove > int(0.25 * len(gb_atoms))
-                )
-            ):
+                    (
+                        num_to_remove < 1 or num_to_remove > int(0.25 * len(gb_atoms))
+                    )
+                ):
             raise GBManipulatorValueError(
                 "Invalid num_to_remove value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region."
@@ -1324,11 +1324,11 @@ class GBManipulator:
              )
 
         if (num_to_insert is not None and
-            (
-                        num_to_insert < 1 or
-                        num_to_insert > int(0.25 * len(gb_atoms))
+                (
+                    num_to_insert < 1 or
+                    num_to_insert > int(0.25 * len(gb_atoms))
                     )
-            ):
+                ):
             raise GBManipulatorValueError(
                 "Invalid num_to_insert value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region.")
@@ -1435,7 +1435,7 @@ class GBManipulator:
         threshold: float = None,
         *,
         mesh_size: int = 4,
-        num_q: int = 50,
+        num_q: int = 50,  # change to flag to use gamma point or random q vector
         num_children: int = 1,
         subtract_displacement: bool = False
     ) -> np.ndarray:
@@ -1488,6 +1488,7 @@ class GBManipulator:
             parent.unit_cell.positions(),
             parent.unit_cell.types()
         )
+        # TODO: Change to calculate if flag specifies no to gamma point
         mesh = [mesh_size, mesh_size, mesh_size]  # mesh of q vectors
         # Gets all symmetrically distinct q vectors, including time reversal symmetry
         _, grid = spg.get_ir_reciprocal_mesh(mesh, structure)
@@ -1514,10 +1515,10 @@ class GBManipulator:
 
         # For each unique q point, calculate the dynamical matrix and the associated
         # eigenvalues and eigenvectors.
-        for i, q_vec in enumerate(unique_q_points[:num_q]):
+        for i, q_vec in enumerate(unique_q_points[:num_q]):  # TODO: remove loop
             dynamical_matrix = _calculate_dynamical_matrix(
                 hardness, positions, parent.gb_indices, neighbor_list_typed, q_vec)
-            if 3 * n_atoms <= sparse_threshold:
+            if 3 * n_atoms <= sparse_threshold:  # TODO: remove this approach
                 freq_vals, disp_vals = np.linalg.eigh(dynamical_matrix)
             else:
                 sparse_matrix = sps.csc_matrix(dynamical_matrix)
