@@ -370,7 +370,7 @@ class GBMaker:
         positions = np.vstack((atoms["x"], atoms["y"], atoms["z"])).T
         rotated_positions = np.dot(positions, R.T)
         atoms["x"], atoms["y"], atoms["z"] = rotated_positions.T
-        atoms["x"] += np.amax(self.__left_grain["x"]) + self.__vacuum_thickness
+        atoms["x"] += np.amax(self.__left_grain["x"])
         return self.__get_points_inside_box(
             atoms,
             [

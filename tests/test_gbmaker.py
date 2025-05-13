@@ -344,6 +344,13 @@ class TestGBMaker(unittest.TestCase):
             self.assertFalse(
                 filecmp.cmp(temp_file.name, "./tests/gold/fcc_Cu.txt", shallow=False))
 
+    def test_large_vacuum(self):
+        gbm_large_vac = GBMaker(
+            5.454, "fluorite", 5.454, np.array([0, 0, 0, 0, 0]), ["U", "O"],
+            repeat_factor=(5, 5), x_dim_min=60, vacuum=400, interaction_distance=11.0
+        )
+        self.assertEqual(gbm_large_vac.vacuum_thickness, 400)
+
 
 if __name__ == "__main__":
     unittest.main()
