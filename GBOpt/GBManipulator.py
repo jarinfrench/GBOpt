@@ -1228,9 +1228,8 @@ class GBManipulator:
             sphere_radii = np.linalg.norm(
                 gb_atoms[valid_simplices] - valid_circumcenters, axis=1)
             interstitial_radii = sphere_radii - atom_radius
-            interstitial_radii -= np.min(interstitial_radii)  # make everything >= 0
+            interstitial_radii -= 0.95 * np.min(interstitial_radii)  # make values > 0
             probabilities = interstitial_radii / np.sum(interstitial_radii)
-            probabilities = probabilities / np.sum(probabilities)  # normalize
             assert abs(1 - np.sum(probabilities)
                        ) < 1e-8, "Probabilities are not normalized!"
             num_sites = len(circumcenters)
@@ -1295,16 +1294,6 @@ class GBManipulator:
 
             return filtered_sites, probabilities
 
-            indices = self.__rng.choice(num_sites,
-                                        num_to_insert,
-                                        replace=False,
-                                        p=probabilities
-                                        )
-            return filtered_sites[indices]
-
-            raise GBManipulatorValueError(
-                "fill_fraction or num_to_insert must be specified.")
-
         if not fill_fraction and not num_to_insert:
             raise GBManipulatorValueError(
                 "fill_fraction or num_to_insert must be specified."
@@ -1324,11 +1313,11 @@ class GBManipulator:
              )
 
         if (num_to_insert is not None and
-            (
-                        num_to_insert < 1 or
-                        num_to_insert > int(0.25 * len(gb_atoms))
+                (
+                    num_to_insert < 1 or
+                    num_to_insert > int(0.25 * len(gb_atoms))
                     )
-            ):
+                ):
             raise GBManipulatorValueError(
                 "Invalid num_to_insert value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region.")
