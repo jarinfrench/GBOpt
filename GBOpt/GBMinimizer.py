@@ -1,12 +1,11 @@
-# Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
-
-import numpy as np
-from GBOpt import GBMaker, GBManipulator
 import math
+import shutil
 import uuid
 from time import time
-import sys
-import shutil
+
+import numpy as np
+
+from GBOpt import GBMaker, GBManipulator
 
 
 class Mutator:
@@ -40,7 +39,7 @@ class Mutator:
             case "translate_right_grain":
                 dz = (GB.z_dim / GB.repeat_factor[1]
                       ) * local_random.uniform(0, 1)
-                dy = (GB.z_dim / GB.repeat_factor[0]
+                dy = (GB.y_dim / GB.repeat_factor[0]
                       ) * local_random.uniform(0, 1)
                 new_system = manipulator.translate_right_grain(dy=dy, dz=dz)
         return new_system
