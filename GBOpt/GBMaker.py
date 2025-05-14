@@ -596,7 +596,7 @@ class GBMaker:
                 "'atoms' and 'box_sizes' must be specified together."
             )
 
-        name_to_int = {name: i + 1 for i, name in enumerate(np.unique(atoms["name"]))}
+        name_to_int = self.__unit_cell.type_map
 
         if charges is not None:
             if not all([isinstance(i, int) or isinstance(i, str) for i in charges.keys()]):
