@@ -962,10 +962,10 @@ class GBManipulator:
             )
 
         if (num_to_remove is not None and
-                (
-                    num_to_remove < 1 or num_to_remove > int(0.25 * len(gb_atoms))
-                )
-            ):
+                    (
+                        num_to_remove < 1 or num_to_remove > int(0.25 * len(gb_atoms))
+                    )
+                ):
             raise GBManipulatorValueError(
                 "Invalid num_to_remove value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region."
@@ -1117,6 +1117,140 @@ class GBManipulator:
         else:
             return pos
 
+    def _Delaunay_approach(
+        gb_atoms: np.ndarray,
+        atom_radius: float,
+        num_to_insert: int,
+    ) -> np.ndarray:
+        """
+        Delaunay triangulation approach for inserting atoms. Potential insertion
+        sites are the circumcenters of the tetrahedra.
+
+        :param gb_atoms: Array of atom positions where we are considering inserting
+            new atoms.
+        :param atom_radius: The radius of an atom.
+        :param num_to_insert: The number of atoms to insert.
+        :param fill_fraction: The fraction of empty lattice sites to to fill. Must be
+            less than or equal to 25% of the total number of atoms in the slab.
+        :return: The sites at which new atoms are inserted, and the probabilities of
+            each site.
+        """
+        # First we need to duplicate the gb_atoms in the y and z directions to
+        # account for PBCs.
+        min_bounds = np.min(gb_atoms, axis=0)
+        max_bounds = np.max(gb_atoms, axis=0)
+        Lx, Ly, Lz = max_bounds - min_bounds
+        tiles = [(dy, dz) for dy in [-1, 0, 1] for dz in [-1, 0, 1]]
+        replicas = []
+        original_indices = []
+        for dy, dz in tiles:
+            shift = np.zeros_like(gb_atoms)
+            shift[:, 1] = dy * Ly
+            shift[:, 2] = dz * Lz
+            replicas.append(gb_atoms + shift)
+            original_indices.extend(np.arange(len(gb_atoms)))
+        tiled = np.vstack(replicas)
+        original_indices = np.array(original_indices)
+
+        # Delaunay triangulation approach
+        tri = Delaunay(tiled)
+        # ijk is for the 3x3 transformation matrix triangulation.transform[:, :3, :]
+        # ik is for the offset vector triangulation.transform[:, 3, :], and ij is
+        # the resulting circumcenter coordinates
+        circumcenters = -np.einsum(
+            "ijk,ik->ij",
+            tri.transform[:, :3, :],
+            tri.transform[:, 3, :]
+        )
+        # Wrap circumcenters back into the original bounds
+        circumcenters[:, 1] = np.mod(
+            circumcenters[:, 1] - min_bounds[1], Ly) + min_bounds[1]
+        circumcenters[:, 2] = np.mod(
+            circumcenters[:, 2] - min_bounds[2], Lz) + min_bounds[2]
+
+        original_indices_simplices = original_indices[tri.simplices]
+
+        # Bounds check
+        in_bounds = np.all((circumcenters >= min_bounds) & (
+            circumcenters <= max_bounds), axis=1)
+        mask = in_bounds
+
+        # Volume check
+        # Calculating the volume may occasionally fail if the points are collinear,
+        # so we catch the warning so users are not concerned.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            simplices = gb_atoms[original_indices_simplices]
+            A, B, C, D = simplices[:, 0], simplices[:,
+                                                    1], simplices[:, 2], simplices[:, 3]
+            volumes = np.abs(
+                np.einsum("ij,ij->i", np.cross(B - A, C - A), D - A)) / 6.0
+        volume_threshold = 1e-3
+        volume_mask = (volumes > volume_threshold * np.median(volumes)) & ~np.isnan(
+            circumcenters).any(axis=1)
+        mask &= volume_mask
+
+        # Convex hull check
+        hull_vertices = set(ConvexHull(gb_atoms).vertices)
+        simplex_mask = ~np.any(np.isin(tri.simplices, list(hull_vertices)), axis=1)
+        mask &= simplex_mask
+
+        valid_circumcenters = circumcenters[mask]
+        valid_simplices = original_indices_simplices[mask, 0]
+        sphere_radii = np.linalg.norm(
+            gb_atoms[valid_simplices] - valid_circumcenters, axis=1)
+        interstitial_radii = sphere_radii - atom_radius
+        interstitial_radii -= np.min(interstitial_radii)  # make everything >= 0
+        probabilities = interstitial_radii / np.sum(interstitial_radii)
+        probabilities = probabilities / np.sum(probabilities)  # normalize
+        assert abs(1 - np.sum(probabilities)
+                   ) < 1e-8, "Probabilities are not normalized!"
+
+        return valid_circumcenters, probabilities
+
+    def _grid_approach(
+        gb_atoms: np.ndarray,
+        atom_radius: float,
+        num_to_insert: int = None,
+    ) -> np.ndarray:
+        """
+        Grid approach for inserting atoms. Potential insertion sites are on a 1x1x1
+        Angstrom grid where sites must be at least *atom_radius* away.
+
+        :param gb_atoms: Array of atom positions where we are considering inserting
+            new atoms.
+        :param atom_radius: The radius of an atom.
+        :param num_to_insert: The number of atoms to insert.
+        :param fill_fraction: The fraction of empty lattice sites to to fill. Must be
+            less than or equal to 25% of the total number of atoms in the slab.
+        :return: The sites at which new atoms are inserted, and the probabilities of
+            each site.
+        """
+        # Grid approach
+        max_x, max_y, max_z = gb_atoms.max(axis=0)
+        min_x, min_y, min_z = gb_atoms.min(axis=0)
+        X, Y, Z = np.meshgrid(
+            np.arange(np.floor(min_x), np.ceil(max_x) + 1),
+            np.arange(np.floor(min_y), np.ceil(max_y) + 1),
+            np.arange(np.floor(min_z), np.ceil(max_z) + 1),
+            indexing="ij"
+        )
+        sites = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
+        GB_tree = KDTree(gb_atoms)
+        sites_tree = KDTree(sites)
+        indices_to_remove = GB_tree.query_ball_tree(sites_tree, atom_radius)
+        indices_to_remove = list(set(
+            [i for sublist in indices_to_remove for i in sublist]))
+        filtered_sites = np.delete(sites, indices_to_remove, axis=0)
+
+        distances, _ = GB_tree.query(filtered_sites, k=1)
+        probabilities = distances / np.sum(distances)
+        probabilities = probabilities / np.sum(probabilities)  # normalize
+        assert abs(1 - np.sum(probabilities)
+                   ) < 1e-8, "Probabilities are not normalized!"
+
+        return filtered_sites, probabilities
+
     def insert_atoms(
         self,
         *,
@@ -1148,162 +1282,6 @@ class GBManipulator:
             specified.
         :return: Atom positions after atom insertion.
         """
-        def Delaunay_approach(
-            gb_atoms: np.ndarray,
-            atom_radius: float,
-            num_to_insert: int
-        ) -> np.ndarray:
-            """
-            Delaunay triangulation approach for inserting atoms. Potential insertion
-            sites are the circumcenters of the tetrahedra.
-
-            :param gb_atoms: Array of atom positions where we are considering inserting
-                new atoms.
-            :param atom_radius: The radius of an atom.
-            :param num_to_insert: The number of atoms to insert.
-            :return: The sites at which new atoms are inserted.
-            """
-            # First we need to duplicate the gb_atoms in the y and z directions to
-            # account for PBCs.
-            min_bounds = np.min(gb_atoms, axis=0)
-            max_bounds = np.max(gb_atoms, axis=0)
-            Lx, Ly, Lz = max_bounds - min_bounds
-            tiles = [(dy, dz) for dy in [-1, 0, 1] for dz in [-1, 0, 1]]
-            replicas = []
-            original_indices = []
-            for dy, dz in tiles:
-                shift = np.zeros_like(gb_atoms)
-                shift[:, 1] = dy * Ly
-                shift[:, 2] = dz * Lz
-                replicas.append(gb_atoms + shift)
-                original_indices.extend(np.arange(len(gb_atoms)))
-            tiled = np.vstack(replicas)
-            original_indices = np.array(original_indices)
-
-            # Delaunay triangulation approach
-            tri = Delaunay(tiled)
-            # ijk is for the 3x3 transformation matrix triangulation.transform[:, :3, :]
-            # ik is for the offset vector triangulation.transform[:, 3, :], and ij is
-            # the resulting circumcenter coordinates
-            circumcenters = -np.einsum(
-                "ijk,ik->ij",
-                tri.transform[:, :3, :],
-                tri.transform[:, 3, :]
-            )
-            # Wrap circumcenters back into the original bounds
-            circumcenters[:, 1] = np.mod(
-                circumcenters[:, 1] - min_bounds[1], Ly) + min_bounds[1]
-            circumcenters[:, 2] = np.mod(
-                circumcenters[:, 2] - min_bounds[2], Lz) + min_bounds[2]
-
-            original_indices_simplices = original_indices[tri.simplices]
-
-            # Bounds check
-            in_bounds = np.all((circumcenters >= min_bounds) & (
-                circumcenters <= max_bounds), axis=1)
-            mask = in_bounds
-
-            # Volume check
-            # Calculating the volume may occasionally fail if the points are collinear,
-            # so we catch the warning so users are not concerned.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                simplices = gb_atoms[original_indices_simplices]
-                A, B, C, D = simplices[:, 0], simplices[:,
-                                                        1], simplices[:, 2], simplices[:, 3]
-                volumes = np.abs(
-                    np.einsum("ij,ij->i", np.cross(B - A, C - A), D - A)) / 6.0
-            volume_threshold = 1e-3
-            volume_mask = (volumes > volume_threshold * np.median(volumes)) & ~np.isnan(
-                circumcenters).any(axis=1)
-            mask &= volume_mask
-
-            # Convex hull check
-            hull_vertices = set(ConvexHull(gb_atoms).vertices)
-            simplex_mask = ~np.any(np.isin(tri.simplices, list(hull_vertices)), axis=1)
-            mask &= simplex_mask
-
-            valid_circumcenters = circumcenters[mask]
-            valid_simplices = original_indices_simplices[mask, 0]
-            sphere_radii = np.linalg.norm(
-                gb_atoms[valid_simplices] - valid_circumcenters, axis=1)
-            interstitial_radii = sphere_radii - atom_radius
-            interstitial_radii -= np.min(interstitial_radii)  # make everything >= 0
-            probabilities = interstitial_radii / np.sum(interstitial_radii)
-            probabilities = probabilities / np.sum(probabilities)  # normalize
-            assert abs(1 - np.sum(probabilities)
-                       ) < 1e-8, "Probabilities are not normalized!"
-            num_sites = len(circumcenters)
-
-            if num_to_insert is None:
-                num_to_insert = int(fill_fraction * num_sites)
-
-            if num_to_insert == 0:
-                warnings.warn("Calculated fraction of atoms to insert is 0: "
-                              f"int({fill_fraction}*{len(gb_atoms)}) = 0"
-                              )
-
-            return valid_circumcenters, probabilities
-
-        def grid_approach(
-            gb_atoms: np.ndarray,
-            atom_radius: float,
-            num_to_insert: int,
-        ) -> np.ndarray:
-            """
-            Grid approach for inserting atoms. Potential insertion sites are on a 1x1x1
-            Angstrom grid where sites must be at least *atom_radius* away.
-
-            :param gb_atoms: Array of atom positions where we are considering inserting
-                new atoms.
-            :param atom_radius: The radius of an atom.
-            :param num_to_insert: The number of atoms to insert.
-
-            :return: The sites at which new atoms are inserted.
-            """
-            # Grid approach
-            max_x, max_y, max_z = gb_atoms.max(axis=0)
-            min_x, min_y, min_z = gb_atoms.min(axis=0)
-            X, Y, Z = np.meshgrid(
-                np.arange(np.floor(min_x), np.ceil(max_x) + 1),
-                np.arange(np.floor(min_y), np.ceil(max_y) + 1),
-                np.arange(np.floor(min_z), np.ceil(max_z) + 1),
-                indexing="ij"
-            )
-            sites = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
-            GB_tree = KDTree(gb_atoms)
-            sites_tree = KDTree(sites)
-            indices_to_remove = GB_tree.query_ball_tree(sites_tree, atom_radius)
-            indices_to_remove = list(set(
-                [i for sublist in indices_to_remove for i in sublist]))
-            filtered_sites = np.delete(sites, indices_to_remove, axis=0)
-
-            distances, _ = GB_tree.query(filtered_sites, k=1)
-            probabilities = distances / np.sum(distances)
-            probabilities = probabilities / np.sum(probabilities)  # normalize
-            assert abs(1 - np.sum(probabilities)
-                       ) < 1e-8, "Probabilities are not normalized!"
-            num_sites = len(filtered_sites)
-
-            if num_to_insert is None:
-                num_to_insert = int(fill_fraction * num_sites)
-
-            if num_to_insert == 0:
-                warnings.warn("Calculated fraction of atoms to insert is 0: "
-                              f"int({fill_fraction}*{len(gb_atoms)}) = 0"
-                              )
-
-            return filtered_sites, probabilities
-
-            indices = self.__rng.choice(num_sites,
-                                        num_to_insert,
-                                        replace=False,
-                                        p=probabilities
-                                        )
-            return filtered_sites[indices]
-
-            raise GBManipulatorValueError(
-                "fill_fraction or num_to_insert must be specified.")
 
         if not fill_fraction and not num_to_insert:
             raise GBManipulatorValueError(
@@ -1324,11 +1302,11 @@ class GBManipulator:
              )
 
         if (num_to_insert is not None and
-            (
-                        num_to_insert < 1 or
-                        num_to_insert > int(0.25 * len(gb_atoms))
+                (
+                    num_to_insert < 1 or
+                    num_to_insert > int(0.25 * len(gb_atoms))
                     )
-            ):
+                ):
             raise GBManipulatorValueError(
                 "Invalid num_to_insert value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region.")
@@ -1365,10 +1343,10 @@ class GBManipulator:
 
         # Calculate the insertion sites using the specified approach.
         if method == "delaunay":
-            possible_sites, probabilities = Delaunay_approach(
+            possible_sites, probabilities = self._Delaunay_approach(
                 gb_atoms[:, 1:], parent.unit_cell.radius, num_to_insert)
         elif method == "grid":
-            possible_sites, probabilities = grid_approach(
+            possible_sites, probabilities = self._grid_approach(
                 gb_atoms[:, 1:], parent.unit_cell.radius, num_to_insert)
         else:
             raise GBManipulatorValueError(f"Unrecognized insert_atoms method: {method}")
