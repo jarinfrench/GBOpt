@@ -1117,7 +1117,8 @@ class GBManipulator:
         else:
             return pos
 
-    def _Delaunay_approach(
+    def Delaunay_approach(
+        self,
         gb_atoms: np.ndarray,
         atom_radius: float,
         num_to_insert: int,
@@ -1208,7 +1209,8 @@ class GBManipulator:
 
         return valid_circumcenters, probabilities
 
-    def _grid_approach(
+    def grid_approach(
+        self,
         gb_atoms: np.ndarray,
         atom_radius: float,
         num_to_insert: int = None,
@@ -1343,10 +1345,10 @@ class GBManipulator:
 
         # Calculate the insertion sites using the specified approach.
         if method == "delaunay":
-            possible_sites, probabilities = self._Delaunay_approach(
+            possible_sites, probabilities = self.Delaunay_approach(
                 gb_atoms[:, 1:], parent.unit_cell.radius, num_to_insert)
         elif method == "grid":
-            possible_sites, probabilities = self._grid_approach(
+            possible_sites, probabilities = self.grid_approach(
                 gb_atoms[:, 1:], parent.unit_cell.radius, num_to_insert)
         else:
             raise GBManipulatorValueError(f"Unrecognized insert_atoms method: {method}")
