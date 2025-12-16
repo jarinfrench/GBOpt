@@ -1,3 +1,5 @@
+# Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
+
 from collections.abc import Sequence
 from numbers import Number
 from typing import Any, Dict, Iterator, List, Tuple, Union

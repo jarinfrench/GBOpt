@@ -1,3 +1,5 @@
+# Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
+
 from GBOpt.Atom import Atom
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import GBManipulator

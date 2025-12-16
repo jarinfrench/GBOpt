@@ -1,3 +1,5 @@
+# Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
+
 from setuptools import find_packages, setup
 
 setup(

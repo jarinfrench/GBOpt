@@ -1,3 +1,6 @@
+# Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
+"""Grain boundary builder utilities."""
+
 import math
 import warnings
 from fractions import Fraction

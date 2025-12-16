@@ -1,3 +1,5 @@
+# Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
+
 import numpy as np
 from GBOpt import GBMaker, GBManipulator
 import math

@@ -1,3 +1,5 @@
+# Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
+
 import multiprocessing as mp
 import warnings
 from itertools import combinations_with_replacement
