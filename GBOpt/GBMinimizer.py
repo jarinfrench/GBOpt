@@ -103,11 +103,10 @@ class MonteCarloMinimizer:
 
         # Set the minimum GBE
         min_gbe = min(self.GBE_vals)
+        prev_gbe = init_gbe
 
         # Run the MC iterations
         for i in range(1, max_steps + 1):
-            prev_gbe = self.GBE_vals[-1]
-
             # Generate a random mutation on the current GB atom structure
             new_system = self.mutator.mutate(
                 self.local_random, self.GB, self.manipulator)
