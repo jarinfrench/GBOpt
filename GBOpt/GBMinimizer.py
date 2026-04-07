@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 from time import time
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -33,13 +33,16 @@ class Mutator:
         :param GBManipulator: GBManipulator object to perform the mutation on.
         :return: Atom positions after the mutation."""
         choice_key = local_random.choice(self.choices_keys)
+        mutation = None
         match choice_key:
             case "insert_atoms":
                 new_system = manipulator.insert_atoms(
                     method="grid", num_to_insert=1)
+                mutation = "add1"
 
             case "remove_atoms":
                 new_system = manipulator.remove_atoms(num_to_remove=1)
+                mutation = "remove1"
 
             case "translate_right_grain":
                 dz = (GB.z_dim / GB.repeat_factor[1]
@@ -47,7 +50,8 @@ class Mutator:
                 dy = (GB.z_dim / GB.repeat_factor[0]
                       ) * local_random.uniform(0, 1)
                 new_system = manipulator.translate_right_grain(dy=dy, dz=dz)
-        return new_system
+                mutation = f"shift{dy:.8f}dy{dz:.8f}dz"
+        return mutation, new_system
 
 
 class MonteCarloMinimizer:
@@ -61,16 +65,39 @@ class MonteCarloMinimizer:
     :param seed: The seed to initialize the numpy.random.default_rng with.
     """
 
-    def __init__(self, GB: GBMaker, gb_energy_func: Callable, choices: list, seed=time()):
+    def __init__(self, GB: GBMaker, gb_energy_func: Callable, choices: list, seed=None, *, initial_structure: Any = None):
         self.GB = GB
         self.gb_energy_func = gb_energy_func
-        self.manipulator = GBManipulator(self.GB)
+        self.initial_structure = initial_structure
+        self.manipulator = self._make_initial_manipulator()
         self.mutator = Mutator(choices, self.manipulator)
         self.accepted_idx = [0]  # Initial guess is accepted by definition
-        self.__operation_list__ = ["START"]
-        self.local_random = np.random.default_rng(seed)
+        self.operation_list = [["START", True]]
+        self.local_random = np.random.default_rng(int(time()) if seed is None else seed)
         self.manipulator.rng = self.local_random
         self.GBE_vals = []
+
+    def _make_initial_manipulator(self) -> GBManipulator:
+        """
+        Build the starting GBManipulator.
+
+        - gbmaker (self.GB) remains the authoritative reference for unit_cell/gb_thickness.
+        - initial structure may be:
+            * None -> Use GBManipulator(self.GB)
+            * GBMaker -> generate starting structure from that maker
+            * anything else -> pass to GBManipulator as a "structure spec" that it can read,
+                while still injecting unit_cell/gb_thickness from self.GB.
+        """
+        seed = self.initial_structure
+        if seed is None:
+            manip = GBManipulator(self.GB)
+        elif isinstance(seed, GBMaker):
+            manip = GBManipulator(seed)
+        else:
+            manip = GBManipulator(seed, unit_cell=self.GB.unit_cell,
+                                  gb_thickness=self.GB.gb_thickness)
+
+        return manip
 
     def run_MC(self, E_accept: float = 1e-1, max_steps: int = 50, E_tol: float = 1e-4, max_rejections: int = 20, cooldown_rate: float = 1.0, unique_id: int = uuid.uuid4(), **kwargs) -> float:
         # TODO: Add options for changing from linear to logarithmic cooldown
@@ -113,7 +140,7 @@ class MonteCarloMinimizer:
         # Run the MC iterations
         for i in range(1, max_steps + 1):
             # Generate a random mutation on the current GB atom structure
-            new_system = self.mutator.mutate(
+            mutation, new_system = self.mutator.mutate(
                 self.local_random, self.GB, self.manipulator)
 
             # Evaluate the energy of this new structure and append it to the GBE values list
@@ -131,6 +158,7 @@ class MonteCarloMinimizer:
                 0, 1) <= math.exp(-(new_gbe - prev_gbe) / T)
 
             if accepted:
+                self.operation_list.append([mutation, True])
                 # Generate a new GB manipulator using the new structure from the dump file
                 self.manipulator = GBManipulator(
                     dump_file_name,
@@ -156,6 +184,7 @@ class MonteCarloMinimizer:
                         break
                     min_gbe = new_gbe
             else:
+                self.operation_list.append([mutation, False])
                 rejection_count += 1
                 # If too many structures are rejected back-to-back, we prematurely stop the MC iterations since we are stuck
                 if rejection_count > max_rejections:
@@ -175,7 +204,7 @@ class GeneticAlgorithmMinimizer:
     the configuration space.
     """
 
-    def __init__(self, GB: GBMaker, gb_energy_func: Callable, choices: list, seed=time(), *, population_size: int = 20, generations: int = 50, keep_top_pct: int = 10, intermediate_pct: int = 60, gb_batch_energy_func: Callable | None = None):
+    def __init__(self, GB: GBMaker, gb_energy_func: Callable, choices: list, seed=time(), *, initial_structure: Any = None, population_size: int = 20, generations: int = 50, keep_top_pct: int = 10, intermediate_pct: int = 60, gb_batch_energy_func: Callable | None = None):
         """
         :param GB: GBMaker object to perform minimization on.
         :param gb_energy_func: Function that returns the energy of a GB structure. It must be callable with
@@ -196,15 +225,30 @@ class GeneticAlgorithmMinimizer:
         self.GB = GB
         self.gb_energy_func = gb_energy_func
         self.gb_batch_energy_func = gb_batch_energy_func
-        self.manipulator = GBManipulator(self.GB)
-        self.mutator = Mutator(choices, self.manipulator)
+        self.initial_structure = initial_structure
         self.local_random = np.random.default_rng(seed)
+        self.manipulator = self._make_initial_manipulator()
+        self.mutator = Mutator(choices, self.manipulator)
         self.manipulator.rng = self.local_random
         self.population_size = population_size
         self.generations = generations
         self.keep_top_pct = keep_top_pct
         self.intermediate_pct = intermediate_pct
         self.GBE_vals = []
+
+    def _make_initial_manipulator(self) -> GBManipulator:
+        seed = self.initial_structure
+        if seed is None:
+            manip = GBManipulator(self.GB)
+        elif isinstance(seed, GBMaker):
+            manip = GBManipulator(seed)
+        else:
+            manip = GBManipulator(seed, unit_cell=self.GB.unit_cell,
+                                  gb_thickness=self.GB.gb_thickness)
+
+        manip.rng = self.local_random if hasattr(self, "local_random") else None
+
+        return manip
 
     def _make_manipulator_from_file(self, filename: str) -> GBManipulator:
         manipulator = GBManipulator(
@@ -385,7 +429,15 @@ class GeneticAlgorithmMinimizer:
         population_structures = []
         population_lineages = []
 
-        for _ in range(self.population_size):
+        if self.initial_structure is not None:
+            seed_manip = self._make_manipulator_from_file(base_parent)
+            population_manipulators.append(seed_manip)
+            population_structures.append(
+                np.array(seed_manip.parents[0].whole_system, copy=True))
+            population_lineages.append([base_parent])
+
+        n_to_generate = self.population_size - len(population_manipulators)
+        for _ in range(n_to_generate):
             candidate_manip = self._make_manipulator_from_file(base_parent)
             candidate_struct = self.mutator.mutate(
                 local_random=self.local_random,
