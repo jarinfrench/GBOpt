@@ -192,7 +192,8 @@ class Atom:
         converted = np.empty((len(atoms), 4))
         names = atoms["name"]
         if type_map is None:
-            type_map = {name: idx + 1 for idx, name in enumerate(set(names))}
+            unique_names = list(dict.fromkeys(names))
+            type_map = {name: idx + 1 for idx, name in enumerate(unique_names)}
         else:
             if not isinstance(type_map, dict):
                 return AtomTypeError(
