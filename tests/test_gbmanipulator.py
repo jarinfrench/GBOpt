@@ -226,6 +226,66 @@ class TestGBManipulator(unittest.TestCase):
         new_system = gbm.insert_atoms(num_to_insert=1, keep_ratio=True)
         self.assertEqual(len(GB.whole_system)+3, len(new_system))
 
+    def test_type_preservation_with_numeric_roundtrip(self):
+        theta = math.radians(36.869898)
+        gb = GBMaker(
+            a0=3.0,
+            structure="rocksalt",
+            gb_thickness=5.0,
+            misorientation=[theta, 0, 0, 0, -theta / 2.0],
+            atom_types=("Na", "Cl"),
+            repeat_factor=(2, 2),
+            x_dim_min=5.0,
+            vacuum=2.0,
+            interaction_distance=4.0
+        )
+        expected_types = {"Na", "Cl"}
+        base_names = gb.whole_system["name"]
+        self.assertEqual(set(base_names), expected_types)
+
+        def roundtrip_names(atoms):
+            with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+                gb.write_lammps(
+                    temp_file.name,
+                    atoms,
+                    gb.box_dims,
+                    type_as_int=True,
+                )
+                loaded = GBManipulator(
+                    temp_file.name,
+                    unit_cell=gb.unit_cell,
+                    gb_thickness=gb.gb_thickness,
+                    seed=self.seed,
+                )
+                return loaded.parents[0].whole_system["name"]
+
+        manipulator = GBManipulator(gb, seed=self.seed)
+
+        translated = manipulator.translate_right_grain(0.1, 0.2)
+        self.assertTrue(np.array_equal(translated["name"], base_names))
+        self.assertEqual(set(roundtrip_names(translated)), expected_types)
+
+        removed = manipulator.remove_atoms(num_to_remove=1, keep_ratio=True)
+        self.assertEqual(set(roundtrip_names(removed)), expected_types)
+
+        inserted = manipulator.insert_atoms(
+            num_to_insert=1,
+            method="grid",
+            keep_ratio=True,
+        )
+        self.assertTrue(
+            np.array_equal(inserted["name"][:len(base_names)], base_names)
+        )
+        self.assertEqual(set(roundtrip_names(inserted)), expected_types)
+
+        manipulator_two = GBManipulator(gb, gb, seed=self.seed)
+        sliced = manipulator_two.slice_and_merge()
+        self.assertEqual(set(roundtrip_names(sliced)), expected_types)
+
+        soft_mode_displaced = manipulator.displace_along_soft_modes()
+        self.assertTrue(np.array_equal(soft_mode_displaced["name"], base_names))
+        self.assertEqual(set(roundtrip_names(soft_mode_displaced)), expected_types)
+
     @pytest.mark.slow
     def test_displace_along_soft_modes_base(self):
         # test the base case
