@@ -425,10 +425,11 @@ class GBMaker:
         # periodic boundary. For the x direction this doesn't matter as much because we
         # do not have periodic boundaries in this direction, but '<=' causes more atoms
         # to be placed.
+        eps = 1e-10
         inside_box = (
-            (atoms["x"] >= x_min) & (atoms["x"] < x_max) &
-            (atoms["y"] >= y_min) & (atoms["y"] < y_max) &
-            (atoms["z"] >= z_min) & (atoms["z"] < z_max)
+            (atoms["x"] >= x_min - eps) & (atoms["x"] < x_max) &
+            (atoms["y"] >= y_min - eps) & (atoms["y"] < y_max) &
+            (atoms["z"] >= z_min - eps) & (atoms["z"] < z_max)
         )
         return atoms[inside_box]
 
