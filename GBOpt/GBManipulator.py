@@ -456,6 +456,9 @@ class Parent:
                     y_dims = [float(line_sp[0]), float(line_sp[1])]
                 elif "zlo zhi" in line:
                     z_dims = [float(line_sp[0]), float(line_sp[1])]
+                elif "xy xz yz" in line:
+                    tilt = [float(line_sp[0]), float(line_sp[1]), float(line_sp[2])]
+                    self.__tilt = tilt
                 elif line == "Atom Type Labels":
                     next(lines)  # Skip the blank line before the data
                     skiprows += 1

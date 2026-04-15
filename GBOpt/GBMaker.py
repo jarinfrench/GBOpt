@@ -240,13 +240,13 @@ class GBMaker:
             threshold = self.__a0 * 15
 
         # approximate the rotation matrix as integers
-        R_left = self.__Rincl
-        R_right = np.dot(self.__Rmis, self.__Rincl)
+        self.__R_left = self.__Rincl
+        self.__R_right = np.dot(self.__Rmis, self.__Rincl)
         # # We store the approximate matrices as objects to allow for large numbers
-        R_left_approx = self.__approximate_rotation_matrix_as_int(R_left).astype(object)
-        R_right_approx = self.__approximate_rotation_matrix_as_int(R_right).astype(
-            object
-        )
+        self.__R_left_approx = self.__approximate_rotation_matrix_as_int(
+            self.__R_left).astype(object)
+        self.__R_right_approx = self.__approximate_rotation_matrix_as_int(
+            self.__R_right).astype(object)
 
         # The periodic distance in each direction is the lattice parameter multiplied by
         # norm of the Miller indices in that direction. This is determined using the
@@ -257,11 +257,11 @@ class GBMaker:
         # (a0**2/d**2)*d = a0**2/d --> spacing = a0 * sqrt(h**2+k**2+l**2)
         spacing_left = {
             axis: self.__a0 * np.linalg.norm(vec)
-            for axis, vec in zip(["x", "y", "z"], R_left_approx)
+            for axis, vec in zip(["x", "y", "z"], self.__R_left_approx)
         }
         spacing_right = {
             axis: self.__a0 * np.linalg.norm(vec)
-            for axis, vec in zip(["x", "y", "z"], R_right_approx)
+            for axis, vec in zip(["x", "y", "z"], self.__R_right_approx)
         }
 
         spacing = {"x": {"left": spacing_left["x"], "right": spacing_right["x"]}}
@@ -287,6 +287,47 @@ class GBMaker:
         warnings.simplefilter("default", UserWarning)
 
         return spacing
+
+    def __get_triclinic_params(self):
+        """
+        Computes the LAMMPS restricted-triclinic tilt factors. The y-period in the lab
+        frame is R_grain @ (g_y * a0). For an exact CSL boundary this is exactly
+        ||g_y|| * a0 * e_y; for non-CSL it has small x and z components. To satisfy
+        LAMMPS's restriction that the b-vector lies in the xy-plane, rotate everything
+        about the x-axis by theta = -atan2(A2[2], A2[1]).
+
+        :return: (xy, xz, yz, theta) - the three tilt scalars and the rotation angle to
+                                       apply to atom coordinates
+        """
+
+        # Use grain with larger y-period, consistent with how spacing["y"] is chosen
+        if np.linalg.norm(self.__R_left_approx[1]) >= np.linalg.norm(self.__R_right_approx[1]):
+            R_grain = self.__R_left
+            g_y = self.__R_left_approx[1].astype(float)
+            g_z = self.__R_left_approx[2].astype(float)
+        else:
+            R_grain = self.__R_right
+            g_y = self.__R_right_approx[1].astype(float)
+            g_z = self.__R_right_approx[2].astype(float)
+
+        # Lab-frame period vectors
+        A2_lab = R_grain @ (g_y * self.__a0)
+        A3_lab = R_grain @ (g_z * self.__a0)
+
+        # Rotate about x to bring A2 into the xy-plane (LAMMPS restricted-triclinic
+        # requires b-vector in the xy-plane). x-components are unaffected by this
+        # rotation
+        theta = -math.atan2(float(A2_lab[2]), float(A2_lab[1]))
+        ct, st = math.cos(theta), math.sin(theta)
+
+        # The x-rotation matrix is [[1,0,0],[0,ct,-st],[0,st,ct]]. The x-components of
+        # A2_lab and A3_lab are unchanged by it, so xy and xz can be read direcly from
+        # the pre-rotation vectors. yz requires the full rotation.
+        xy = float(A2_lab[0])
+        xz = float(A3_lab[0])
+        yz = float(ct * A3_lab[1] - st * A3_lab[2])
+
+        return xy, xz, yz, theta
 
     def __init_unit_cell(self, atom_types: str | Tuple[str, ...]) -> UnitCell:
         """
@@ -539,7 +580,8 @@ class GBMaker:
         *,
         type_as_int: bool = False,
         precision: int = 6,
-        charges: dict = None
+        charges: dict = None,
+        triclinic: bool = False
     ) -> None:
         """
         Writes the atom positions with the given box dimensions to a LAMMPS input file.
@@ -618,6 +660,13 @@ class GBMaker:
                 f'{box_sizes[1][0]:.{precision}f} {box_sizes[1][1]:.{precision}f} ylo yhi\n')
             fdata.write(
                 f'{box_sizes[2][0]:.{precision}f} {box_sizes[2][1]:.{precision}f} zlo zhi\n')
+            if triclinic:
+                xy, xz, yz, theta = self.__get_triclinic_params()
+                fdata.write(
+                    f'{xy:.{precision}f} {xz:.{precision}f} {yz:.{precision}f} xy xz yz\n'
+                )
+                ct, st = math.cos(theta), math.sin(theta)
+                Rx = np.array([[1, 0, 0], [0, ct, -st], [0, st, ct]])
 
             if not type_as_int:
                 fdata.write("\nAtom Type Labels\n\n")
@@ -633,6 +682,9 @@ class GBMaker:
                     charge = charges[name_to_int[name]]if type_as_int else charges[name]
                 else:
                     charge = None
+
+                if triclinic:
+                    pos = Rx @ np.array(pos, dtype=float)
                 fdata.write(format_atom_line(i + 1, name, pos, charge))
 
     # Properties with getters and setters. Automatic updates for related parameters are
