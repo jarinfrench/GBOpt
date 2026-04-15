@@ -9,7 +9,6 @@ import warnings
 from unittest.mock import patch
 
 import numpy as np
-import pytest
 
 from GBOpt.Atom import Atom, AtomValueError
 from GBOpt.GBMaker import GBMaker, GBMakerTypeError, GBMakerValueError
@@ -319,7 +318,6 @@ class TestGBMaker(unittest.TestCase):
             GBMaker(self.a0, self.structure, -5.0,
                     self.misorientation, self.atom_types)  # Negative thickness
 
-    @pytest.mark.xfail(reason="Fails due to issue #39")
     def test_single_grain_creation(self):
         gbm_single = GBMaker(3.54, "fcc", 5.0,
                              np.array([0, 0, 0, 0, 0]), "Cu",
@@ -329,8 +327,7 @@ class TestGBMaker(unittest.TestCase):
                              )
         with tempfile.NamedTemporaryFile(delete=True) as temp_file:
             gbm_single.write_lammps(temp_file.name)
-            # This test _will_ fail until we address #39
-            self.assertFalse(
+            self.assertTrue(
                 filecmp.cmp(temp_file.name, "./tests/gold/fcc_Cu.txt", shallow=False))
 
 
