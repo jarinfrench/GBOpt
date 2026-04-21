@@ -495,6 +495,19 @@ class GBMaker:
         )
         return atoms[inside_box]
 
+    def __reduced_coordinate_tolerance(self, basis_vector: np.ndarray) -> float:
+        """
+        Convert the Cartesian epsilon to reduced-coordinate units for a basis vector.
+
+        :param basis_vector: Cartesian basis vector used to define the coordinate scale.
+        :return: Reduced-coordinate tolerance corresponding to ``self.__epsilon``.
+        """
+        basis_vector = np.asarray(basis_vector, dtype=np.float64)
+        basis_length = np.linalg.norm(basis_vector)
+        if basis_length <= 0.0 or not np.isfinite(basis_length):
+            raise GBMakerValueError("basis_vector must have non-zero length.")
+        return self.__epsilon / basis_length
+
     def __update_dims(self) -> None:
         """
         Updates the y_dim and z_dim parameters after a relevant parameter has been

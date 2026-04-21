@@ -161,6 +161,30 @@ class TestGBMaker(unittest.TestCase):
                 with self.assertRaises(GBMakerValueError):
                     wrap_reduced_coordinate(np.array([0.25]), tol=tol)
 
+    def test_reduced_coordinate_tolerance_scales_with_basis_length(self):
+        basis_vector = np.array([3.0, 4.0, 0.0])
+        self.gbm.epsilon = 2e-8
+
+        tol = self.gbm._GBMaker__reduced_coordinate_tolerance(basis_vector)
+
+        self.assertAlmostEqual(tol, 4e-9, delta=1e-18)
+
+    def test_reduced_coordinate_tolerance_rejects_zero_length_basis_vector(self):
+        with self.assertRaises(GBMakerValueError):
+            self.gbm._GBMaker__reduced_coordinate_tolerance(np.zeros(3))
+
+    def test_reduced_coordinate_tolerance_rejects_non_finite_basis_vectors(self):
+        for basis_vector in (
+            np.array([np.nan, 0.0, 0.0]),
+            np.array([np.inf, 0.0, 0.0]),
+            np.array([-np.inf, 0.0, 0.0]),
+            np.array([1.0, np.nan, 2.0]),
+            np.array([1.0, np.inf, 2.0]),
+        ):
+            with self.subTest(basis_vector=basis_vector):
+                with self.assertRaises(GBMakerValueError):
+                    self.gbm._GBMaker__reduced_coordinate_tolerance(basis_vector)
+
     # Tests for additional getters
     def test_additional_getters(self):
         self.assertGreater(self.gbm.y_dim, 0)
