@@ -605,6 +605,26 @@ class GBMaker:
 
         return box_basis
 
+    def __selection_basis_vectors(self, primitive_periods: np.ndarray) -> np.ndarray:
+        """
+        Build the canonical in-plane selection basis for y/z box coordinates.
+
+        Periodic axes use the box-periodic basis vectors; non-periodic axes fall back
+        to the corresponding Cartesian unit vectors.
+
+        :param primitive_periods: 2x3 array containing primitive y/z period vectors.
+        :return: 2x3 array containing the y/z selection basis vectors.
+        """
+        selection_basis = self.__box_periodic_basis(primitive_periods)
+        inplane_periodic = getattr(self, "_GBMaker__inplane_periodic", (True, True))
+
+        for row_index, is_periodic in enumerate(inplane_periodic):
+            if is_periodic:
+                continue
+            selection_basis[row_index, row_index + 1] = 1.0
+
+        return selection_basis
+
     def __reduced_box_coordinates(
         self, cartesian_coordinates: np.ndarray, box_basis: np.ndarray
     ) -> np.ndarray:

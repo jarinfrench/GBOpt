@@ -734,6 +734,53 @@ class TestGBMakerBoxPeriodicBasis(unittest.TestCase):
             self.gbm._GBMaker__box_periodic_basis(primitive_periods)
 
 
+class TestGBMakerSelectionBasisVectors(unittest.TestCase):
+    def setUp(self):
+        self.gbm = object.__new__(GBMaker)
+        self.gbm._GBMaker__epsilon = 1e-10
+        self.gbm._GBMaker__y_dim = 12.0
+        self.gbm._GBMaker__z_dim = 15.0
+
+    def test_selection_basis_vectors_uses_periodic_box_basis_for_both_axes(self):
+        self.gbm._GBMaker__inplane_periodic = (True, True)
+        primitive_periods = np.array([[2.0, 4.0, -1.0], [-3.0, 1.5, 5.0]])
+
+        basis = self.gbm._GBMaker__selection_basis_vectors(primitive_periods)
+
+        np.testing.assert_allclose(
+            basis,
+            np.array([[6.0, 12.0, -3.0], [-9.0, 4.5, 15.0]]),
+            atol=1e-12,
+            rtol=0.0,
+        )
+
+    def test_selection_basis_vectors_uses_cartesian_unit_vector_for_nonperiodic_y(self):
+        self.gbm._GBMaker__inplane_periodic = (False, True)
+        primitive_periods = np.array([[2.0, 4.0, -1.0], [-3.0, 1.5, 5.0]])
+
+        basis = self.gbm._GBMaker__selection_basis_vectors(primitive_periods)
+
+        np.testing.assert_allclose(
+            basis,
+            np.array([[0.0, 1.0, 0.0], [-9.0, 4.5, 15.0]]),
+            atol=1e-12,
+            rtol=0.0,
+        )
+
+    def test_selection_basis_vectors_uses_cartesian_unit_vector_for_nonperiodic_z(self):
+        self.gbm._GBMaker__inplane_periodic = (True, False)
+        primitive_periods = np.array([[2.0, 4.0, -1.0], [-3.0, 1.5, 5.0]])
+
+        basis = self.gbm._GBMaker__selection_basis_vectors(primitive_periods)
+
+        np.testing.assert_allclose(
+            basis,
+            np.array([[6.0, 12.0, -3.0], [0.0, 0.0, 1.0]]),
+            atol=1e-12,
+            rtol=0.0,
+        )
+
+
 class TestGBMakerBoxCoordinateConversions(unittest.TestCase):
     def setUp(self):
         self.gbm = object.__new__(GBMaker)
