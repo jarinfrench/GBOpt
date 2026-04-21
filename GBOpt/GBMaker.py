@@ -605,6 +605,86 @@ class GBMaker:
 
         return box_basis
 
+    def __reduced_box_coordinates(
+        self, cartesian_coordinates: np.ndarray, box_basis: np.ndarray
+    ) -> np.ndarray:
+        """
+        Convert Cartesian coordinates to mixed box coordinates ``[x_cart, u_y, u_z]``.
+
+        The mixed basis is ``[e_x, A_y, A_z]`` where ``e_x`` is the Cartesian x-axis
+        and ``A_y``/``A_z`` are the in-plane box basis vectors.
+
+        :param cartesian_coordinates: Cartesian coordinates with shape ``(..., 3)``.
+        :param box_basis: 2x3 array containing ``A_y`` and ``A_z``.
+        :return: Mixed box coordinates with shape ``(..., 3)``.
+        """
+        cartesian_coordinates = np.asarray(cartesian_coordinates, dtype=np.float64)
+        box_basis = np.asarray(box_basis, dtype=np.float64)
+
+        if cartesian_coordinates.shape[-1] != 3:
+            raise GBMakerValueError(
+                "cartesian_coordinates must have a trailing dimension of length 3."
+            )
+        if box_basis.shape != (2, 3):
+            raise GBMakerValueError("box_basis must be a 2x3 array.")
+        if not np.all(np.isfinite(cartesian_coordinates)):
+            raise GBMakerValueError(
+                "cartesian_coordinates must contain only finite values."
+            )
+        if not np.all(np.isfinite(box_basis)):
+            raise GBMakerValueError("box_basis must contain only finite values.")
+
+        yz_basis = box_basis[:, 1:].T
+        determinant = np.linalg.det(yz_basis)
+        if np.isclose(determinant, 0.0, atol=self.__epsilon, rtol=0.0):
+            raise GBMakerValueError(
+                "box_basis y/z projections must form an invertible 2x2 basis."
+            )
+
+        yz_coordinates = cartesian_coordinates[..., 1:]
+        reduced_yz = np.linalg.solve(
+            yz_basis, yz_coordinates.reshape(-1, 2).T
+        ).T.reshape(yz_coordinates.shape)
+        x_cart = (
+            cartesian_coordinates[..., 0]
+            - reduced_yz[..., 0] * box_basis[0, 0]
+            - reduced_yz[..., 1] * box_basis[1, 0]
+        )
+        return np.concatenate((x_cart[..., np.newaxis], reduced_yz), axis=-1)
+
+    def __cartesian_from_box_coordinates(
+        self, box_coordinates: np.ndarray, box_basis: np.ndarray
+    ) -> np.ndarray:
+        """
+        Convert mixed box coordinates ``[x_cart, u_y, u_z]`` to Cartesian coordinates.
+
+        :param box_coordinates: Mixed box coordinates with shape ``(..., 3)``.
+        :param box_basis: 2x3 array containing ``A_y`` and ``A_z``.
+        :return: Cartesian coordinates with shape ``(..., 3)``.
+        """
+        box_coordinates = np.asarray(box_coordinates, dtype=np.float64)
+        box_basis = np.asarray(box_basis, dtype=np.float64)
+
+        if box_coordinates.shape[-1] != 3:
+            raise GBMakerValueError(
+                "box_coordinates must have a trailing dimension of length 3."
+            )
+        if box_basis.shape != (2, 3):
+            raise GBMakerValueError("box_basis must be a 2x3 array.")
+        if not np.all(np.isfinite(box_coordinates)):
+            raise GBMakerValueError("box_coordinates must contain only finite values.")
+        if not np.all(np.isfinite(box_basis)):
+            raise GBMakerValueError("box_basis must contain only finite values.")
+
+        cartesian_coordinates = np.array(box_coordinates, copy=True)
+        cartesian_coordinates[..., 0] += np.tensordot(
+            box_coordinates[..., 1:], box_basis[:, 0], axes=([-1], [0])
+        )
+        cartesian_coordinates[..., 1:] = np.tensordot(
+            box_coordinates[..., 1:], box_basis[:, 1:], axes=([-1], [0])
+        )
+        return cartesian_coordinates
+
     def __update_dims(self) -> None:
         """
         Updates the y_dim and z_dim parameters after a relevant parameter has been

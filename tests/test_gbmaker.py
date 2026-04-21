@@ -734,6 +734,70 @@ class TestGBMakerBoxPeriodicBasis(unittest.TestCase):
             self.gbm._GBMaker__box_periodic_basis(primitive_periods)
 
 
+class TestGBMakerBoxCoordinateConversions(unittest.TestCase):
+    def setUp(self):
+        self.gbm = object.__new__(GBMaker)
+        self.gbm._GBMaker__epsilon = 1e-10
+
+    def test_reduced_box_coordinates_handles_orthorhombic_basis(self):
+        box_basis = np.array([[0.0, 12.0, 0.0], [0.0, 0.0, 15.0]])
+        cartesian = np.array([[1.25, 6.0, 3.75], [4.5, 3.0, 12.0]])
+
+        reduced = self.gbm._GBMaker__reduced_box_coordinates(cartesian, box_basis)
+
+        np.testing.assert_allclose(
+            reduced,
+            np.array([[1.25, 0.5, 0.25], [4.5, 0.25, 0.8]]),
+            atol=1e-12,
+            rtol=0.0,
+        )
+
+    def test_cartesian_from_box_coordinates_handles_tilted_basis(self):
+        box_basis = np.array([[6.0, 12.0, -3.0], [-9.0, 4.5, 15.0]])
+        box_coordinates = np.array([[1.5, 0.25, 0.75], [-2.0, 0.5, 0.2]])
+
+        cartesian = self.gbm._GBMaker__cartesian_from_box_coordinates(
+            box_coordinates, box_basis
+        )
+
+        np.testing.assert_allclose(
+            cartesian,
+            np.array([[-3.75, 6.375, 10.5], [-0.8, 6.9, 1.5]]),
+            atol=1e-12,
+            rtol=0.0,
+        )
+
+    def test_reduced_box_coordinates_and_cartesian_from_box_coordinates_round_trip(self):
+        box_basis = np.array([[6.0, 12.0, -3.0], [-9.0, 4.5, 15.0]])
+        cartesian = np.array(
+            [[-3.75, 6.375, 10.5], [-0.8, 6.9, 1.5], [2.25, 0.0, 7.5]]
+        )
+
+        reduced = self.gbm._GBMaker__reduced_box_coordinates(cartesian, box_basis)
+        reconstructed = self.gbm._GBMaker__cartesian_from_box_coordinates(
+            reduced, box_basis
+        )
+
+        np.testing.assert_allclose(reconstructed, cartesian, atol=1e-12, rtol=0.0)
+
+    def test_reduced_box_coordinates_preserves_vectorized_shape(self):
+        box_basis = np.array([[6.0, 12.0, -3.0], [-9.0, 4.5, 15.0]])
+        cartesian = np.array(
+            [
+                [[-3.75, 6.375, 10.5], [-0.8, 6.9, 1.5]],
+                [[2.25, 0.0, 7.5], [1.5, 8.25, 0.0]],
+            ]
+        )
+
+        reduced = self.gbm._GBMaker__reduced_box_coordinates(cartesian, box_basis)
+        reconstructed = self.gbm._GBMaker__cartesian_from_box_coordinates(
+            reduced, box_basis
+        )
+
+        self.assertEqual(reduced.shape, cartesian.shape)
+        np.testing.assert_allclose(reconstructed, cartesian, atol=1e-12, rtol=0.0)
+
+
 class TestGBMakerTriclinic(unittest.TestCase):
     def setUp(self):
         a0 = 3.61
