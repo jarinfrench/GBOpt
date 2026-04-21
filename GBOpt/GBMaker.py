@@ -27,6 +27,27 @@ class GBMakerValueError(GBMakerError):
     pass
 
 
+def wrap_reduced_coordinate(reduced_coord: np.ndarray, tol: float) -> np.ndarray:
+    """
+    Wrap reduced coordinates into [0, 1) and snap both periodic faces to 0.
+
+    :param reduced_coord: Reduced coordinates to wrap.
+    :param tol: Tolerance in reduced-coordinate units.
+    :return: Wrapped reduced coordinates in [0, 1).
+    """
+    if not math.isfinite(tol):
+        raise GBMakerValueError("Reduced-coordinate tolerance must be finite.")
+    if tol < 0:
+        raise GBMakerValueError("Reduced-coordinate tolerance must be non-negative.")
+
+    wrapped = np.mod(np.asarray(reduced_coord, dtype=np.float64), 1.0)
+    return np.where(
+        (wrapped < tol) | ((1.0 - wrapped) < tol),
+        0.0,
+        wrapped,
+    )
+
+
 class GBMaker:
     """
     Class to create a GB structure based on user defined parameters. The GB normal is

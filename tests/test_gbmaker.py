@@ -13,7 +13,12 @@ import numpy as np
 from scipy.spatial import KDTree
 
 from GBOpt.Atom import Atom, AtomValueError
-from GBOpt.GBMaker import GBMaker, GBMakerTypeError, GBMakerValueError
+from GBOpt.GBMaker import (
+    GBMaker,
+    GBMakerTypeError,
+    GBMakerValueError,
+    wrap_reduced_coordinate,
+)
 from GBOpt.UnitCell import UnitCell
 
 
@@ -119,6 +124,42 @@ class TestGBMaker(unittest.TestCase):
         with self.assertRaises(AtomValueError):
             GBMaker(self.a0, self.structure, self.gb_thickness,
                     self.misorientation, "Invalid")
+
+    def test_wrap_reduced_coordinate_preserves_exact_thresholds(self):
+        tol = 1e-10
+        coords = np.array([tol / 2, tol, 1.0 - tol, 1.0 - tol / 2])
+        wrapped = wrap_reduced_coordinate(coords, tol=tol)
+        expected = np.array([0.0, tol, 1.0 - tol, 0.0])
+        np.testing.assert_allclose(wrapped, expected, atol=1e-15, rtol=0.0)
+
+    def test_wrap_reduced_coordinate_scalar_and_0d_inputs(self):
+        for coord in (0.375, np.array(0.375)):
+            wrapped = wrap_reduced_coordinate(coord, tol=1e-10)
+            self.assertEqual(wrapped.shape, ())
+            np.testing.assert_allclose(wrapped, 0.375, atol=1e-15, rtol=0.0)
+
+    def test_wrap_reduced_coordinate_preserves_multidimensional_shape(self):
+        coords = np.array([[0.25, 1.2], [-0.2, 2.75]])
+        wrapped = wrap_reduced_coordinate(coords, tol=1e-10)
+        self.assertEqual(wrapped.shape, coords.shape)
+        expected = np.array([[0.25, 0.2], [0.8, 0.75]])
+        np.testing.assert_allclose(wrapped, expected, atol=1e-15, rtol=0.0)
+
+    def test_wrap_reduced_coordinate_wraps_multiple_periods_away(self):
+        coords = np.array([2.2, -3.7, 4.125, -5.875])
+        wrapped = wrap_reduced_coordinate(coords, tol=1e-10)
+        expected = np.array([0.2, 0.3, 0.125, 0.125])
+        np.testing.assert_allclose(wrapped, expected, atol=1e-15, rtol=0.0)
+
+    def test_wrap_reduced_coordinate_negative_tolerance_raises_gbmaker_error(self):
+        with self.assertRaises(GBMakerValueError):
+            wrap_reduced_coordinate(np.array([0.25]), tol=-1e-10)
+
+    def test_wrap_reduced_coordinate_non_finite_tolerance_raises_gbmaker_error(self):
+        for tol in (np.nan, np.inf, -np.inf):
+            with self.subTest(tol=tol):
+                with self.assertRaises(GBMakerValueError):
+                    wrap_reduced_coordinate(np.array([0.25]), tol=tol)
 
     # Tests for additional getters
     def test_additional_getters(self):
