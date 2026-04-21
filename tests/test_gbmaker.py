@@ -1247,6 +1247,79 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                 self.gbm._GBMaker__assert_unique_positions(canonical_positions)
 
 
+class TestGBMakerGenerateGB(unittest.TestCase):
+    def setUp(self):
+        a0 = 3.61
+        theta = math.radians(36.869898)
+        misorientation = np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0])
+        self.gbm = GBMaker(
+            a0,
+            "fcc",
+            10.0,
+            misorientation,
+            "Cu",
+            repeat_factor=6,
+            x_dim_min=60.0,
+            vacuum=10.0,
+            interaction_distance=10.0,
+        )
+
+    def test_generate_gb_whole_system_matches_grain_concatenation(self):
+        np.testing.assert_array_equal(
+            self.gbm.whole_system,
+            np.hstack((self.gbm.left_grain, self.gbm.right_grain)),
+        )
+
+    def test_generate_gb_vacuum_setter_rebuilds_grain_windows(self):
+        original_left_min = float(np.min(self.gbm.left_grain["x"]))
+        original_right_min = float(np.min(self.gbm.right_grain["x"]))
+
+        self.gbm.vacuum_thickness = 15.0
+
+        self.assertAlmostEqual(
+            float(np.min(self.gbm.left_grain["x"])) - original_left_min,
+            5.0,
+            delta=1e-8,
+        )
+        self.assertAlmostEqual(
+            float(np.min(self.gbm.right_grain["x"])) - original_right_min,
+            5.0,
+            delta=1e-8,
+        )
+        np.testing.assert_array_equal(
+            self.gbm.whole_system,
+            np.hstack((self.gbm.left_grain, self.gbm.right_grain)),
+        )
+
+    def test_generate_gb_misorientation_setter_rebuilds_grains(self):
+        original_whole_system = self.gbm.whole_system.copy()
+        theta = math.radians(22.619865)
+
+        self.gbm.misorientation = np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0])
+
+        self.assertFalse(
+            np.array_equal(original_whole_system, self.gbm.whole_system)
+        )
+        np.testing.assert_array_equal(
+            self.gbm.whole_system,
+            np.hstack((self.gbm.left_grain, self.gbm.right_grain)),
+        )
+
+    def test_generate_gb_update_spacing_rebuilds_grains_and_box_dims(self):
+        original_box_dims = self.gbm.box_dims.copy()
+        original_whole_system = self.gbm.whole_system.copy()
+
+        with self.assertWarns(UserWarning):
+            self.gbm.update_spacing(threshold=self.gbm.a0)
+
+        self.assertFalse(np.allclose(original_box_dims, self.gbm.box_dims))
+        self.assertFalse(np.array_equal(original_whole_system, self.gbm.whole_system))
+        np.testing.assert_array_equal(
+            self.gbm.whole_system,
+            np.hstack((self.gbm.left_grain, self.gbm.right_grain)),
+        )
+
+
 class TestGBMakerTriclinic(unittest.TestCase):
     def setUp(self):
         a0 = 3.61

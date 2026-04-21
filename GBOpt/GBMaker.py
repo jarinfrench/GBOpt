@@ -269,8 +269,30 @@ class GBMaker:
         """
         Private method to calculate the left grain, right grain, and whole GB system
         """
-        self.__left_grain = self.__generate_left_grain()
-        self.__right_grain = self.__generate_right_grain()
+        left_bounds = np.array(
+            [
+                self.__vacuum_thickness,
+                self.__left_x + self.__vacuum_thickness,
+            ],
+            dtype=np.float64,
+        )
+        right_bounds = np.array(
+            [
+                self.__left_x + self.__vacuum_thickness,
+                self.__x_dim + self.__vacuum_thickness,
+            ],
+            dtype=np.float64,
+        )
+        self.__left_grain = self.__generate_grain(
+            self.__R_left,
+            self.__R_left_approx,
+            left_bounds,
+        )
+        self.__right_grain = self.__generate_grain(
+            self.__R_right,
+            self.__R_right_approx,
+            right_bounds,
+        )
         self.__whole_system = np.hstack(
             (self.__left_grain, self.__right_grain))
 
@@ -1092,6 +1114,9 @@ class GBMaker:
             )
             self.__repeat_factor[1] = repeat_z
         self.__box_dims = self.__calculate_box_dimensions()
+        if hasattr(self, "_GBMaker__R_left"):
+            self.__generate_gb()
+            self.__set_gb_region()
 
     def __validate(
         self,
@@ -1222,6 +1247,7 @@ class GBMaker:
         :param threshold: The maximum allowed value that any spacing can take
         """
         self.__spacing = self.__calculate_periodic_spacing(threshold)
+        self.__update_dims()
 
     def write_lammps(
         self,
@@ -1446,6 +1472,8 @@ class GBMaker:
         self.__vacuum_thickness = self.__validate(
             value, Number, "vacuum_thickness", positive=True
         )
+        self.__generate_gb()
+        self.__set_gb_region()
         self.__box_dims = self.__calculate_box_dimensions()
 
     @property
