@@ -391,6 +391,117 @@ class GBMaker:
         unit_cell.init_by_structure(self.__structure, self.__a0, atom_types)
         return unit_cell
 
+    def __generate_grain(
+        self,
+        R_grain: np.ndarray,
+        R_grain_approx: np.ndarray,
+        x_bounds: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Generate one grain by enumerating lattice coefficients over a bounded slab.
+
+        :param R_grain: Rotation matrix for the grain.
+        :param R_grain_approx: Integer approximation of ``R_grain``.
+        :param x_bounds: Length-2 array-like containing ``[x_min, x_max]``.
+        :return: Structured atom array for the selected grain.
+        """
+        x_bounds = np.asarray(x_bounds, dtype=np.float64)
+        if x_bounds.shape != (2,):
+            raise GBMakerValueError("x_bounds must be a length-2 array.")
+        if x_bounds[1] <= x_bounds[0]:
+            raise GBMakerValueError("x_bounds must satisfy x_max > x_min.")
+
+        rotated_unit_cell_basis = self.__unit_cell.conventional @ R_grain.T
+        primitive_periods = np.asarray(R_grain_approx[1:], dtype=np.float64)
+        primitive_periods = primitive_periods @ rotated_unit_cell_basis
+
+        reduced_periods = np.linalg.solve(
+            rotated_unit_cell_basis.T, primitive_periods.T
+        ).T
+        x_direction_lattice = np.cross(reduced_periods[0], reduced_periods[1])
+        rounded_direction = np.rint(x_direction_lattice)
+        if np.allclose(
+            x_direction_lattice, rounded_direction, atol=self.__epsilon, rtol=0.0
+        ) and np.any(rounded_direction):
+            x_direction_lattice = self.__reduce_integer_row(
+                rounded_direction.astype(int)
+            ).astype(np.float64)
+
+        selection_box_basis = self.__selection_basis_vectors(primitive_periods).copy()
+        axis_dims = (self.__y_dim, self.__z_dim)
+        inplane_periodic = getattr(self, "_GBMaker__inplane_periodic", (True, True))
+        for row_index, (is_periodic, axis_dim) in enumerate(
+            zip(inplane_periodic, axis_dims)
+        ):
+            if not is_periodic:
+                selection_box_basis[row_index] *= axis_dim
+
+        selection_box_basis_lattice = np.linalg.solve(
+            rotated_unit_cell_basis.T, selection_box_basis.T
+        ).T
+        local_x_bounds = np.array([0.0, x_bounds[1] - x_bounds[0]], dtype=np.float64)
+        nx_range = self.__x_index_range(
+            primitive_periods, rotated_unit_cell_basis, local_x_bounds
+        )
+
+        lattice_bound_corners = []
+        for nx in (nx_range[0], nx_range[-1]):
+            x_base = nx * x_direction_lattice
+            for uy in (0.0, 1.0):
+                for uz in (0.0, 1.0):
+                    cell_origin = (
+                        x_base
+                        + uy * selection_box_basis_lattice[0]
+                        + uz * selection_box_basis_lattice[1]
+                    )
+                    for cell_corner in np.ndindex((2, 2, 2)):
+                        lattice_bound_corners.append(
+                            cell_origin + np.array(cell_corner, dtype=np.float64)
+                        )
+
+        lattice_bound_corners = np.asarray(lattice_bound_corners, dtype=np.float64)
+        lattice_min = np.floor(np.min(lattice_bound_corners, axis=0)).astype(int) - 1
+        lattice_max = np.ceil(np.max(lattice_bound_corners, axis=0)).astype(int) + 1
+
+        coefficient_ranges = [
+            np.arange(lower, upper + 1, dtype=int)
+            for lower, upper in zip(lattice_min, lattice_max)
+        ]
+        lattice_coefficients = np.array(
+            np.meshgrid(*coefficient_ranges, indexing="ij")
+        ).reshape(3, -1).T
+
+        atoms = self.get_supercell(lattice_coefficients @ self.__unit_cell.conventional)
+        positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
+        rotated_positions = positions @ R_grain.T
+        rotated_positions[:, 0] += x_bounds[0]
+        atoms["x"], atoms["y"], atoms["z"] = rotated_positions.T
+
+        if np.array_equal(
+            np.asarray(R_grain_approx[1:], dtype=int),
+            np.array([[0, 1, 0], [0, 0, 1]], dtype=int),
+        ) and np.allclose(R_grain, np.eye(3), atol=self.__epsilon, rtol=0.0):
+            atoms = self.__get_points_inside_box(
+                atoms,
+                [
+                    x_bounds[0],
+                    0.0,
+                    0.0,
+                    x_bounds[1],
+                    self.__y_dim,
+                    self.__z_dim,
+                ],
+            )
+        elif any(inplane_periodic):
+            atoms = self.__select_atoms_in_box_basis(atoms, primitive_periods, x_bounds)
+            atoms = self.__clip_atoms_to_cartesian_box(atoms, x_bounds)
+        else:
+            atoms = self.__clip_atoms_to_cartesian_box(atoms, x_bounds)
+        self.__assert_unique_positions(
+            np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
+        )
+        return atoms
+
     def __generate_left_grain(self) -> np.ndarray:
         """
         Generates the left grain of the GB system.
@@ -398,25 +509,16 @@ class GBMaker:
         :return: 4xn array containing the atom data (type and position) for the left
             grain.
         """
-        body_diagonal = np.linalg.norm(
-            [self.__left_x, self.__y_dim, self.__z_dim])
-        body_diagonal -= body_diagonal % self.__a0
-        X = np.arange(-body_diagonal, body_diagonal, self.__a0)
-
-        corners = np.vstack(np.meshgrid(X, X, X)).reshape(3, -1).T
-        atoms = self.get_supercell(corners)
-
-        positions = np.vstack((atoms["x"], atoms["y"], atoms["z"])).T
-        rotated_positions = np.dot(positions, self.__Rincl.T)
-        atoms["x"], atoms["y"], atoms["z"] = rotated_positions.T
-        atoms["x"] += self.__vacuum_thickness
-
-        return self.__get_points_inside_box(
-            atoms,
-            [
-                self.__vacuum_thickness, 0, 0,
-                self.__left_x + self.__vacuum_thickness, self.__y_dim, self.__z_dim
-            ]
+        return self.__generate_grain(
+            self.__R_left,
+            self.__R_left_approx,
+            np.array(
+                [
+                    self.__vacuum_thickness,
+                    self.__left_x + self.__vacuum_thickness,
+                ],
+                dtype=np.float64,
+            ),
         )
 
     def __generate_right_grain(self) -> np.ndarray:
@@ -431,27 +533,16 @@ class GBMaker:
         :return: 4xn array containing the atom data (type and position)
             for the right grain.
         """
-        body_diagonal = np.linalg.norm(
-            [self.__right_x, self.__y_dim, self.__z_dim])
-        body_diagonal -= body_diagonal % self.__a0
-        X = np.arange(-body_diagonal, body_diagonal, self.__a0)
-
-        corners = np.vstack(np.meshgrid(X, X, X)).reshape(3, -1).T
-        atoms = self.get_supercell(corners)
-
-        R = np.dot(self.__Rincl, self.__Rmis)
-        positions = np.vstack((atoms["x"], atoms["y"], atoms["z"])).T
-        rotated_positions = np.dot(positions, R.T)
-        atoms["x"], atoms["y"], atoms["z"] = rotated_positions.T
-
-        interface_x = self.__left_x + self.__vacuum_thickness
-        atoms["x"] += interface_x
-        return self.__get_points_inside_box(
-            atoms,
-            [
-                interface_x, 0, 0,
-                self.__x_dim + self.__vacuum_thickness, self.__y_dim, self.__z_dim
-            ]
+        return self.__generate_grain(
+            self.__R_right,
+            self.__R_right_approx,
+            np.array(
+                [
+                    self.__left_x + self.__vacuum_thickness,
+                    self.__x_dim + self.__vacuum_thickness,
+                ],
+                dtype=np.float64,
+            ),
         )
 
     def __set_gb_region(self):
@@ -659,7 +750,8 @@ class GBMaker:
         if x_bounds.shape != (2,):
             raise GBMakerValueError("x_bounds must be a length-2 array.")
         if not np.all(np.isfinite(primitive_periods)):
-            raise GBMakerValueError("primitive_periods must contain only finite values.")
+            raise GBMakerValueError(
+                "primitive_periods must contain only finite values.")
         if not np.all(np.isfinite(rotated_unit_cell_basis)):
             raise GBMakerValueError(
                 "rotated_unit_cell_basis must contain only finite values."

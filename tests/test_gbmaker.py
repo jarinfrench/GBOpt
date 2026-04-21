@@ -1167,6 +1167,86 @@ class TestGBMakerSelectAtomsInBoxBasis(unittest.TestCase):
         self.assertTrue(np.all(reduced[:, 1] < 1.0 + y_tol))
 
 
+class TestGBMakerGenerateGrain(unittest.TestCase):
+    def setUp(self):
+        a0 = 3.61
+        theta = math.radians(36.869898)
+        misorientation = np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0])
+        self.gbm = GBMaker(
+            a0,
+            "fcc",
+            10.0,
+            misorientation,
+            "Cu",
+            repeat_factor=6,
+            x_dim_min=60.0,
+            vacuum=10.0,
+            interaction_distance=10.0,
+        )
+
+    @staticmethod
+    def _positions(atoms):
+        return np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
+
+    def _primitive_periods(self, R_grain, R_grain_approx):
+        rotated_unit_cell_basis = self.gbm.unit_cell.conventional @ R_grain.T
+        return np.asarray(R_grain_approx[1:], dtype=np.float64) @ rotated_unit_cell_basis
+
+    def test_generate_grain_keeps_atoms_within_grain_bounds_and_unique(self):
+        interface = self.gbm._GBMaker__left_x + self.gbm.vacuum_thickness
+        cases = (
+            (
+                self.gbm.left_grain,
+                np.array([self.gbm.vacuum_thickness, interface]),
+            ),
+            (
+                self.gbm.right_grain,
+                np.array([interface, self.gbm.x_dim + self.gbm.vacuum_thickness]),
+            ),
+        )
+
+        for atoms, x_bounds in cases:
+            with self.subTest(x_bounds=x_bounds):
+                positions = self._positions(atoms)
+                self.gbm._GBMaker__assert_unique_positions(positions)
+                self.assertTrue(np.all(positions[:, 0] >= x_bounds[0] - self.gbm.epsilon))
+                self.assertTrue(np.all(positions[:, 0] < x_bounds[1]))
+                self.assertTrue(np.all(positions[:, 1] >= -self.gbm.epsilon))
+                self.assertTrue(np.all(positions[:, 1] < self.gbm.y_dim))
+                self.assertTrue(np.all(positions[:, 2] >= -self.gbm.epsilon))
+                self.assertTrue(np.all(positions[:, 2] < self.gbm.z_dim))
+
+    def test_generate_grain_places_right_grain_at_or_beyond_interface(self):
+        interface = self.gbm._GBMaker__left_x + self.gbm.vacuum_thickness
+
+        self.assertGreaterEqual(np.min(self.gbm.right_grain["x"]), interface - self.gbm.epsilon)
+
+    def test_generate_grain_removes_periodic_duplicates_in_sigma5_csl_cell(self):
+        grains = (
+            (self.gbm.left_grain, self.gbm._GBMaker__R_left, self.gbm._GBMaker__R_left_approx),
+            (self.gbm.right_grain, self.gbm._GBMaker__R_right, self.gbm._GBMaker__R_right_approx),
+        )
+
+        for atoms, R_grain, R_grain_approx in grains:
+            with self.subTest(grain=R_grain_approx.tolist()):
+                primitive_periods = self._primitive_periods(R_grain, R_grain_approx)
+                selection_basis = self.gbm._GBMaker__selection_basis_vectors(primitive_periods)
+                canonical_box = self.gbm._GBMaker__reduced_box_coordinates(
+                    self._positions(atoms), selection_basis
+                )
+                for row_index in range(2):
+                    tol = self.gbm._GBMaker__reduced_coordinate_tolerance(
+                        selection_basis[row_index]
+                    )
+                    canonical_box[:, row_index + 1] = wrap_reduced_coordinate(
+                        canonical_box[:, row_index + 1], tol
+                    )
+                canonical_positions = self.gbm._GBMaker__cartesian_from_box_coordinates(
+                    canonical_box, selection_basis
+                )
+                self.gbm._GBMaker__assert_unique_positions(canonical_positions)
+
+
 class TestGBMakerTriclinic(unittest.TestCase):
     def setUp(self):
         a0 = 3.61
