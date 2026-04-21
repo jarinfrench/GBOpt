@@ -529,7 +529,8 @@ class TestGBMakerPeriodRowOrientationHelpers(unittest.TestCase):
         np.testing.assert_array_equal(
             oriented, np.array([[2, 0, 0], [0, 3, 0], [0, 0, 4]])
         )
-        np.testing.assert_array_equal(approx, np.array([[2, 0, 0], [0, -3, 0], [0, 0, -4]]))
+        np.testing.assert_array_equal(approx, np.array(
+            [[2, 0, 0], [0, -3, 0], [0, 0, -4]]))
 
 
 class TestGBMakerScaledPeriodicBasisVector(unittest.TestCase):
@@ -845,6 +846,27 @@ class TestGBMakerBoxCoordinateConversions(unittest.TestCase):
         np.testing.assert_allclose(reconstructed, cartesian, atol=1e-12, rtol=0.0)
 
 
+class TestGBMakerAssertUniquePositions(unittest.TestCase):
+    def setUp(self):
+        self.gbm = object.__new__(GBMaker)
+        self.gbm.epsilon = 1e-10
+
+    def test_assert_unique_positions_passes_for_distinct_positions(self):
+        positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        self.gbm._GBMaker__assert_unique_positions(positions)
+
+    def test_assert_unique_positions_raises_for_exact_duplicate(self):
+        positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        with self.assertRaises(GBMakerValueError):
+            self.gbm._GBMaker__assert_unique_positions(positions)
+
+    def test_assert_unique_positions_raises_for_positions_within_epsilon(self):
+        eps = self.gbm.epsilon
+        positions = np.array([[0.0, 0.0, 0.0], [0.4*eps, 0.0, 0.0]])
+        with self.assertRaises(GBMakerValueError):
+            self.gbm._GBMaker__assert_unique_positions(positions)
+
+
 class TestGBMakerTriclinic(unittest.TestCase):
     def setUp(self):
         a0 = 3.61
@@ -958,14 +980,16 @@ class TestGBMakerTriclinic(unittest.TestCase):
                 )
                 other_approx = fake_right if selected_branch == "left" else fake_left
 
-                actual = np.array(self.gbm._GBMaker__get_triclinic_params(), dtype=float)
+                actual = np.array(
+                    self.gbm._GBMaker__get_triclinic_params(), dtype=float)
                 expected_selected = expected_tilt(selected_R, selected_approx)
                 expected_other = expected_tilt(other_R, other_approx)
 
                 np.testing.assert_allclose(
                     actual, expected_selected, atol=1e-12, rtol=0.0
                 )
-                self.assertFalse(np.allclose(actual, expected_other, atol=1e-12, rtol=0.0))
+                self.assertFalse(np.allclose(
+                    actual, expected_other, atol=1e-12, rtol=0.0))
 
                 with tempfile.NamedTemporaryFile(delete=True) as f:
                     self.gbm.write_lammps(f.name, triclinic=True)

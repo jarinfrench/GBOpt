@@ -625,6 +625,24 @@ class GBMaker:
 
         return selection_basis
 
+    def __assert_unique_positions(self, positions: np.ndarray) -> None:
+        """
+        Assert that no two positions occupy the same epsilon-quantized cell.
+
+        :param positions: Cartesian positions with shape (N, 3).
+        :raises GBMakerValueError: If any two positions map to the same quantized cell.
+        """
+        positions = np.asarray(positions, dtype=np.float64)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            raise GBMakerValueError("positions must be an Nx3 array.")
+        if len(positions) == 0:
+            return
+        quantized = np.round(positions / self.__epsilon).astype(np.int64)
+        if len(np.unique(quantized, axis=0)) < len(quantized):
+            raise GBMakerValueError(
+                "Duplicate atomic positions detected within epsilon tolerance."
+            )
+
     def __reduced_box_coordinates(
         self, cartesian_coordinates: np.ndarray, box_basis: np.ndarray
     ) -> np.ndarray:
