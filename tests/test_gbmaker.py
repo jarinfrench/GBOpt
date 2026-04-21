@@ -694,6 +694,81 @@ class TestGBMakerScaledPeriodicBasisVector(unittest.TestCase):
             )
 
 
+class TestGBMakerPeriodicSpacing(unittest.TestCase):
+    def setUp(self):
+        self.a0 = 3.61
+        self.structure = "fcc"
+        self.atom_types = "Cu"
+        self.gb_thickness = self.a0
+        self.sigma3_111 = np.array(
+            [
+                3 * np.pi / 4,
+                np.arccos(-1 / 3),
+                np.pi / 4,
+                np.pi / 4,
+                -np.arctan(1 / np.sqrt(2)),
+            ]
+        )
+        self.sigma7_111 = np.array(
+            [
+                np.arctan(3 / 2),
+                np.arccos(6 / 7),
+                np.arctan(-2 / 3),
+                np.pi / 4,
+                -np.arctan(1 / np.sqrt(2)),
+            ]
+        )
+
+    def _make_gb(self, misorientation):
+        return GBMaker(
+            self.a0,
+            self.structure,
+            self.gb_thickness,
+            misorientation,
+            self.atom_types,
+            repeat_factor=2,
+            x_dim_min=50.0,
+            interaction_distance=5.0,
+        )
+
+    def test_periodic_spacing_sigma3_keeps_periodic_flags_and_x_lengths_consistent(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            gbm = self._make_gb(self.sigma3_111)
+
+        self.assertEqual(gbm._GBMaker__inplane_periodic, (True, True))
+        self.assertAlmostEqual(gbm.spacing["y"], self.a0 * np.sqrt(6), places=5)
+        self.assertAlmostEqual(gbm.spacing["z"], self.a0 * np.sqrt(2), places=5)
+        self.assertAlmostEqual(
+            gbm.x_dim,
+            gbm._GBMaker__left_x + gbm._GBMaker__right_x,
+            delta=1e-12,
+        )
+        self.assertEqual(
+            [
+                str(w.message) for w in caught
+                if "non-periodic" in str(w.message).lower()
+            ],
+            [],
+        )
+
+    def test_periodic_spacing_sigma7_marks_y_nonperiodic_and_warns_for_y_only(self):
+        mod = sys.modules.get("GBOpt.GBMaker")
+        if mod is not None and hasattr(mod, "__warningregistry__"):
+            mod.__warningregistry__.clear()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            gbm = self._make_gb(self.sigma7_111)
+
+        self.assertEqual(gbm._GBMaker__inplane_periodic, (False, True))
+        self.assertAlmostEqual(gbm.spacing["y"], 15 * self.a0, places=12)
+        self.assertAlmostEqual(gbm.spacing["z"], self.a0 * 7 * np.sqrt(2), places=5)
+        non_periodic_messages = [
+            str(w.message) for w in caught if "non-periodic" in str(w.message).lower()
+        ]
+        self.assertEqual(non_periodic_messages, ["Resulting boundary is non-periodic along y."])
+
 class TestGBMakerBoxPeriodicBasis(unittest.TestCase):
     def setUp(self):
         self.gbm = object.__new__(GBMaker)

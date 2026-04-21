@@ -351,14 +351,18 @@ class GBMaker:
             }
         )
 
+        inplane_periodic = []
         warnings.simplefilter("once", UserWarning)
         for key, val in spacing.items():
             if key == 'x':
                 continue
-            if threshold < val:
+            is_periodic = val <= threshold
+            inplane_periodic.append(is_periodic)
+            if not is_periodic:
                 spacing[key] = threshold
-                warnings.warn("Resulting boundary is non-periodic.")
+                warnings.warn(f"Resulting boundary is non-periodic along {key}.")
         warnings.simplefilter("default", UserWarning)
+        self.__inplane_periodic = tuple(inplane_periodic)
 
         return spacing
 
