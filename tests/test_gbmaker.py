@@ -445,6 +445,21 @@ class TestGBMaker(unittest.TestCase):
             self.assertTrue(
                 filecmp.cmp(temp_file.name, "./tests/gold/fcc_Cu.txt", shallow=False))
 
+    def test_gb_plane_x_equals_vacuum_plus_left_x(self):
+        expected = self.gbm.vacuum_thickness + self.gbm._GBMaker__left_x
+        self.assertAlmostEqual(self.gbm.gb_plane_x, expected, places=10)
+
+    def test_gb_plane_x_tracks_vacuum_change(self):
+        original = self.gbm.gb_plane_x
+        self.gbm.vacuum_thickness += 5.0
+        self.assertAlmostEqual(self.gbm.gb_plane_x - original, 5.0, places=10)
+
+    def test_gb_plane_x_updates_after_misorientation_change(self):
+        theta = math.radians(22.619865)
+        self.gbm.misorientation = np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0])
+        expected = self.gbm.vacuum_thickness + self.gbm._GBMaker__left_x
+        self.assertAlmostEqual(self.gbm.gb_plane_x, expected, places=10)
+
 
 class TestGBMakerIntRotationHelpers(unittest.TestCase):
     def setUp(self):
@@ -716,6 +731,65 @@ class TestGBMakerPeriodicSpacing(unittest.TestCase):
         ]
         self.assertEqual(non_periodic_messages, [
                          "Resulting boundary is non-periodic along y."])
+
+
+class TestGBMakerGrainWidthBalance(unittest.TestCase):
+    """Tests that __calculate_periodic_spacing equalizes left_x and right_x."""
+
+    def _make_gb(self, misorientation, a0, structure, atom_types, **kwargs):
+        probe = GBMaker(a0, structure, a0, misorientation, atom_types, **kwargs)
+        gb_thickness = 2 * max(probe.spacing["x"]["left"], probe.spacing["x"]["right"])
+        gbm = GBMaker(a0, structure, gb_thickness, misorientation, atom_types, **kwargs)
+        return gbm, probe.spacing["x"]
+
+    def test_mixed_boundary_grain_widths_balanced(self):
+        theta = 2 * np.arctan(1 / 3)
+        mis = np.array([theta, 0, 0, np.pi / 4, -np.arctan(1 / np.sqrt(2))])
+        gbm, x_spacing = self._make_gb(
+            mis, 5.431, "diamond", "Si", interaction_distance=6.0, vacuum=0,
+            repeat_factor=(2, 3)
+        )
+        left_x = gbm._GBMaker__left_x
+        right_x = gbm._GBMaker__right_x
+        tolerance = max(x_spacing["left"], x_spacing["right"])
+        self.assertAlmostEqual(left_x, right_x, delta=tolerance,
+                               msg=f"{left_x=:.4f} and {right_x=:.4f} differ by more "
+                               f"than one period ({tolerance:.4f})"
+                               )
+
+    def test_mixed_boundary_both_grains_meet_x_dim(self):
+        theta = 2 * np.arctan(1 / 3)
+        mis = np.array([theta, 0, 0, np.pi / 4, -np.arctan(1 / np.sqrt(2))])
+        gbm, _ = self._make_gb(
+            mis, 5.431, "diamond", "Si", interaction_distance=6.0, vacuum=0,
+            repeat_factor=(2, 3)
+        )
+        self.assertGreaterEqual(gbm._GBMaker__left_x, gbm.x_dim_min)
+        self.assertGreaterEqual(gbm._GBMaker__right_x, gbm.x_dim_min)
+
+    def test_grain_widths_balanced_for_all_boundary_types(self):
+        """Both symmetric tilt and mixed tilt/twist satisfy the balance invariant."""
+        cases = [
+            (
+                np.array([math.radians(36.869898), 0.0, 0.0,
+                         0.0, -math.radians(36.869898) / 2.0]),
+                3.61, "fcc", "Cu",
+                dict(repeat_factor=(2, 3), x_dim_min=50, interaction_distance=5.0)
+            ),
+            (
+                np.array([2 * np.arctan(1 / 3), 0.0, 0.0,
+                         np.pi / 4, -np.arctan(1 / np.sqrt(2))]),
+                5.431, "diamond", "Si",
+                dict(repeat_factor=(2, 3), x_dim_min=50,
+                     interaction_distance=5.0, vacuum=0)
+            )
+        ]
+        for mis, a0, structure, atom_types, kwargs in cases:
+            with self.subTest(structure=structure):
+                gbm, x_spacing = self._make_gb(mis, a0, structure, atom_types, **kwargs)
+                tolerance = max(x_spacing["left"], x_spacing["right"])
+                self.assertAlmostEqual(gbm._GBMaker__left_x,
+                                       gbm._GBMaker__right_x, delta=tolerance)
 
 
 class TestGBMakerBoxPeriodicBasis(unittest.TestCase):
@@ -1451,6 +1525,33 @@ class TestGBMakerGenerateGB(unittest.TestCase):
                 f"{central_gap:.6f} Å when left grain is denser in x"
             ),
         )
+
+    def test_gb_region_atoms_lie_within_window(self):
+        x_gb = self.gbm.gb_plane_x
+        half = self.gbm.gb_thickness / 2.0
+        gb_atoms = self.gbm._GBMaker__gb_region
+        self.assertGreater(len(gb_atoms), 0)
+        xs = gb_atoms["x"]
+        self.assertTrue(np.all(xs > x_gb - half),
+                        msg="Some GB-region atoms lie below x_gb - gb_thickness/2")
+        self.assertTrue(np.all(xs < x_gb + half),
+                        msg="Some GB-region atoms lie above x_gb + gb_thickness/2")
+
+    def test_gb_region_contains_atoms_from_both_grains(self):
+        x_gb = self.gbm.gb_plane_x
+        gb_atoms = self.gbm._GBMaker__gb_region
+        self.assertGreater(np.sum(gb_atoms["x"] <= x_gb),
+                           0, msg="GB region has no atoms from left grain")
+        self.assertGreater(np.sum(gb_atoms["x"] >= x_gb),
+                           0, msg="GB region has no atoms from right grain")
+
+    def test_gb_region_window_correct_after_vacuum_change(self):
+        self.gbm.vacuum_thickness = 15.0
+        x_gb = self.gbm.gb_plane_x
+        half = self.gbm.gb_thickness / 2.0
+        gb_atoms = self.gbm._GBMaker__gb_region
+        self.assertTrue(np.all(gb_atoms["x"] > x_gb - half))
+        self.assertTrue(np.all(gb_atoms["x"] < x_gb + half))
 
 
 class TestGBMakerTriclinic(unittest.TestCase):

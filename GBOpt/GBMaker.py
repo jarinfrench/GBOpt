@@ -381,6 +381,11 @@ class GBMaker:
             self.__x_dim_min / spacing["x"]["left"]) * spacing["x"]["left"]
         self.__right_x = math.ceil(
             self.__x_dim_min / spacing["x"]["right"]) * spacing["x"]["right"]
+        target = max(self.__left_x, self.__right_x)
+        self.__left_x = math.ceil(
+            target / spacing["x"]["left"] - self.__epsilon) * spacing["x"]["left"]
+        self.__right_x = math.ceil(
+            target / spacing["x"]["right"] - self.__epsilon) * spacing["x"]["right"]
         self.__x_dim = self.__left_x + self.__right_x
         spacing.update(
             {
@@ -553,10 +558,9 @@ class GBMaker:
         """
         Identifies the atoms in the GB region based on the gb thickness.
         """
-        left_x_max = max(self.__left_grain['x'])
-        right_x_min = min(self.__right_grain['x'])
-        left_cut = left_x_max - self.__gb_thickness / 2.0
-        right_cut = right_x_min + self.__gb_thickness / 2.0
+        x_gb = self.__vacuum_thickness + self.__left_x
+        left_cut = x_gb - self.__gb_thickness / 2.0
+        right_cut = x_gb + self.__gb_thickness / 2.0
         left_gb = self.__left_grain[self.__left_grain['x'] > left_cut]
         right_gb = self.__right_grain[self.__right_grain['x'] < right_cut]
         self.__gb_region = np.hstack((left_gb, right_gb))
@@ -1377,6 +1381,10 @@ class GBMaker:
     @property
     def right_grain(self) -> np.ndarray:
         return self.__right_grain
+
+    @property
+    def gb_plane_x(self) -> float:
+        return self.__vacuum_thickness + self.__left_x
 
     @property
     def spacing(self) -> dict:
