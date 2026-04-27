@@ -11,6 +11,10 @@ from typing import Any, Optional
 import numpy as np
 
 from GBOpt import GBMaker, GBManipulator
+from GBOpt.Utils.logging_utils import get_logger, make_run_adapter
+
+
+logger = get_logger("GBOpt.GBMinimizer")
 
 
 class Mutator:
@@ -71,6 +75,7 @@ class MonteCarloMinimizer:
     def __init__(self, GB: GBMaker, gb_energy_func: Callable, choices: list, seed=None, *, initial_structure: Any = None):
         self.GB = GB
         self.gb_energy_func = gb_energy_func
+        self.seed = seed
         self.initial_structure = initial_structure
         self.manipulator = self._make_initial_manipulator()
         self.mutator = Mutator(choices, self.manipulator)
@@ -119,6 +124,13 @@ class MonteCarloMinimizer:
 
         assert cooldown_rate > 0.0 and cooldown_rate <= 1.0
 
+        run_logger = make_run_adapter(
+            logger,
+            component="gbminimizer",
+            unique_id=str(unique_id),
+            seed=self.seed,
+        )
+
         # Get initial energy
         init_system = np.array(self.manipulator.parents[0].whole_system, copy=True)
         init_gbe, _ = self.gb_energy_func(
@@ -135,16 +147,48 @@ class MonteCarloMinimizer:
         # Set the Monte-Carlo temperature such that there is a 50% probability of accepting an `E_accept` amount of increase to the GBE
         T = -1 * E_accept / math.log(0.5)
         rejection_count = 0
+        run_logger.info(
+            "Starting Monte Carlo minimization",
+            extra={
+                "event": "mc_run_started",
+                "step": 0,
+                "energy": init_gbe,
+                "best_energy": init_gbe,
+                "temperature": T,
+                "max_steps": max_steps,
+                "max_rejections": max_rejections,
+                "cooldown_rate": cooldown_rate,
+            },
+        )
 
         # Set the minimum GBE
         min_gbe = min(self.GBE_vals)
         prev_gbe = init_gbe
+        run_logger.info(
+            "Evaluated initial Monte Carlo structure",
+            extra={
+                "event": "initial_energy_evaluated",
+                "step": 0,
+                "energy": init_gbe,
+                "best_energy": min_gbe,
+                "temperature": T,
+            },
+        )
 
         # Run the MC iterations
         for i in range(1, max_steps + 1):
             # Generate a random mutation on the current GB atom structure
             mutation, new_system = self.mutator.mutate(
                 self.local_random, self.GB, self.manipulator)
+            run_logger.debug(
+                "Proposed Monte Carlo mutation",
+                extra={
+                    "event": "mutation_proposed",
+                    "step": i,
+                    "mutation": mutation,
+                    "temperature": T,
+                },
+            )
 
             # Evaluate the energy of this new structure and append it to the GBE values list
             new_gbe, dump_file_name = self.gb_energy_func(
@@ -155,6 +199,7 @@ class MonteCarloMinimizer:
                 **kwargs,
             )
             self.GBE_vals.append(new_gbe)
+            delta_energy = new_gbe - prev_gbe
 
             # Accept this new structure if the energy decreases from the previous MC iteration OR probabilistically based on the energy increase
             accepted = new_gbe <= prev_gbe or self.local_random.uniform(
@@ -176,26 +221,98 @@ class MonteCarloMinimizer:
                 self.accepted_idx.append(i)
                 # Set the consecutive rejection counter to zero
                 rejection_count = 0
+                run_logger.debug(
+                    "Accepted Monte Carlo mutation",
+                    extra={
+                        "event": "mutation_accepted",
+                        "step": i,
+                        "mutation": mutation,
+                        "accepted": True,
+                        "energy": new_gbe,
+                        "best_energy": min_gbe,
+                        "delta_energy": delta_energy,
+                        "temperature": T,
+                    },
+                )
 
                 # If new structure has the lowest energy observed so far, update the minimum GBE value and copy the dump file for this structure
                 if new_gbe <= min_gbe:
                     shutil.copyfile(dump_file_name, "min" + dump_file_name)
                     del_E = abs(min_gbe - new_gbe)
+                    run_logger.info(
+                        "Updated Monte Carlo best energy",
+                        extra={
+                            "event": "best_energy_updated",
+                            "step": i,
+                            "mutation": mutation,
+                            "energy": new_gbe,
+                            "best_energy": new_gbe,
+                            "delta_energy": del_E,
+                        },
+                    )
                     # If the reduction in minimum energy was less than the tolerance threshold, we consider the MC solve converged
                     if del_E <= E_tol:
-                        print("Meets energy tolerance criterion!")
+                        run_logger.info(
+                            "Met Monte Carlo energy tolerance",
+                            extra={
+                                "event": "energy_tolerance_met",
+                                "step": i,
+                                "mutation": mutation,
+                                "energy": new_gbe,
+                                "best_energy": new_gbe,
+                                "delta_energy": del_E,
+                                "temperature": T,
+                            },
+                        )
                         break
                     min_gbe = new_gbe
             else:
                 self.operation_list.append([mutation, False])
                 rejection_count += 1
+                run_logger.debug(
+                    "Rejected Monte Carlo mutation",
+                    extra={
+                        "event": "mutation_rejected",
+                        "step": i,
+                        "mutation": mutation,
+                        "accepted": False,
+                        "energy": new_gbe,
+                        "best_energy": min_gbe,
+                        "delta_energy": delta_energy,
+                        "temperature": T,
+                        "rejection_count": rejection_count,
+                        "max_rejections": max_rejections,
+                    },
+                )
                 # If too many structures are rejected back-to-back, we prematurely stop the MC iterations since we are stuck
                 if rejection_count > max_rejections:
-                    print("Too many rejections!")
+                    run_logger.warning(
+                        "Exceeded Monte Carlo rejection threshold",
+                        extra={
+                            "event": "max_rejections_exceeded",
+                            "step": i,
+                            "mutation": mutation,
+                            "energy": new_gbe,
+                            "best_energy": min_gbe,
+                            "delta_energy": delta_energy,
+                            "temperature": T,
+                            "rejection_count": rejection_count,
+                            "max_rejections": max_rejections,
+                        },
+                    )
                     break
             # The temperature is cooled down to gradually reduce the probability of accepting worse solutions over time and let the MC minimization converge
             T *= cooldown_rate
 
+        run_logger.info(
+            "Completed Monte Carlo minimization",
+            extra={
+                "event": "mc_run_completed",
+                "step": len(self.GBE_vals) - 1,
+                "best_energy": min_gbe,
+                "accepted_steps": len(self.accepted_idx),
+            },
+        )
         return min_gbe
 
 

@@ -11,12 +11,17 @@ Usage
 """
 
 import argparse
-import sys
+import logging
 from fractions import Fraction
 from typing import Optional
 
 import numpy as np
 from scipy.spatial.transform import Rotation
+
+from GBOpt.Utils.logging_utils import configure_logging, get_logger
+
+
+logger = get_logger("GBOpt.Utils.gb_params")
 
 
 # ---------------------------------------------------------------------------
@@ -189,10 +194,13 @@ def from_orientation_matrices(
         cos_angle = np.clip(np.dot(normal_from_P, n_hat), -1.0, 1.0)
         angle_err = np.degrees(np.arccos(cos_angle))
         if angle_err > 1.0:
-            print(
-                f"WARNING: supplied --normal deviates from P[0] by "
-                f"{angle_err:.2f}° — using P[0] for inclination.",
-                file=sys.stderr,
+            logger.warning(
+                "Supplied boundary normal differs from P[0]; using P[0]",
+                extra={
+                    "component": "gb_params",
+                    "event": "boundary_normal_override_deviation",
+                    "warning_angle_deg": f"{angle_err:.2f}",
+                },
             )
 
     theta, phi = inclination_from_normal(normal_from_P)
@@ -471,9 +479,23 @@ def run_self_test() -> None:
     np.testing.assert_allclose(Rincl[0, :], normal / np.linalg.norm(normal), atol=1e-10)
     cases.append("Sigma3 coherent twin")
 
-    print("Standalone regression checks passed:")
+    logger.info(
+        "Standalone regression checks passed",
+        extra={
+            "component": "gb_params",
+            "event": "self_test_passed",
+            "case_count": len(cases),
+        },
+    )
     for case in cases:
-        print(f"  - {case}")
+        logger.info(
+            "Validated representative grain-boundary case",
+            extra={
+                "component": "gb_params",
+                "event": "self_test_case_passed",
+                "case_name": case,
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +587,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     """Entry point for the command-line interface."""
+    configure_logging(level=logging.INFO)
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -598,6 +621,15 @@ def main() -> None:
         input_summary = f"P={P.tolist()}  Q={Q.tolist()}"
 
     checks = validate(params, normal, P_norm, Q_norm, reference_Rmis)
+    logger.info(
+        "Computed GB misorientation parameters",
+        extra={
+            "component": "gb_params",
+            "event": "misorientation_computed",
+            "mode": args.mode,
+            "check_count": len(checks),
+        },
+    )
     print(format_output(params, input_summary, checks))
 
 

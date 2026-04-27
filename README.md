@@ -23,3 +23,16 @@ Then install the dependencies
 pip install .
 ```
 
+## Logging
+
+GBOpt does not configure logging automatically when imported as a library, and
+existing warnings continue to use Python's `warnings` module.
+
+To enable GBOpt console logs in a script or notebook:
+```python
+from GBOpt.Utils.logging_utils import configure_logging
+
+configure_logging(level="INFO")
+```
+
+Use `level="DEBUG"` to include detailed Monte Carlo mutation events.

@@ -571,7 +571,7 @@ class UnitCell:
 
     def __repr__(self):
         structure_info = f"UnitCell with {len(self.__unit_cell)} " + \
-            f"atom{"s" if len(self.__unit_cell) != 1 else ""}"
+            f"atom{'s' if len(self.__unit_cell) != 1 else ''}"
         lattice_info = f"Lattice parameter (a0): {self.__a0:.3f} Å"
         radius_info = f"Radius: {self.__radius:.3f} Å"
         atom_info = ", ".join(
