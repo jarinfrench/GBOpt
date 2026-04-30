@@ -27,12 +27,12 @@ class GBMakerValueError(GBMakerError):
     pass
 
 
-def wrap_reduced_coordinate(reduced_coord: np.ndarray, tol: float) -> np.ndarray:
+def wrap_reduced_coordinate(reduced_coord: np.ndarray, tol: float = 1e-8) -> np.ndarray:
     """
     Wrap reduced coordinates into [0, 1) and snap both periodic faces to 0.
 
     :param reduced_coord: Reduced coordinates to wrap.
-    :param tol: Tolerance in reduced-coordinate units.
+    :param tol: Tolerance in reduced-coordinate units. Optional, defaults to 1e-8
     :return: Wrapped reduced coordinates in [0, 1).
     """
     if not math.isfinite(tol):
@@ -153,26 +153,6 @@ class GBMaker:
         cosine = np.dot(reference, candidate) / (ref_norm * cand_norm)
         return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
 
-    def __orient_period_rows(self, R_grain: np.ndarray, approx: np.ndarray) -> np.ndarray:
-        """
-        Orient approximate periodic rows to match the corresponding grain rows.
-
-        The integer approximation preserves row norms, but the sign of each row is
-        arbitrary. Flip any row whose direction is antiparallel to the matching float
-        row so the periodic basis remains consistently oriented.
-
-        :param R_grain: The grain rotation matrix in floating-point form.
-        :param approx: Integer approximation of the same matrix.
-        :return: A copy of ``approx`` with row signs oriented to ``R_grain``.
-        """
-        R_grain = np.asarray(R_grain, dtype=np.float64)
-        oriented = np.array(approx)
-        for i, grain_row in enumerate(R_grain):
-            approx_row = np.asarray(oriented[i], dtype=np.float64)
-            if np.dot(grain_row, approx_row) < 0:
-                oriented[i] = -oriented[i]
-        return oriented
-
     # Private class methods
     def __approximate_rotation_row_as_int(
         self, row: np.ndarray, angle_tol_deg: float = 0.5, max_scale: int = 10000
@@ -290,41 +270,24 @@ class GBMaker:
             self.__R_right,
             self.__R_right_approx,
             right_bounds,
+            trim_upper_face=True,
         )
 
-        # For PBC bicrystals (vacuum ~= 0), exclude right-grain atoms that are within
-        # floating-point noise of x_dim and would overlap with left-grain atoms at x=0
-        # in the periodic image.
-        first_nn = min(self.__unit_cell.ideal_bond_lengths.values())
-        if self.__vacuum_thickness < first_nn:
-            # x_tol must sit between floating point noise (~1e-8 angstroms) and the
-            # interplanar spacing d_hkl (the thinnest crystal layer, ~0.1-1 angstroms
-            # for common boundaries). Using 1e-3 * d_hkl places it three orders of
-            # magnitude below the thinnest interplanar spacing, well clear of machine
-            # noise.
-            x_span = right_bounds[1] - right_bounds[0]
-            n_planes = len(
-                np.unique(np.round(self.__right_grain["x"] / self.__epsilon)))
-            d_hkl = x_span / n_planes
-            x_tol = d_hkl * 1e-3
+        # The two grains may have different interplanar x-spacings (asymmetric tilt,
+        # mixed tilt/twist, etc.), causing the periodic-edge gap to differ from the
+        # central GB gap. When the periodic gap is smaller, close-contact atom pairs
+        # form across the x boundary. Extend the trim to equalize the two gaps.
+        left_max_x = np.max(self.__left_grain["x"])
+        right_min_x = np.min(self.__right_grain["x"])
+        central_gap = right_min_x - left_max_x
+        left_min_x = np.min(self.__left_grain["x"])
+        right_max_x = np.max(self.__right_grain["x"])
+        periodic_gap = ((right_bounds[1] - right_max_x) +
+                        (left_min_x - left_bounds[0]))
+        if periodic_gap < central_gap - self.__epsilon:
             self.__right_grain = self.__right_grain[
-                self.__right_grain["x"] < right_bounds[1] - x_tol
+                self.__right_grain["x"] < right_bounds[1] - central_gap
             ]
-            # The two grains may have different interplanar x-spacings (asymmetric tilt,
-            # mixed tilt/twist, etc.), causing the periodic-edge gap to differ from the
-            # central GB gap. When the periodic gap is smaller, close-contact atom pairs
-            # form across the x boundary. Extend the trim to equalize the two gaps.
-            left_max_x = np.max(self.__left_grain["x"])
-            right_min_x = np.min(self.__right_grain["x"])
-            central_gap = right_min_x - left_max_x
-            left_min_x = np.min(self.__left_grain["x"])
-            right_max_x = np.max(self.__right_grain["x"])
-            periodic_gap = ((right_bounds[1] - right_max_x) +
-                            (left_min_x - left_bounds[0]))
-            if periodic_gap < central_gap - self.__epsilon:
-                self.__right_grain = self.__right_grain[
-                    self.__right_grain["x"] < right_bounds[1] - central_gap
-                ]
             # When d_L < d_R (left grain denser in x), the periodic-edge gap equals d_R
             # which exceeds central_gap, so the fix above does not fire. This leaves
             # extra interfacial volume at the x periodic boundary. NPT simulations will
@@ -354,10 +317,6 @@ class GBMaker:
             self.__R_left).astype(object)
         self.__R_right_approx = self.__approximate_rotation_matrix_as_int(
             self.__R_right).astype(object)
-        self.__R_left_approx = self.__orient_period_rows(
-            self.__R_left, self.__R_left_approx).astype(object)
-        self.__R_right_approx = self.__orient_period_rows(
-            self.__R_right, self.__R_right_approx).astype(object)
 
         # The periodic distance in each direction is the lattice parameter multiplied by
         # norm of the Miller indices in that direction. This is determined using the
@@ -402,7 +361,10 @@ class GBMaker:
             inplane_periodic.append(is_periodic)
             if not is_periodic:
                 spacing[key] = threshold
-                warnings.warn(f"Resulting boundary is non-periodic along {key}.")
+                warnings.warn(
+                    f"Required {key}-spacing {val:.4f} Å exceeds threshold "
+                    f"{threshold:.4f} Å; boundary is non-periodic along {key}."
+                )
         self.__inplane_periodic = tuple(inplane_periodic)
 
         return spacing
@@ -431,6 +393,9 @@ class GBMaker:
             R_grain = self.__R_right
             R_grain_approx = self.__R_right_approx
 
+        # conventional stores basis vectors as rows: C = [a1; a2; a3].
+        # Rotating each row vector to the lab frame gives [R@a1; R@a2; R@a3],
+        # which in batch form is (R @ C.T).T = C @ R.T.
         rotated_unit_cell_basis = self.__unit_cell.conventional @ R_grain.T
         primitive_periods = (
             np.asarray(R_grain_approx[1:], dtype=np.float64) @ rotated_unit_cell_basis
@@ -467,6 +432,7 @@ class GBMaker:
         R_grain: np.ndarray,
         R_grain_approx: np.ndarray,
         x_bounds: np.ndarray,
+        trim_upper_face: bool = False,
     ) -> np.ndarray:
         """
         Generate one grain by enumerating lattice coefficients over a bounded slab.
@@ -474,6 +440,7 @@ class GBMaker:
         :param R_grain: Rotation matrix for the grain.
         :param R_grain_approx: Integer approximation of ``R_grain``.
         :param x_bounds: Length-2 array-like containing ``[x_min, x_max]``.
+        :param trim_upper_face: Flag to trim the upper x bound atoms.
         :return: Structured atom array for the selected grain.
         """
         x_bounds = np.asarray(x_bounds, dtype=np.float64)
@@ -546,13 +513,15 @@ class GBMaker:
 
         if any(inplane_periodic):
             atoms = self.__select_atoms_in_box_basis(atoms, primitive_periods, x_bounds)
-            atoms = self.__clip_atoms_to_cartesian_box(atoms, x_bounds)
-        else:
-            atoms = self.__clip_atoms_to_cartesian_box(atoms, x_bounds)
-        self.__assert_unique_positions(
-            np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
-        )
-        return atoms
+        atoms = self.__clip_atoms_to_cartesian_box(atoms, x_bounds)
+
+        if trim_upper_face:
+            x_span = x_bounds[1] - x_bounds[0]
+            n_planes = len(np.unique(np.round(atoms["x"] / self.__epsilon)))
+            d_hkl = x_span / n_planes
+            atoms = atoms[atoms["x"] < x_bounds[1] - d_hkl * 1e-3]
+
+        return self.__deduplicate_positions(atoms)
 
     def __set_gb_region(self):
         """
@@ -743,22 +712,6 @@ class GBMaker:
         n_max = math.ceil((x_bounds[1] - x_offset_min) / x_projection) + 1
         return np.arange(n_min, n_max + 1, dtype=int)
 
-    def __assert_unique_positions(self, positions: np.ndarray) -> None:
-        """
-        Assert that no two positions occupy the same epsilon-quantized cell.
-
-        :param positions: Cartesian positions with shape (N, 3).
-        :raises GBMakerValueError: If any two positions map to the same quantized cell.
-        """
-        positions = np.asarray(positions, dtype=np.float64)
-        if len(positions) == 0:
-            return
-        quantized = np.round(positions / self.__epsilon).astype(np.int64)
-        if len(np.unique(quantized, axis=0)) < len(quantized):
-            raise GBMakerValueError(
-                "Duplicate atomic positions detected within epsilon tolerance."
-            )
-
     def __reduced_box_coordinates(
         self, cartesian_coordinates: np.ndarray, box_basis: np.ndarray
     ) -> np.ndarray:
@@ -830,6 +783,7 @@ class GBMaker:
         :return: Filtered atom array, with lower-face y/z values clamped to zero on
             non-periodic axes.
         """
+
         x_bounds = np.asarray(x_bounds, dtype=np.float64)
 
         inplane_periodic = self.__inplane_periodic
@@ -860,7 +814,7 @@ class GBMaker:
 
     def __deduplicate_positions(self, atoms: np.ndarray) -> np.ndarray:
         """
-        Reive duplicate atoms using epsilon-quantized Cartesian positions.
+        Remove duplicate atoms using epsilon-quantized Cartesian positions.
         Keeps the first occurrence of each position.
         """
         if len(atoms) == 0:
@@ -869,10 +823,7 @@ class GBMaker:
         positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
         quantized = np.round(positions / self.__epsilon).astype(np.int64)
         _, unique_indices = np.unique(quantized, axis=0, return_index=True)
-        deduplicated = atoms[np.sort(unique_indices)]
-        self.__assert_unique_positions(np.column_stack(
-            (deduplicated["x"], deduplicated["y"], deduplicated["z"])))
-        return deduplicated
+        return atoms[np.sort(unique_indices)]
 
     def __select_atoms_in_box_basis(
         self,
@@ -897,8 +848,49 @@ class GBMaker:
 
         selection_basis = self.__selection_basis_vectors(primitive_periods)
         positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
-        box_coordinates = self.__reduced_box_coordinates(positions, selection_basis)
         inplane_periodic = self.__inplane_periodic
+
+        # Fast path: orthogonal box - no tilt, so in-plane basis vectors have zero
+        # x-projection. Reduced coordinates are simple ratios; skip the solve round trip.
+        if np.allclose(selection_basis[:, 0], 0.0, atol=self.__epsilon, rtol=0.0):
+            inside_box = np.ones(len(atoms), dtype=bool)
+            for row_index, is_periodic in enumerate(inplane_periodic):
+                axis = row_index + 1  # 1=y, 2=z
+                period = selection_basis[row_index, axis]
+                coord = positions[:, axis]
+                if is_periodic:
+                    tol = self.__reduced_coordinate_tolerance(
+                        selection_basis[row_index])
+                    inside_box &= (coord / period >= -
+                                   tol) & (coord / period < 1.0 + tol)
+                # non-periodic handled by __clip_atoms_to_cartesian_box
+            selected_atoms = atoms[inside_box].copy()
+            if len(selected_atoms) == 0:
+                return selected_atoms
+
+            for row_index, is_periodic in enumerate(inplane_periodic):
+                if not is_periodic:
+                    continue
+                axis = row_index + 1
+                period = selection_basis[row_index, axis]
+                tol = self.__reduced_coordinate_tolerance(selection_basis[row_index])
+                selected_atoms_coord = selected_atoms[("y", "z")[row_index]]
+                wrapped = np.mod(selected_atoms_coord, period)
+                selected_atoms[("y", "z")[row_index]] = np.where(
+                    (wrapped < tol * period) | ((period - wrapped) < tol * period),
+                    0.0,
+                    wrapped,
+                )
+            inside_x = (
+                (selected_atoms["x"] >= x_bounds[0] - self.__epsilon)
+                & (selected_atoms["x"] < x_bounds[1] - self.__epsilon)
+            )
+            selected_atoms = selected_atoms[inside_x]
+            if len(selected_atoms) == 0:
+                return selected_atoms
+            return self.__deduplicate_positions(selected_atoms)
+
+        box_coordinates = self.__reduced_box_coordinates(positions, selection_basis)
 
         inside_box = np.ones(len(atoms), dtype=bool)
         axis_dims = (self.__y_dim, self.__z_dim)
@@ -984,9 +976,9 @@ class GBMaker:
             )
             self.__repeat_factor[1] = repeat_z
         self.__box_dims = self.__calculate_box_dimensions()
-        if hasattr(self, "_GBMaker__R_left"):
-            self.__generate_gb()
-            self.__set_gb_region()
+
+        self.__generate_gb()
+        self.__set_gb_region()
 
     def __validate(
         self,
