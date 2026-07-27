@@ -14,6 +14,8 @@ from typing import List, Tuple
 
 import numpy as np
 
+from GBOpt.Checkpoint import ENERGY_PENALTY
+
 try:
     import tomllib
 except ImportError:
@@ -140,10 +142,18 @@ def get_gb_energy(
     env = os.environ.copy()
     if _is_teton():
         env["OMP_NUM_THREADS"] = str(n_threads)
+        env.setdefault("OMP_PROC_BIND", "spread")
+        env.setdefault("OMP_PLACES", "threads")
 
-    with open(results_out, "w") as f:
-        P = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT,
-                           env=env, check=False, shell=True)
+    # Don't route subprocess stdout to results_out: LAMMPS writes the GBE via
+    # its own `print ... file` handle, but Kokkos finalization also writes the
+    # OMP_PROC_BIND warning to fd 1 at position 0, overwriting the GBE value.
+    # LAMMPS screen output is already captured via -sc; redirect stdout here to
+    # the log file so any shell-level messages (module load, srun) aren't lost.
+    with open(logfile, "a") as log:
+        P = subprocess.run(
+            cmd, stdout=log, stderr=subprocess.STDOUT, env=env, check=False, shell=True
+        )
 
     if not P.returncode:
         txt = Path(results_out).read_text()
@@ -155,7 +165,7 @@ def get_gb_energy(
                 pass
         return gbe_val, f"final_{unique_id}.dump"
     else:
-        return 1.0e30, ""
+        return ENERGY_PENALTY, ""
 
 
 def run_mc(
@@ -206,7 +216,7 @@ def run_mc(
         nodes=nodes,
         partition=partition,
         module=module,
-        material=material
+        material=material,
     )
 
     GB0 = _build_gb(
@@ -225,8 +235,11 @@ def run_mc(
         repeat_factor=repeat_factor,
     )
 
-    extra = {"initial_structure": str(
-        initial_structure)} if initial_structure is not None else {}
+    extra = (
+        {"initial_structure": str(initial_structure)}
+        if initial_structure is not None
+        else {}
+    )
     MC = GBMinimizer.MonteCarloMinimizer(
         copy.deepcopy(GB),
         energy_fn,
@@ -241,7 +254,7 @@ def run_mc(
         cooldown_rate=cooldown_rate,
         E_tol=e_tol,
         E_accept=e_accept,
-        # checkpoint_file="checkpoint.json",
+        checkpoint_file="checkpoint.json",
     )
 
     op_list = MC.operation_list
@@ -256,18 +269,42 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run MC grain boundary optimization")
     parser.add_argument("--material", required=True)
     parser.add_argument("--boundary", required=True)
-    parser.add_argument("--run", type=int, default=1, metavar="N",
-                        help="Run index; controls output directory and seed offset (seed = base_seed + N - 1)")
-    parser.add_argument("--high-energy", action="store_true",
-                        help="Use high-energy restart structure from materials/")
-    parser.add_argument("--e-accept", type=float, default=None, metavar="E",
-                        help="Acceptance energy threshold in eV (overrides mc.toml)")
-    parser.add_argument("--initial-structure", default=None, metavar="PATH",
-                        help="Path to initial LAMMPS data file; overrides GBMaker-generated structure")
+    parser.add_argument(
+        "--run",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Run index; controls output directory and seed offset (seed = base_seed + N - 1)",
+    )
+    parser.add_argument(
+        "--high-energy",
+        action="store_true",
+        help="Use high-energy restart structure from materials/",
+    )
+    parser.add_argument(
+        "--e-accept",
+        type=float,
+        default=None,
+        metavar="E",
+        help="Acceptance energy threshold in eV (overrides mc.toml)",
+    )
+    parser.add_argument(
+        "--initial-structure",
+        default=None,
+        metavar="PATH",
+        help="Path to initial LAMMPS data file; overrides GBMaker-generated structure",
+    )
     args = parser.parse_args()
 
     init_type = "high_energy" if args.high_energy else "standard"
-    run_dir = PROJECT_ROOT / args.material / args.boundary / "MC" / init_type / f"run{args.run}"
+    run_dir = (
+        PROJECT_ROOT
+        / args.material
+        / args.boundary
+        / "MC"
+        / init_type
+        / f"run{args.run}"
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
     os.chdir(run_dir)
 
@@ -290,7 +327,9 @@ def main() -> None:
     boundaries = _load_boundaries()
     if args.boundary not in boundaries:
         print(
-            f"Unknown boundary '{args.boundary}'. Available: {list(boundaries)}", file=sys.stderr)
+            f"Unknown boundary '{args.boundary}'. Available: {list(boundaries)}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     bnd = boundaries[args.boundary]
