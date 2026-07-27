@@ -73,7 +73,7 @@ class Mutator:
             case "translate_right_grain":
                 dz = (GB.z_dim / GB.repeat_factor[1]
                       ) * local_random.uniform(0, 1)
-                dy = (GB.z_dim / GB.repeat_factor[0]
+                dy = (GB.y_dim / GB.repeat_factor[0]
                       ) * local_random.uniform(0, 1)
                 new_system = manipulator.translate_right_grain(dy=dy, dz=dz)
                 mutation = f"shift{dy:.8f}dy{dz:.8f}dz"

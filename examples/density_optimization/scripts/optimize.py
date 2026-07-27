@@ -32,11 +32,8 @@ import numpy as np
 from slurm_utils import SlurmJob, submit_job, wait_for_jobs
 
 from GBOpt import GBMaker, GBManipulator, GBMinimizer
-<<<<<<< HEAD
 from GBOpt.BoundarySpec import FiveDOFSpec
-=======
 from GBOpt.Checkpoint import ENERGY_PENALTY
->>>>>>> feature/checkpointing
 
 BOUNDARY = "sigma5_310_STGB"
 
