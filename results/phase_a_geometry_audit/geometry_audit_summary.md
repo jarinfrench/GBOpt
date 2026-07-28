@@ -1,6 +1,6 @@
 # Zhang Geometry-Audit Summary
 
-Source: `/home/frenjc/projects/GBOpt-worktrees/boundary-spec-api-stage-E/results/phase_a_geometry_audit/generation_results.tsv`
+Source: `/home/frenjc/projects/GBOpt-worktrees/boundary-spec-api-stage-F/results/phase_a_geometry_audit/generation_results.tsv`
 
 > **Classification policy:** Phase 1 audit statuses are descriptive and warning-only. No threshold in this report rejects generation.
 

@@ -1,0 +1,12 @@
+date=2026-07-28T15:44:03-06:00
+git_commit=8a274bf08c8bdd4295d8b43229be2a31580dbbb8
+git_status_begin
+?? gb_migration_guide.md
+?? results/phase_a_geometry_audit/provenance.txt
+?? tools/
+git_status_end
+python=Python 3.13.1
+csv_sha256=c5bf122c65dc3e155f6acd2bbbda5fcc782df45936774d6f61f09fb6e645e8a8
+generator_sha256=a24228b485d12e19ee419ba1405a6c7c30097b5a3bd3fbba07699d9a4472560c
+audit_sha256=82ce34a33169d761f95b38327bec8589b095a4a463a82f873d53cbff86db3576
+summary_sha256=73a77bb6296c8d970273dfd384d02428daf7308d934820660974085e78531b40
