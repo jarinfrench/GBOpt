@@ -1,0 +1,208 @@
+{
+  "P": [
+    [
+      -8,
+      7,
+      -11
+    ],
+    [
+      4,
+      3,
+      -1
+    ],
+    [
+      1,
+      -2,
+      -2
+    ]
+  ],
+  "Q": [
+    [
+      1,
+      0,
+      -5
+    ],
+    [
+      5,
+      0,
+      1
+    ],
+    [
+      0,
+      -1,
+      0
+    ]
+  ],
+  "atoms": {
+    "left_counts": {
+      "O": 3536,
+      "U": 1768
+    },
+    "left_total": 5304,
+    "right_counts": {
+      "O": 3552,
+      "U": 1776
+    },
+    "right_total": 5328,
+    "total": 10632,
+    "whole_counts": {
+      "O": 7088,
+      "U": 3544
+    }
+  },
+  "axis_set": "111",
+  "basis_mode": "supplied",
+  "boundary_type": "MX",
+  "case_id": "zhang_189_MX_111",
+  "construction_mode": "exact",
+  "files": {
+    "data_file": "structure.data",
+    "data_sha256": "8d1f45cbcde0a87fdeb3742c64b956ba2e1c808c91e73c5b7adf1d645fe32931"
+  },
+  "gbopt": {
+    "module_path": "/home/frenjc/projects/GBOpt/GBOpt/__init__.py",
+    "python_executable": "/home/frenjc/miniforge/envs/GBOpt/bin/python",
+    "python_version": "3.13.1 | packaged by conda-forge | (main, Jan 13 2025, 09:53:10) [GCC 13.3.0]",
+    "version": "0.1"
+  },
+  "generation_signature": "b34a37124e8cd93f05d2f1f58c3a7b11eec4c6266ea9cd7ee538248d50ba85de",
+  "generator_schema": 2,
+  "geometry": {
+    "box_dims_angstrom": [
+      [
+        0.0,
+        166.8603145628103
+      ],
+      [
+        0.0,
+        27.810052427135044
+      ],
+      [
+        0.0,
+        32.724
+      ]
+    ],
+    "gb_plane_x_angstrom": 83.43015728140514,
+    "gb_thickness_angstrom": 166.8603145628103,
+    "gb_thickness_periods": 2.0,
+    "interaction_distance_angstrom": 11.0,
+    "mismatch_max_cells": 50,
+    "mismatch_tol": 0.005,
+    "repeat_factor": [
+      1,
+      2
+    ],
+    "spacing": {
+      "x": {
+        "left": 83.43015728140514,
+        "right": 27.810052427135044
+      },
+      "y": 27.810052427135044,
+      "z": 16.362
+    },
+    "strain_accommodation": {
+      "y": {
+        "box_length": 27.810052427135044,
+        "left_repeats": 1,
+        "left_scale": 1.0,
+        "left_unstrained_length": 27.810052427135044,
+        "mismatch": 0.0,
+        "right_repeats": 1,
+        "right_scale": 1.0,
+        "right_unstrained_length": 27.810052427135044
+      },
+      "z": {
+        "box_length": 32.724,
+        "left_repeats": 2,
+        "left_scale": 1.0,
+        "left_unstrained_length": 32.724,
+        "mismatch": 0.0,
+        "right_repeats": 6,
+        "right_scale": 1.0,
+        "right_unstrained_length": 32.724
+      }
+    },
+    "strain_grain": "both",
+    "vacuum_angstrom": 0.0,
+    "x_dim_min_angstrom": 60.0
+  },
+  "geometry_audit": {
+    "bins_y": 6,
+    "bins_z": 7,
+    "bulk_reference_distance_angstrom": 2.3616512761201407,
+    "central_interface": {
+      "empty_left_bin_fraction": 0.0,
+      "empty_right_bin_fraction": 0.0,
+      "maximum_angstrom": 9.09174790887107,
+      "median_angstrom": 4.991547871537065,
+      "minimum_angstrom": 2.3175043689279278,
+      "percentile_95_angstrom": 7.64776441746214,
+      "range_angstrom": 6.774243539943143,
+      "total_bins": 42,
+      "valid_bin_fraction": 1.0,
+      "valid_bins": 42
+    },
+    "central_plane_x_angstrom": 83.43015728140514,
+    "nearest_neighbors": {
+      "central_cross_min_angstrom": 2.3616512761201705,
+      "left_internal_min_angstrom": 2.361651276120142,
+      "periodic_cross_min_angstrom": 2.226586176189911,
+      "periodic_duplicate_count": 0,
+      "right_internal_min_angstrom": 2.3616512761201407
+    },
+    "periodic_interface": {
+      "empty_left_bin_fraction": 0.0,
+      "empty_right_bin_fraction": 0.0,
+      "maximum_angstrom": 7.130782673624379,
+      "median_angstrom": 3.9219304704934004,
+      "minimum_angstrom": 1.4261565347248535,
+      "percentile_95_angstrom": 6.587060494760486,
+      "range_angstrom": 5.704626138899526,
+      "total_bins": 42,
+      "valid_bin_fraction": 1.0,
+      "valid_bins": 42
+    },
+    "reasons": [
+      "central_interface_large_gap_range",
+      "central_interface_heavy_gap_tail",
+      "periodic_interface_large_gap_range",
+      "periodic_interface_heavy_gap_tail"
+    ],
+    "status": "suspicious",
+    "thresholds": {
+      "duplicate_tolerance_angstrom": 1e-06,
+      "max_empty_bin_fraction": 0.25,
+      "max_gap_range_bulk_factor": 2.0,
+      "max_gap_tail_bulk_factor": 1.0,
+      "min_cross_distance_bulk_factor": 0.45
+    }
+  },
+  "inplane_periodic": [
+    true,
+    true
+  ],
+  "material": {
+    "atom_types": [
+      "U",
+      "O"
+    ],
+    "charges": {
+      "O": -1.2,
+      "U": 2.4
+    },
+    "expected_ratio": [
+      1,
+      2
+    ],
+    "lattice_constant_angstrom": 5.454,
+    "structure": "fluorite"
+  },
+  "reference_energies_j_m2": {
+    "ceo2_gotte": null,
+    "uo2_basak": 1.8
+  },
+  "source_csv": "/home/frenjc/projects/GBOpt/gb_data_gbopt.csv",
+  "source_csv_sha256": "c5bf122c65dc3e155f6acd2bbbda5fcc782df45936774d6f61f09fb6e645e8a8",
+  "source_row": 189,
+  "uses_exact_construction": true
+}

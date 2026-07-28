@@ -1,0 +1,53 @@
+{
+  "status": "suspicious",
+  "reasons": [
+    "central_interface_large_gap_range",
+    "central_interface_heavy_gap_tail",
+    "periodic_interface_large_gap_range",
+    "periodic_interface_heavy_gap_tail",
+    "central_interface_severe_overlap",
+    "periodic_interface_severe_overlap"
+  ],
+  "central_interface": {
+    "minimum_angstrom": 0.45380023053199636,
+    "median_angstrom": 5.596869509892002,
+    "percentile_95_angstrom": 10.134871815212009,
+    "maximum_angstrom": 10.739938789253998,
+    "range_angstrom": 10.286138558722001,
+    "empty_left_bin_fraction": 0.0,
+    "empty_right_bin_fraction": 0.0,
+    "valid_bin_fraction": 1.0,
+    "valid_bins": 126,
+    "total_bins": 126
+  },
+  "periodic_interface": {
+    "minimum_angstrom": 0.7563337175530106,
+    "median_angstrom": 5.748136253404005,
+    "percentile_95_angstrom": 10.513038673988515,
+    "maximum_angstrom": 11.647539250318001,
+    "range_angstrom": 10.89120553276499,
+    "empty_left_bin_fraction": 0.0,
+    "empty_right_bin_fraction": 0.0,
+    "valid_bin_fraction": 1.0,
+    "valid_bins": 126,
+    "total_bins": 126
+  },
+  "nearest_neighbors": {
+    "left_internal_min_angstrom": 2.3616512761194683,
+    "right_internal_min_angstrom": 2.36165127611946,
+    "central_cross_min_angstrom": 0.4538002305320106,
+    "periodic_cross_min_angstrom": 0.9076004610640211,
+    "periodic_duplicate_count": 0
+  },
+  "bins_y": 21,
+  "bins_z": 6,
+  "bulk_reference_distance_angstrom": 2.36165127611946,
+  "central_plane_x_angstrom": 98.323383281903,
+  "thresholds": {
+    "max_empty_bin_fraction": 0.25,
+    "max_gap_range_bulk_factor": 2.0,
+    "max_gap_tail_bulk_factor": 1.0,
+    "min_cross_distance_bulk_factor": 0.45,
+    "duplicate_tolerance_angstrom": 1e-06
+  }
+}
