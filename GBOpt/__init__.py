@@ -3,6 +3,21 @@
 __version__ = "0.2.0"
 
 from GBOpt.Atom import Atom
+from GBOpt.BicrystalState import (
+    LEFT_GRAIN_ID,
+    RIGHT_GRAIN_ID,
+    STATE_SCHEMA_VERSION,
+    TRANSLATION_CONVENTION,
+    BicrystalState,
+    BicrystalStateError,
+    BicrystalStateTypeError,
+    BicrystalStateValueError,
+    BicrystalTopology,
+    BoundaryCondition,
+    InterfaceDescriptor,
+    RegionDescriptor,
+    SurfaceDescriptor,
+)
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import GBManipulator
 from GBOpt.Position import Position
@@ -13,3 +28,17 @@ French, J. C. and Bhave, C. V. (2026). GBOpt: Grain Boundary Structure Optimizat
 Using Monte Carlo and Evolutionary Algorithms. SoftwareX, 35, 102763.
 https://doi.org/10.1016/j.softx.2026.102763
 """
+from GBOpt.geometry_audit import GeometryAuditError
+from GBOpt.geometry_validation import (
+    BicrystalFeasibilityReport,
+    ContactPolicy,
+    FeasibilityOverride,
+    FeasibilityPolicy,
+    FeasibilityStatus,
+    GeometryValidationError,
+    SlabPolicy,
+    SpeciesPairThresholds,
+    ValidationReason,
+    VoidPolicy,
+    validate_bicrystal_state,
+)

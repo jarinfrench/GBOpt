@@ -7,10 +7,9 @@ modify coordinates, select a termination, or decide a relative grain translation
 purpose is to quantify interface gaps, close contacts, and periodic duplicate sites so
 construction defects can be identified without changing generation behavior.
 
-The simulation box is assumed to be orthorhombic. The bicrystal is periodic in all
-three directions for duplicate and periodic-interface checks, while internal-grain and
-central-interface nearest-neighbor checks are periodic only in the two in-plane
-coordinates (y and z).
+The legacy audit entry point retains its periodic-x, in-plane-y/z behavior. Reusable
+primitives in this module additionally support arbitrary interface axes and mixed
+periodic/fixed boundary conditions for strict ``BicrystalState`` validation.
 """
 
 from __future__ import annotations
@@ -232,33 +231,218 @@ def _wrap_periodic(values: np.ndarray, lower: float, length: float) -> np.ndarra
     return np.clip(wrapped, 0.0, upper_inside)
 
 
-def _nonperiodic_x_periodic_yz_coordinates(
+def wrap_periodic_coordinates(
     positions: np.ndarray,
-    *,
-    x_min: float,
-    x_span: float,
     lower: np.ndarray,
     lengths: np.ndarray,
+    periodic_axes: tuple[int, ...],
+) -> np.ndarray:
+    """Return coordinates wrapped only along the declared periodic axes."""
+    result = np.array(positions, dtype=np.float64, copy=True)
+    for axis in periodic_axes:
+        result[:, axis] = _wrap_periodic(
+            result[:, axis], float(lower[axis]), float(lengths[axis])
+        )
+    return result
+
+
+def mixed_boundary_tree_coordinates(
+    positions: np.ndarray,
+    lower: np.ndarray,
+    lengths: np.ndarray,
+    periodic_axes: tuple[int, ...],
+    *,
+    shared_fixed_bounds: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Transform coordinates for a cKDTree periodic only along y and z."""
-    padding = max(1.0, 0.05 * max(x_span, 1.0))
-    transformed = np.array(positions, dtype=np.float64, copy=True)
-    transformed[:, 0] = transformed[:, 0] - x_min + padding
-    transformed[:, 1] = _wrap_periodic(
-        transformed[:, 1],
-        float(lower[1]),
-        float(lengths[1]),
-    )
-    transformed[:, 2] = _wrap_periodic(
-        transformed[:, 2],
-        float(lower[2]),
-        float(lengths[2]),
-    )
-    boxsize = np.array(
-        [2.0 * x_span + 3.0 * padding, lengths[1], lengths[2]],
-        dtype=np.float64,
-    )
+    """Transform coordinates for ``cKDTree`` with mixed boundary conditions.
+
+    ``cKDTree`` accepts a periodic box on every axis or none. Fixed axes are therefore
+    embedded in a box more than twice their occupied span, making the periodic image
+    farther away than the direct separation. Callers comparing two sets should pass
+    shared fixed bounds derived from their union.
+    """
+    array = np.asarray(positions, dtype=np.float64)
+    if array.ndim != 2 or array.shape[1] != 3:
+        raise GeometryAuditError("positions must have shape (N, 3).")
+    periodic = frozenset(int(axis) for axis in periodic_axes)
+    if not periodic.issubset({0, 1, 2}):
+        raise GeometryAuditError("periodic_axes may contain only 0, 1, and 2.")
+    transformed = np.array(array, copy=True)
+    boxsize = np.empty(3, dtype=np.float64)
+    if shared_fixed_bounds is None:
+        fixed_min = np.min(array, axis=0) if len(array) else np.array(lower, copy=True)
+        fixed_max = np.max(array, axis=0) if len(array) else np.array(lower, copy=True)
+    else:
+        fixed_min, fixed_max = shared_fixed_bounds
+    for axis in range(3):
+        if axis in periodic:
+            transformed[:, axis] = _wrap_periodic(
+                transformed[:, axis], float(lower[axis]), float(lengths[axis])
+            )
+            boxsize[axis] = float(lengths[axis])
+        else:
+            span = max(float(fixed_max[axis] - fixed_min[axis]), 0.0)
+            padding = max(1.0, 0.05 * max(span, 1.0))
+            transformed[:, axis] = transformed[:, axis] - float(fixed_min[axis]) + padding
+            boxsize[axis] = 2.0 * span + 3.0 * padding
     return transformed, boxsize
+
+
+def same_distance_summary(
+    positions: np.ndarray,
+    lower: np.ndarray,
+    lengths: np.ndarray,
+    periodic_axes: tuple[int, ...],
+) -> float | None:
+    """Return the minimum distinct-site distance under mixed boundaries."""
+    if len(positions) < 2:
+        return None
+    transformed, boxsize = mixed_boundary_tree_coordinates(
+        positions, lower, lengths, periodic_axes
+    )
+    tree = cKDTree(transformed, boxsize=boxsize)
+    distances = tree.query(transformed, k=2, workers=1)[0][:, 1]
+    finite = distances[np.isfinite(distances)]
+    return None if finite.size == 0 else float(np.min(finite))
+
+
+def cross_distance_summary(
+    query_positions: np.ndarray,
+    target_positions: np.ndarray,
+    lower: np.ndarray,
+    lengths: np.ndarray,
+    periodic_axes: tuple[int, ...],
+) -> float | None:
+    """Return the minimum cross-set distance under mixed boundaries."""
+    if len(query_positions) == 0 or len(target_positions) == 0:
+        return None
+    combined = np.vstack((query_positions, target_positions))
+    bounds = (np.min(combined, axis=0), np.max(combined, axis=0))
+    query, boxsize = mixed_boundary_tree_coordinates(
+        query_positions, lower, lengths, periodic_axes, shared_fixed_bounds=bounds
+    )
+    target, _ = mixed_boundary_tree_coordinates(
+        target_positions, lower, lengths, periodic_axes, shared_fixed_bounds=bounds
+    )
+    distances = cKDTree(target, boxsize=boxsize).query(query, k=1, workers=1)[0]
+    finite = distances[np.isfinite(distances)]
+    return None if finite.size == 0 else float(np.min(finite))
+
+
+def periodic_duplicate_pairs(
+    positions: np.ndarray,
+    lower: np.ndarray,
+    lengths: np.ndarray,
+    periodic_axes: tuple[int, ...],
+    tolerance: float,
+) -> tuple[tuple[int, int], ...]:
+    """Return stable unique index pairs within ``tolerance`` under mixed boundaries."""
+    if len(positions) < 2:
+        return ()
+    transformed, boxsize = mixed_boundary_tree_coordinates(
+        positions, lower, lengths, periodic_axes
+    )
+    pairs = cKDTree(transformed, boxsize=boxsize).query_pairs(
+        float(tolerance), output_type="set"
+    )
+    return tuple(sorted((int(i), int(j)) for i, j in pairs))
+
+
+def _generic_bin_indices(
+    positions: np.ndarray,
+    lower: np.ndarray,
+    lengths: np.ndarray,
+    tangent_axes: tuple[int, int],
+    bins: tuple[int, int],
+    periodic_axes: tuple[int, ...],
+) -> np.ndarray:
+    indices: list[np.ndarray] = []
+    periodic = frozenset(periodic_axes)
+    for axis, count in zip(tangent_axes, bins, strict=True):
+        if axis in periodic:
+            reduced = (
+                np.mod(positions[:, axis] - lower[axis], lengths[axis])
+                / lengths[axis]
+            )
+        else:
+            reduced = (positions[:, axis] - lower[axis]) / lengths[axis]
+            reduced = np.clip(reduced, 0.0, np.nextafter(1.0, 0.0))
+        values = np.floor(reduced * count).astype(np.int64)
+        np.minimum(values, count - 1, out=values)
+        indices.append(values)
+    return indices[0] * bins[1] + indices[1]
+
+
+def summarize_interface_gaps(
+    minus_positions: np.ndarray,
+    plus_positions: np.ndarray,
+    lower: np.ndarray,
+    lengths: np.ndarray,
+    *,
+    axis: int,
+    normal_sign: int,
+    bins: tuple[int, int],
+    plus_normal_shift: float = 0.0,
+    periodic_axes: tuple[int, ...] = (0, 1, 2),
+) -> InterfaceGapStatistics:
+    """Return local per-bin gap metrics for an oriented physical interface.
+
+    ``plus_normal_shift`` unfolds the plus grain for a periodic-boundary interface.
+    It is zero for an interior interface and normally one signed box length for a
+    periodic interface.
+    """
+    if axis not in (0, 1, 2) or normal_sign not in (-1, 1):
+        raise GeometryAuditError("axis and normal_sign are invalid.")
+    bins = _validated_bins(bins)
+    tangent = tuple(candidate for candidate in range(3) if candidate != axis)
+    total = bins[0] * bins[1]
+    minus_bins = _generic_bin_indices(
+        minus_positions, lower, lengths, tangent, bins, periodic_axes
+    )
+    plus_bins = _generic_bin_indices(
+        plus_positions, lower, lengths, tangent, bins, periodic_axes
+    )
+    minus_surface = np.full(total, -np.inf, dtype=np.float64)
+    plus_surface = np.full(total, np.inf, dtype=np.float64)
+    minus_oriented = normal_sign * minus_positions[:, axis]
+    plus_oriented = normal_sign * (plus_positions[:, axis] + plus_normal_shift)
+    np.maximum.at(minus_surface, minus_bins, minus_oriented)
+    np.minimum.at(plus_surface, plus_bins, plus_oriented)
+    minus_present = np.isfinite(minus_surface)
+    plus_present = np.isfinite(plus_surface)
+    return _summarize_gaps(
+        plus_surface - minus_surface, minus_present, plus_present
+    )
+
+
+def automatic_interface_bins(
+    lengths: np.ndarray,
+    axis: int,
+    bulk_reference_distance: float | None,
+    *,
+    min_bins_per_axis: int = 1,
+    max_bins_per_axis: int = 64,
+    count_mode: str = "nearest",
+) -> tuple[int, int]:
+    """Choose deterministic approximately isotropic bins tangent to an interface."""
+    tangent = tuple(candidate for candidate in range(3) if candidate != axis)
+    if bulk_reference_distance is None or bulk_reference_distance <= 0.0:
+        target = min(float(lengths[tangent[0]]), float(lengths[tangent[1]])) / 8.0
+    else:
+        target = 2.0 * float(bulk_reference_distance)
+    target = max(target, np.finfo(np.float64).eps)
+
+    def count(length: float) -> int:
+        estimate_float = length / target
+        estimate = (
+            int(math.ceil(estimate_float))
+            if count_mode == "ceil"
+            else int(math.floor(estimate_float + 0.5))
+        )
+        return min(max(estimate, min_bins_per_axis), max_bins_per_axis)
+    if count_mode not in {"ceil", "nearest"}:
+        raise GeometryAuditError("count_mode must be 'ceil' or 'nearest'.")
+    return count(float(lengths[tangent[0]])), count(float(lengths[tangent[1]]))
 
 
 def _minimum_internal_distance(
@@ -267,21 +451,7 @@ def _minimum_internal_distance(
     lengths: np.ndarray,
 ) -> float | None:
     """Return minimum same-grain distance with y/z periodicity only."""
-    if len(positions) < 2:
-        return None
-    x_min = float(np.min(positions[:, 0]))
-    x_span = float(np.ptp(positions[:, 0]))
-    transformed, boxsize = _nonperiodic_x_periodic_yz_coordinates(
-        positions,
-        x_min=x_min,
-        x_span=x_span,
-        lower=lower,
-        lengths=lengths,
-    )
-    tree = cKDTree(transformed, boxsize=boxsize)
-    distances = tree.query(transformed, k=2, workers=1)[0][:, 1]
-    finite = distances[np.isfinite(distances)]
-    return None if finite.size == 0 else float(np.min(finite))
+    return same_distance_summary(positions, lower, lengths, (1, 2))
 
 
 def _minimum_cross_distance(
@@ -291,29 +461,9 @@ def _minimum_cross_distance(
     lengths: np.ndarray,
 ) -> float | None:
     """Return minimum cross-set distance with y/z periodicity only."""
-    if len(query_positions) == 0 or len(target_positions) == 0:
-        return None
-    combined = np.vstack((query_positions, target_positions))
-    x_min = float(np.min(combined[:, 0]))
-    x_span = float(np.ptp(combined[:, 0]))
-    query_transformed, boxsize = _nonperiodic_x_periodic_yz_coordinates(
-        query_positions,
-        x_min=x_min,
-        x_span=x_span,
-        lower=lower,
-        lengths=lengths,
+    return cross_distance_summary(
+        query_positions, target_positions, lower, lengths, (1, 2)
     )
-    target_transformed, _ = _nonperiodic_x_periodic_yz_coordinates(
-        target_positions,
-        x_min=x_min,
-        x_span=x_span,
-        lower=lower,
-        lengths=lengths,
-    )
-    tree = cKDTree(target_transformed, boxsize=boxsize)
-    distances = tree.query(query_transformed, k=1, workers=1)[0]
-    finite = distances[np.isfinite(distances)]
-    return None if finite.size == 0 else float(np.min(finite))
 
 
 def _periodic_duplicate_count(
@@ -323,18 +473,11 @@ def _periodic_duplicate_count(
     tolerance: float,
 ) -> int:
     """Count unique whole-system periodic atom pairs within ``tolerance``."""
-    if len(positions) < 2:
-        return 0
-    wrapped = np.column_stack(
-        tuple(
-            _wrap_periodic(positions[:, axis], float(lower[axis]), float(lengths[axis]))
-            for axis in range(3)
+    return len(
+        periodic_duplicate_pairs(
+            positions, lower, lengths, (0, 1, 2), tolerance
         )
     )
-    tree = cKDTree(wrapped, boxsize=lengths)
-    ordered_count = int(tree.count_neighbors(tree, tolerance, cumulative=True))
-    unique_count = (ordered_count - len(positions)) // 2
-    return max(0, int(unique_count))
 
 
 def _bin_indices(
@@ -430,17 +573,14 @@ def _automatic_bins(
     max_bins_per_axis: int,
 ) -> tuple[int, int]:
     """Choose approximately isotropic physical bins from the bulk spacing."""
-    if bulk_reference_distance is None or bulk_reference_distance <= 0.0:
-        target_width = min(lengths[1], lengths[2]) / 8.0
-    else:
-        target_width = 2.0 * bulk_reference_distance
-    target_width = max(target_width, np.finfo(np.float64).eps)
-
-    def count(length: float) -> int:
-        estimate = int(math.ceil(length / target_width))
-        return min(max(estimate, min_bins_per_axis), max_bins_per_axis)
-
-    return count(float(lengths[1])), count(float(lengths[2]))
+    return automatic_interface_bins(
+        lengths,
+        0,
+        bulk_reference_distance,
+        min_bins_per_axis=min_bins_per_axis,
+        max_bins_per_axis=max_bins_per_axis,
+        count_mode="ceil",
+    )
 
 
 def _bulk_reference(*distances: float | None) -> float | None:
@@ -667,5 +807,12 @@ __all__ = [
     "GeometryAuditThresholds",
     "InterfaceGapStatistics",
     "NearestNeighborDiagnostics",
+    "automatic_interface_bins",
+    "cross_distance_summary",
+    "mixed_boundary_tree_coordinates",
+    "periodic_duplicate_pairs",
+    "same_distance_summary",
+    "summarize_interface_gaps",
+    "wrap_periodic_coordinates",
     "audit_bicrystal_geometry",
 ]

@@ -10,6 +10,12 @@ constructed independently with GBOpt's exact supplied-P/Q path and written as:
       zhang_001_ST_100/
         structure.data
         metadata.json
+        bicrystal_state/
+          state.json
+          atoms.npy
+          box_dims.npy
+          atom_ids.npy
+          grain_ids.npy
       ...
 
 Each case runs in a child process so memory is released after large structures and a
@@ -70,7 +76,7 @@ except ImportError:  # pragma: no cover - available on Linux/macOS.
 
 _RESULT_MARKER = "__GBOPT_STRUCTURE_RESULT__="
 _EXPECTED_CASES = 197
-_GENERATOR_SCHEMA = 2
+_GENERATOR_SCHEMA = 3
 _ALLOWED_TYPES = ("ST", "AT", "TW", "MX")
 _ALLOWED_AXIS_SETS = ("100", "110", "111")
 _REQUIRED_COLUMNS = (
@@ -112,36 +118,14 @@ _RESULT_FIELDS = (
     "signal",
     "data_file",
     "metadata_file",
+    "state_directory",
     "data_sha256",
-    "audit_status",
-    "audit_reasons",
-    "audit_bins_y",
-    "audit_bins_z",
-    "central_gap_min_angstrom",
-    "central_gap_median_angstrom",
-    "central_gap_p95_angstrom",
-    "central_gap_max_angstrom",
-    "central_gap_range_angstrom",
-    "central_empty_left_fraction",
-    "central_empty_right_fraction",
-    "periodic_gap_min_angstrom",
-    "periodic_gap_median_angstrom",
-    "periodic_gap_p95_angstrom",
-    "periodic_gap_max_angstrom",
-    "periodic_gap_range_angstrom",
-    "periodic_empty_left_fraction",
-    "periodic_empty_right_fraction",
-    "left_internal_min_angstrom",
-    "right_internal_min_angstrom",
-    "central_cross_min_angstrom",
-    "periodic_cross_min_angstrom",
-    "periodic_duplicate_count",
-    "p_det_abs",
-    "q_det_abs",
-    "max_miller_row_norm",
-    "box_x_angstrom",
-    "box_y_angstrom",
-    "box_z_angstrom",
+    "structure_hash",
+    "state_hash",
+    "feasibility_status",
+    "feasibility_raw_status",
+    "feasibility_report_hash",
+    "feasibility_reasons",
     "warning_count",
     "warnings",
     "error_type",
@@ -452,6 +436,77 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_sha256(value: Any) -> str:
+    """Return SHA-256 of deterministic compact JSON."""
+    payload = json.dumps(
+        _jsonable(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _feasibility_report_matches(report: Any) -> bool:
+    """Verify retained feasibility policy and report hashes without regeneration."""
+    if not isinstance(report, dict):
+        return False
+    try:
+        expected_report = report["report_hash"]
+        expected_policy = report["policy_hash"]
+        policy = report["policy"]
+        report_payload = {
+            key: value
+            for key, value in report.items()
+            if key not in {"report_hash", "policy_hash"}
+        }
+        return (
+            isinstance(expected_report, str)
+            and isinstance(expected_policy, str)
+            and _canonical_sha256(policy) == expected_policy
+            and _canonical_sha256(report_payload) == expected_report
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _state_directory_matches(
+    state_path: Path,
+    *,
+    structure_hash: str,
+    state_hash: str,
+) -> bool:
+    """Return whether a saved BicrystalState directory matches retained hashes.
+
+    The check validates the manifest-level structure/state hashes and streams every
+    serialized array through SHA-256 without loading the arrays into memory.
+
+    :param state_path: Directory containing ``state.json`` and serialized NPY arrays.
+    :param structure_hash: Expected deterministic structure hash.
+    :param state_hash: Expected deterministic state hash including provenance.
+    :return: ``True`` when the manifest and all array payload hashes match.
+    """
+    manifest_path = state_path / "state.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("structure_hash") != structure_hash:
+            return False
+        if manifest.get("state_hash") != state_hash:
+            return False
+        arrays = manifest["arrays"]
+        array_hashes = manifest["array_hashes"]
+        if set(arrays) != set(array_hashes):
+            return False
+        for name, filename in arrays.items():
+            path = state_path / filename
+            if not path.is_file() or _sha256(path) != array_hashes[name]:
+                return False
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return True
+
+
 def _jsonable(value: Any) -> Any:
     try:
         import numpy as np
@@ -741,58 +796,6 @@ def _strain_metadata(gb: Any) -> dict[str, Any]:
     }
 
 
-def _det3_abs(matrix: Matrix3) -> int:
-    """Return the absolute exact determinant of a three-by-three integer matrix."""
-    a, b, c = matrix
-    determinant = (
-        a[0] * (b[1] * c[2] - b[2] * c[1])
-        - a[1] * (b[0] * c[2] - b[2] * c[0])
-        + a[2] * (b[0] * c[1] - b[1] * c[0])
-    )
-    return abs(int(determinant))
-
-
-def _max_miller_row_norm(P: Matrix3, Q: Matrix3) -> float:
-    """Return the maximum Euclidean row norm across one P/Q pair."""
-    return max(
-        math.sqrt(sum(component * component for component in row))
-        for matrix in (P, Q)
-        for row in matrix
-    )
-
-
-def _audit_result_fields(audit: dict[str, Any]) -> dict[str, Any]:
-    """Flatten selected geometry-audit scalars for TSV and manifest output."""
-    central = audit["central_interface"]
-    periodic = audit["periodic_interface"]
-    nearest = audit["nearest_neighbors"]
-    return {
-        "audit_status": audit["status"],
-        "audit_reasons": json.dumps(audit["reasons"], separators=(",", ":")),
-        "audit_bins_y": audit["bins_y"],
-        "audit_bins_z": audit["bins_z"],
-        "central_gap_min_angstrom": central["minimum_angstrom"],
-        "central_gap_median_angstrom": central["median_angstrom"],
-        "central_gap_p95_angstrom": central["percentile_95_angstrom"],
-        "central_gap_max_angstrom": central["maximum_angstrom"],
-        "central_gap_range_angstrom": central["range_angstrom"],
-        "central_empty_left_fraction": central["empty_left_bin_fraction"],
-        "central_empty_right_fraction": central["empty_right_bin_fraction"],
-        "periodic_gap_min_angstrom": periodic["minimum_angstrom"],
-        "periodic_gap_median_angstrom": periodic["median_angstrom"],
-        "periodic_gap_p95_angstrom": periodic["percentile_95_angstrom"],
-        "periodic_gap_max_angstrom": periodic["maximum_angstrom"],
-        "periodic_gap_range_angstrom": periodic["range_angstrom"],
-        "periodic_empty_left_fraction": periodic["empty_left_bin_fraction"],
-        "periodic_empty_right_fraction": periodic["empty_right_bin_fraction"],
-        "left_internal_min_angstrom": nearest["left_internal_min_angstrom"],
-        "right_internal_min_angstrom": nearest["right_internal_min_angstrom"],
-        "central_cross_min_angstrom": nearest["central_cross_min_angstrom"],
-        "periodic_cross_min_angstrom": nearest["periodic_cross_min_angstrom"],
-        "periodic_duplicate_count": nearest["periodic_duplicate_count"],
-    }
-
-
 def _peak_rss_mib() -> float | None:
     if resource is None:
         return None
@@ -822,19 +825,41 @@ def _generate_case(case: BoundaryCase, config: GenerationConfig) -> dict[str, An
     target_dir.mkdir(parents=True, exist_ok=True)
     data_path = target_dir / "structure.data"
     metadata_path = target_dir / "metadata.json"
+    state_path = target_dir / "bicrystal_state"
     temporary_data = target_dir / f".structure.data.tmp-{os.getpid()}"
 
     if config.project_root is not None:
         sys.path.insert(0, str(config.project_root))
     try:
         import numpy as np
-        from GBOpt import GBMaker
+        from GBOpt import (
+            GBMaker,
+            FeasibilityPolicy,
+            validate_bicrystal_state,
+        )
         from GBOpt.BoundarySpec import PQSpec
-        from GBOpt.geometry_audit import audit_bicrystal_geometry
 
         P = np.asarray(case.P, dtype=object)
         Q = np.asarray(case.Q, dtype=object)
         boundary = PQSpec(P=P, Q=Q, basis_mode="supplied")
+        topology = (
+            "periodic_bicrystal"
+            if config.vacuum == 0.0
+            else "single_interface_slab"
+        )
+        boundary_conditions = (
+            "periodic" if topology == "periodic_bicrystal" else "fixed",
+            "periodic",
+            "periodic",
+        )
+        provenance = {
+            "case_id": case.case_id,
+            "source_row": case.source_row,
+            "source_table": str(config.data_file),
+            "source_sha256": config.source_sha256,
+            "boundary_type": case.boundary_type,
+            "axis_set": case.axis_set,
+        }
         common = dict(
             a0=config.lattice_constant,
             structure=config.structure,
@@ -848,6 +873,10 @@ def _generate_case(case: BoundaryCase, config: GenerationConfig) -> dict[str, An
             mismatch_tol=config.mismatch_tol,
             mismatch_max_cells=config.mismatch_max_cells,
             strain_grain=config.strain_grain,
+            topology=topology,
+            boundary_conditions=boundary_conditions,
+            termination_ids=(0, 0),
+            provenance=provenance,
         )
 
         if config.gb_thickness_periods > 0.0:
@@ -891,18 +920,12 @@ def _generate_case(case: BoundaryCase, config: GenerationConfig) -> dict[str, An
             label=f"{case.case_id} whole system",
         )
 
-        geometry_audit = audit_bicrystal_geometry(
-            gb.left_grain,
-            gb.right_grain,
-            gb.box_dims,
-            central_plane_x=float(gb.gb_plane_x),
+        feasibility_policy = FeasibilityPolicy.from_unit_cell(gb.unit_cell)
+        feasibility_report = validate_bicrystal_state(
+            gb.bicrystal_state,
+            policy=feasibility_policy,
         )
-        geometry_audit_payload = geometry_audit.to_dict()
-        audit_fields = _audit_result_fields(geometry_audit_payload)
-        box_lengths = np.asarray(gb.box_dims, dtype=float)[:, 1] - np.asarray(
-            gb.box_dims,
-            dtype=float,
-        )[:, 0]
+        feasibility_payload = feasibility_report.to_dict()
 
         charge_map = dict(zip(config.atom_types, config.charges))
         temporary_data.unlink(missing_ok=True)
@@ -918,6 +941,10 @@ def _generate_case(case: BoundaryCase, config: GenerationConfig) -> dict[str, An
             )
         os.replace(temporary_data, data_path)
         data_sha256 = _sha256(data_path)
+
+        gb.bicrystal_state.save(state_path)
+        structure_hash = gb.bicrystal_state.structure_hash
+        state_hash = gb.bicrystal_state.state_hash
 
         metadata = {
             "generator_schema": _GENERATOR_SCHEMA,
@@ -938,6 +965,9 @@ def _generate_case(case: BoundaryCase, config: GenerationConfig) -> dict[str, An
             "construction_mode": "exact",
             "uses_exact_construction": bool(gb.uses_exact_construction),
             "inplane_periodic": periodic,
+            "topology": gb.topology,
+            "boundary_conditions": gb.boundary_conditions,
+            "termination_ids": gb.termination_ids,
             "material": {
                 "structure": config.structure,
                 "atom_types": config.atom_types,
@@ -968,10 +998,16 @@ def _generate_case(case: BoundaryCase, config: GenerationConfig) -> dict[str, An
                 "right_total": int(gb.right_grain.size),
                 "right_counts": right_counts,
             },
-            "geometry_audit": geometry_audit_payload,
+            "state": {
+                "directory": state_path.name,
+                "structure_hash": structure_hash,
+                "state_hash": state_hash,
+            },
+            "geometry_feasibility": feasibility_payload,
             "files": {
                 "data_file": data_path.name,
                 "data_sha256": data_sha256,
+                "state_manifest": str(Path(state_path.name) / "state.json"),
             },
             "gbopt": _gbopt_provenance(),
         }
@@ -979,7 +1015,7 @@ def _generate_case(case: BoundaryCase, config: GenerationConfig) -> dict[str, An
         elapsed = time.perf_counter() - started
         peak = _peak_rss_mib()
         first, second = config.atom_types
-        result = {
+        return {
             "case_id": case.case_id,
             "source_row": case.source_row,
             "status": "generated",
@@ -992,20 +1028,22 @@ def _generate_case(case: BoundaryCase, config: GenerationConfig) -> dict[str, An
             "peak_rss_mib": "" if peak is None else round(peak, 3),
             "data_file": str(data_path),
             "metadata_file": str(metadata_path),
+            "state_directory": str(state_path),
             "data_sha256": data_sha256,
-            "p_det_abs": _det3_abs(case.P),
-            "q_det_abs": _det3_abs(case.Q),
-            "max_miller_row_norm": _max_miller_row_norm(case.P, case.Q),
-            "box_x_angstrom": float(box_lengths[0]),
-            "box_y_angstrom": float(box_lengths[1]),
-            "box_z_angstrom": float(box_lengths[2]),
+            "structure_hash": structure_hash,
+            "state_hash": state_hash,
+            "feasibility_status": feasibility_report.status,
+            "feasibility_raw_status": feasibility_report.raw_status,
+            "feasibility_report_hash": feasibility_report.report_hash,
+            "feasibility_reasons": json.dumps(
+                [reason.code for reason in feasibility_report.reasons],
+                separators=(",", ":"),
+            ),
             "warning_count": 0,
             "warnings": "[]",
             "error_type": "",
             "message": "",
         }
-        result.update(audit_fields)
-        return result
     finally:
         temporary_data.unlink(missing_ok=True)
         if config.project_root is not None:
@@ -1035,7 +1073,14 @@ def _child_run(case: BoundaryCase, config: GenerationConfig) -> dict[str, Any]:
                 "peak_rss_mib": "" if peak is None else round(peak, 3),
                 "data_file": "",
                 "metadata_file": "",
+                "state_directory": "",
                 "data_sha256": "",
+                "structure_hash": "",
+                "state_hash": "",
+                "feasibility_status": "",
+                "feasibility_raw_status": "",
+                "feasibility_report_hash": "",
+                "feasibility_reasons": "[]",
                 "error_type": type(exc).__name__,
                 "message": "".join(
                     traceback.format_exception(type(exc), exc, exc.__traceback__)
@@ -1055,7 +1100,13 @@ def _existing_result(
     target_dir = config.output_root / case.case_id
     data_path = target_dir / "structure.data"
     metadata_path = target_dir / "metadata.json"
-    if not data_path.is_file() or not metadata_path.is_file():
+    state_path = target_dir / "bicrystal_state"
+    state_manifest_path = state_path / "state.json"
+    if (
+        not data_path.is_file()
+        or not metadata_path.is_file()
+        or not state_manifest_path.is_file()
+    ):
         return None
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1066,16 +1117,21 @@ def _existing_result(
             return None
         if _sha256(data_path) != expected_hash:
             return None
+        expected_structure_hash = metadata["state"]["structure_hash"]
+        expected_state_hash = metadata["state"]["state_hash"]
+        feasibility = metadata["geometry_feasibility"]
+        if not _feasibility_report_matches(feasibility):
+            return None
+        if not _state_directory_matches(
+            state_path,
+            structure_hash=expected_structure_hash,
+            state_hash=expected_state_hash,
+        ):
+            return None
         atoms = metadata["atoms"]
-        audit = metadata["geometry_audit"]
-        geometry = metadata["geometry"]
-        box_lengths = [
-            float(bounds[1]) - float(bounds[0])
-            for bounds in geometry["box_dims_angstrom"]
-        ]
         counts = atoms["whole_counts"]
         first, second = config.atom_types
-        result = {
+        return {
             "case_id": case.case_id,
             "source_row": case.source_row,
             "status": "skipped",
@@ -1090,13 +1146,17 @@ def _existing_result(
             "signal": "",
             "data_file": str(data_path),
             "metadata_file": str(metadata_path),
+            "state_directory": str(state_path),
             "data_sha256": expected_hash,
-            "p_det_abs": _det3_abs(case.P),
-            "q_det_abs": _det3_abs(case.Q),
-            "max_miller_row_norm": _max_miller_row_norm(case.P, case.Q),
-            "box_x_angstrom": float(box_lengths[0]),
-            "box_y_angstrom": float(box_lengths[1]),
-            "box_z_angstrom": float(box_lengths[2]),
+            "structure_hash": expected_structure_hash,
+            "state_hash": expected_state_hash,
+            "feasibility_status": feasibility["status"],
+            "feasibility_raw_status": feasibility["raw_status"],
+            "feasibility_report_hash": feasibility["report_hash"],
+            "feasibility_reasons": json.dumps(
+                [item["code"] for item in feasibility["reasons"]],
+                separators=(",", ":"),
+            ),
             "warning_count": 0,
             "warnings": "[]",
             "error_type": "",
@@ -1104,8 +1164,6 @@ def _existing_result(
             "stdout_tail": "",
             "stderr_tail": "",
         }
-        result.update(_audit_result_fields(audit))
-        return result
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
@@ -1314,30 +1372,13 @@ def _write_manifest(
                 "natoms": result.get("natoms"),
                 "data_file": result.get("data_file"),
                 "metadata_file": result.get("metadata_file"),
+                "state_directory": result.get("state_directory"),
                 "data_sha256": result.get("data_sha256"),
-                "audit_status": result.get("audit_status"),
-                "audit_reasons": result.get("audit_reasons"),
-                "central_gap_max_angstrom": result.get(
-                    "central_gap_max_angstrom"
-                ),
-                "central_gap_range_angstrom": result.get(
-                    "central_gap_range_angstrom"
-                ),
-                "periodic_gap_max_angstrom": result.get(
-                    "periodic_gap_max_angstrom"
-                ),
-                "periodic_gap_range_angstrom": result.get(
-                    "periodic_gap_range_angstrom"
-                ),
-                "central_cross_min_angstrom": result.get(
-                    "central_cross_min_angstrom"
-                ),
-                "periodic_cross_min_angstrom": result.get(
-                    "periodic_cross_min_angstrom"
-                ),
-                "periodic_duplicate_count": result.get(
-                    "periodic_duplicate_count"
-                ),
+                "structure_hash": result.get("structure_hash"),
+                "state_hash": result.get("state_hash"),
+                "feasibility_status": result.get("feasibility_status"),
+                "feasibility_raw_status": result.get("feasibility_raw_status"),
+                "feasibility_report_hash": result.get("feasibility_report_hash"),
             }
         )
     _atomic_json(
@@ -1350,6 +1391,13 @@ def _write_manifest(
             "output_root": str(config.output_root),
             "configuration": _jsonable(asdict(config)),
             "status_counts": dict(Counter(str(item["status"]) for item in results)),
+            "feasibility_status_counts": dict(
+                Counter(
+                    str(item.get("feasibility_status", ""))
+                    for item in results
+                    if item.get("feasibility_status")
+                )
+            ),
             "structures": entries,
         },
     )
@@ -1363,9 +1411,9 @@ def _display(index: int, total: int, result: dict[str, Any]) -> None:
     suffix = f" {elapsed}s" if elapsed != "" else ""
     if natoms != "":
         suffix += f" {natoms} atoms"
-    audit_status = result.get("audit_status", "")
-    if audit_status:
-        suffix += f" audit={audit_status}"
+    feasibility = result.get("feasibility_status", "")
+    if feasibility:
+        suffix += f" geometry={feasibility}"
     print(f"[{index:03d}/{total:03d}] {status:>10} {case_id}{suffix}", flush=True)
     if status not in {"generated", "skipped"}:
         lines = str(result.get("message", "")).strip().splitlines()

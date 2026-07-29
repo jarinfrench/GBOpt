@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
+
+from GBOpt import GBMaker
+from GBOpt.BoundarySpec import PQSpec
+from GBOpt.geometry_validation import FeasibilityPolicy, validate_bicrystal_state
+from generate_structures import _load_cases
 
 from GBOpt.geometry_audit import GeometryAuditResult, audit_bicrystal_geometry
 
@@ -169,3 +175,79 @@ def test_zhang_041_twist_remains_a_reasonable_geometry_control() -> None:
     assert result.nearest_neighbors.central_cross_min_angstrom is not None
     assert result.nearest_neighbors.periodic_cross_min_angstrom is not None
     assert result.nearest_neighbors.periodic_duplicate_count == 0
+
+
+@pytest.fixture(scope="module")
+def reduced_exact_feasibility_reports():
+    """Build small exact production-path states for the Phase 4 regressions."""
+    cases = {
+        case.case_id: case
+        for case in _load_cases(Path("gb_data_gbopt.csv"), expected_cases=197)
+    }
+    reports = {}
+    for case_id in ("zhang_041_TW_100", "zhang_001_ST_100"):
+        case = cases[case_id]
+        with pytest.warns(UserWarning, match="Recommended repeat factor"):
+            gb = GBMaker.from_boundary_spec(
+                a0=5.454,
+                structure="fluorite",
+                atom_types=("U", "O"),
+                boundary=PQSpec(
+                    P=np.asarray(case.P, dtype=object),
+                    Q=np.asarray(case.Q, dtype=object),
+                    basis_mode="supplied",
+                ),
+                mode="exact",
+                repeat_factor=(1, 1),
+                x_dim_min=8.0,
+                gb_thickness=0.0,
+                vacuum=0.0,
+                interaction_distance=0.0,
+                mismatch_tol=1.0e-3,
+                mismatch_max_cells=50,
+                strain_grain="both",
+                topology="periodic_bicrystal",
+                boundary_conditions=("periodic", "periodic", "periodic"),
+                termination_ids=(0, 0),
+            )
+        before = gb.bicrystal_state.structure_hash
+        report = validate_bicrystal_state(
+            gb.bicrystal_state,
+            policy=FeasibilityPolicy.from_unit_cell(gb.unit_cell),
+        )
+        assert gb.bicrystal_state.structure_hash == before
+        reports[case_id] = report
+    return reports
+
+
+def test_reduced_exact_twist_control_is_feasible(
+    reduced_exact_feasibility_reports,
+) -> None:
+    report = reduced_exact_feasibility_reports["zhang_041_TW_100"]
+
+    assert report.status == "feasible"
+    assert [item.interface_id for item in report.interfaces] == [
+        "central_gb",
+        "periodic_gb",
+    ]
+    assert report.raw_reasons == ()
+
+
+def test_reduced_exact_symmetric_tilt_fails_both_interfaces_on_contacts(
+    reduced_exact_feasibility_reports,
+) -> None:
+    report = reduced_exact_feasibility_reports["zhang_001_ST_100"]
+
+    assert report.status == "infeasible"
+    hard_failures = {
+        (reason.descriptor_id, reason.species)
+        for reason in report.raw_reasons
+        if reason.code == "interface.cross_contact_below_hard_minimum"
+    }
+    assert hard_failures == {
+        ("central_gb", ("O", "O")),
+        ("central_gb", ("U", "U")),
+        ("periodic_gb", ("O", "O")),
+        ("periodic_gb", ("U", "U")),
+    }
+    assert report.duplicate_pairs == ()

@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import math
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from numbers import Number
 from typing import Any
@@ -19,6 +20,16 @@ from GBOpt.BoundarySpec import (
     CSLExactSpec,
     FiveDOFSpec,
     PQSpec,
+)
+from GBOpt.BicrystalState import (
+    LEFT_GRAIN_ID,
+    RIGHT_GRAIN_ID,
+    BicrystalState,
+    BicrystalTopology,
+    BoundaryCondition,
+    InterfaceDescriptor,
+    RegionDescriptor,
+    SurfaceDescriptor,
 )
 from GBOpt.crystallography import (
     csl_approx_spec_to_embedding,
@@ -366,6 +377,10 @@ def _miller_row_norm(row: Sequence[object] | np.ndarray) -> float:
 
 _VALID_STRAIN_GRAIN = frozenset({"both", "left", "right"})
 _VALID_BOUNDARY_MODES = frozenset({"exact", "prefer_exact", "approximate"})
+_VALID_BICRYSTAL_TOPOLOGIES = frozenset(
+    {"periodic_bicrystal", "single_interface_slab"}
+)
+_VALID_BOUNDARY_CONDITIONS = frozenset({"periodic", "fixed"})
 
 
 class GBMaker:
@@ -397,6 +412,19 @@ class GBMaker:
         ``1``.
     :param epsilon: Numerical tolerance used for geometric comparisons. Keyword
         parameter, optional, defaults to ``1e-10``.
+    :param topology: Explicit seed topology. Supported values are
+        ``"periodic_bicrystal"`` and ``"single_interface_slab"``. ``None`` resolves
+        the topology once from ``vacuum`` for compatibility. Keyword parameter,
+        optional, defaults to ``None``.
+    :param boundary_conditions: Explicit x/y/z conditions using ``"periodic"`` or
+        ``"fixed"``. ``None`` resolves them once from the topology and generated
+        in-plane commensurability. Keyword parameter, optional, defaults to ``None``.
+    :param termination_ids: Nonnegative left/right termination identifiers retained in
+        the state, or ``None`` when unavailable. Keyword parameter, optional, defaults
+        to ``(0, 0)``.
+    :param provenance: JSON-compatible source-row or campaign provenance retained in
+        deterministic construction metadata. Keyword parameter, optional, defaults to
+        ``None``.
 
     Internal keyword parameters:
 
@@ -404,6 +432,11 @@ class GBMaker:
         present, the embedding provides the left/right rotations and, for exact coherent
         boundaries, the integer P/Q periodic Miller rows. Internal keyword parameter,
         optional, defaults to ``None``.
+    :param _boundary_spec: Original normalized boundary specification retained for
+        deterministic seed reconstruction. Internal keyword parameter, optional,
+        defaults to ``None``.
+    :param _construction_mode: Construction policy recorded in seed metadata. Internal
+        keyword parameter, optional, defaults to ``"legacy"``.
     :param _mismatch_tol: Maximum allowed relative mismatch for commensurate in-plane
         repeat search. ``None`` disables mismatch accommodation. Internal keyword
         parameter, optional, defaults to ``None``.
@@ -418,12 +451,18 @@ class GBMaker:
     def __init__(self, a0: float, structure: str, gb_thickness: float,
                  misorientation: np.ndarray, atom_types: str | tuple[str, ...], *,
                  _embedding=None,
+                 _boundary_spec=None,
+                 _construction_mode: str = "legacy",
                  _mismatch_tol=None,
                  _mismatch_max_cells: int = 50,
                  _strain_grain: str = "both",
                  repeat_factor: int | Sequence[int] = 2, x_dim_min: float = 50,
                  vacuum: float = 10, interaction_distance: float = 15.0,
-                 gb_id: int = 1, epsilon: float = 1e-10):
+                 gb_id: int = 1, epsilon: float = 1e-10,
+                 topology: BicrystalTopology | None = None,
+                 boundary_conditions: Sequence[BoundaryCondition] | None = None,
+                 termination_ids: tuple[int, int] | None = (0, 0),
+                 provenance: Mapping[str, object] | None = None):
         if _embedding is None:
             warnings.warn(
                 _LEGACY_CONSTRUCTOR_DEPRECATION,
@@ -464,6 +503,18 @@ class GBMaker:
         self.__id = self.__validate(gb_id, int, "id", positive=True)
         self.__inplane_periodic = (True, True)
         self.__embedding = _embedding
+        self.__boundary_spec = _boundary_spec
+        self.__construction_mode = str(_construction_mode)
+        self.__requested_topology = self.__validate_bicrystal_topology(topology)
+        self.__requested_boundary_conditions = self.__validate_boundary_conditions(
+            boundary_conditions
+        )
+        self.__termination_ids = self.__validate_termination_ids(termination_ids)
+        self.__provenance = self.__validate_provenance(provenance)
+        self.__relative_translation_lab = (0.0, 0.0, 0.0)
+        self.__bicrystal_state: BicrystalState | None = None
+        self.__atom_ids = np.empty(0, dtype=np.int64)
+        self.__grain_ids = np.empty(0, dtype=np.int8)
         self.__mismatch_tol = self.__validate_mismatch_tol(_mismatch_tol)
         self.__mismatch_max_cells = self.__validate_mismatch_max_cells(
             _mismatch_max_cells
@@ -475,6 +526,11 @@ class GBMaker:
 
         self.__unit_cell = self.__init_unit_cell(atom_types)
         self.__spacing = self.__calculate_periodic_spacing()  # periodic distances dict
+        self.__topology, self.__topology_source = self.__resolve_bicrystal_topology()
+        (
+            self.__boundary_conditions,
+            self.__boundary_conditions_source,
+        ) = self.__resolve_boundary_conditions()
         self.__update_dims()
 
         self.__radius = a0 * self.__unit_cell.radius  # atom radius
@@ -498,6 +554,12 @@ class GBMaker:
         mismatch_tol=None,
         mismatch_max_cells: int = 50,
         strain_grain: str = "both",
+        boundary_spec=None,
+        construction_mode: str = "exact",
+        topology: BicrystalTopology | None = None,
+        boundary_conditions: Sequence[BoundaryCondition] | None = None,
+        termination_ids: tuple[int, int] | None = (0, 0),
+        provenance: Mapping[str, object] | None = None,
     ) -> GBMaker:
         """Build a GBMaker from a BoundaryEmbedding.
 
@@ -527,13 +589,30 @@ class GBMaker:
         :param strain_grain: Grain strain policy used when mismatch accommodation is
             active. Supported values are ``"both"``, ``"left"``, and ``"right"``.
             Keyword parameter, optional, defaults to ``"both"``.
-        :return: Fully initialized GBMaker instance.
+        :param boundary_spec: Original normalized boundary specification retained in
+            deterministic construction metadata. Keyword parameter, optional, defaults
+            to ``None``.
+        :param construction_mode: Construction policy retained in deterministic
+            metadata. Keyword parameter, optional, defaults to ``"exact"``.
+        :param topology: Explicit seed topology, or ``None`` for one-time compatibility
+            resolution from ``vacuum``. Keyword parameter, optional, defaults to
+            ``None``.
+        :param boundary_conditions: Explicit x/y/z conditions, or ``None`` for
+            construction-derived conditions. Keyword parameter, optional, defaults to
+            ``None``.
+        :param termination_ids: Nonnegative left/right termination identifiers, or
+            ``None``. Keyword parameter, optional, defaults to ``(0, 0)``.
+        :param provenance: JSON-compatible source-row or campaign provenance. Keyword
+            parameter, optional, defaults to ``None``.
+        :return: Fully initialized GBMaker instance carrying a ``BicrystalState``.
         """
         if misorientation is None:
             misorientation = np.zeros(5)
         return cls(
             a0, structure, gb_thickness, np.asarray(misorientation), atom_types,
             _embedding=embedding,
+            _boundary_spec=boundary_spec,
+            _construction_mode=construction_mode,
             _mismatch_tol=mismatch_tol,
             _mismatch_max_cells=mismatch_max_cells,
             _strain_grain=strain_grain,
@@ -542,6 +621,10 @@ class GBMaker:
             vacuum=vacuum,
             interaction_distance=interaction_distance,
             gb_id=gb_id,
+            topology=topology,
+            boundary_conditions=boundary_conditions,
+            termination_ids=termination_ids,
+            provenance=provenance,
         )
 
     @classmethod
@@ -564,6 +647,10 @@ class GBMaker:
         mismatch_tol: float | None = None,
         mismatch_max_cells: int = 50,
         strain_grain: str = "both",
+        topology: BicrystalTopology | None = None,
+        boundary_conditions: Sequence[BoundaryCondition] | None = None,
+        termination_ids: tuple[int, int] | None = (0, 0),
+        provenance: Mapping[str, object] | None = None,
     ) -> GBMaker:
         """Build a grain boundary from a boundary-spec dataclass.
 
@@ -645,7 +732,19 @@ class GBMaker:
             the right-grain length, and ``"right"`` preserves the left-grain length.
             Ignored when ``mismatch_tol`` is ``None``. Keyword argument, optional,
             defaults to ``"both"``.
-        :return: Fully initialized ``GBMaker`` instance.
+        :param topology: Explicit generation topology. ``None`` resolves it once from
+            ``vacuum`` for compatibility. Keyword argument, optional, defaults to
+            ``None``.
+        :param boundary_conditions: Explicit x/y/z conditions. ``None`` resolves them
+            once from topology and in-plane commensurability. Keyword argument,
+            optional, defaults to ``None``.
+        :param termination_ids: Nonnegative left/right termination identifiers retained
+            in the state, or ``None``. Keyword argument, optional, defaults to
+            ``(0, 0)``.
+        :param provenance: JSON-compatible source-row or campaign provenance retained in
+            deterministic metadata. Keyword argument, optional, defaults to ``None``.
+        :return: Fully initialized ``GBMaker`` instance carrying a generation-time
+            ``BicrystalState``.
         :raises BoundarySpecError: If the requested mode is incompatible with the
             boundary type, exact boundary conversion or exactification fails, an
             exact-cell limit is exceeded, or another boundary-spec construction error
@@ -771,7 +870,458 @@ class GBMaker:
             mismatch_tol=mismatch_tol,
             mismatch_max_cells=mismatch_max_cells,
             strain_grain=strain_grain,
+            boundary_spec=boundary,
+            construction_mode=mode,
+            topology=topology,
+            boundary_conditions=boundary_conditions,
+            termination_ids=termination_ids,
+            provenance=provenance,
         )
+
+    @staticmethod
+    def __validate_bicrystal_topology(
+        value: BicrystalTopology | None,
+    ) -> BicrystalTopology | None:
+        """Return a validated optional generation topology.
+
+        :param value: Candidate topology string or ``None``.
+        :return: Validated topology or ``None``.
+        :raises GBMakerValueError: If ``value`` is not a supported topology.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str) or value not in _VALID_BICRYSTAL_TOPOLOGIES:
+            raise GBMakerValueError(
+                "topology must be one of "
+                f"{sorted(_VALID_BICRYSTAL_TOPOLOGIES)} or None; got {value!r}."
+            )
+        return value  # type: ignore[return-value]
+
+    @staticmethod
+    def __validate_boundary_conditions(
+        value: Sequence[BoundaryCondition] | None,
+    ) -> tuple[BoundaryCondition, BoundaryCondition, BoundaryCondition] | None:
+        """Return validated optional x/y/z boundary conditions.
+
+        :param value: Candidate three-entry boundary-condition sequence or ``None``.
+        :return: Normalized condition tuple or ``None``.
+        :raises GBMakerTypeError: If ``value`` is not a non-string sequence.
+        :raises GBMakerValueError: If the sequence length or an entry is invalid.
+        """
+        if value is None:
+            return None
+        if isinstance(value, (str, bytes)):
+            raise GBMakerTypeError(
+                "boundary_conditions must be a three-entry sequence, not a string."
+            )
+        try:
+            conditions = tuple(value)
+        except TypeError as exc:
+            raise GBMakerTypeError(
+                "boundary_conditions must be a three-entry sequence."
+            ) from exc
+        if len(conditions) != 3:
+            raise GBMakerValueError(
+                "boundary_conditions must contain exactly three entries for x, y, z."
+            )
+        for axis, condition in enumerate(conditions):
+            if condition not in _VALID_BOUNDARY_CONDITIONS:
+                raise GBMakerValueError(
+                    f"boundary_conditions[{axis}] must be one of "
+                    f"{sorted(_VALID_BOUNDARY_CONDITIONS)}; got {condition!r}."
+                )
+        return conditions  # type: ignore[return-value]
+
+    @staticmethod
+    def __validate_termination_ids(
+        value: tuple[int, int] | None,
+    ) -> tuple[int, int] | None:
+        """Return validated nonnegative left/right termination identifiers.
+
+        :param value: Candidate two-entry termination tuple or ``None``.
+        :return: Normalized termination tuple or ``None``.
+        :raises GBMakerTypeError: If an entry is not an integer.
+        :raises GBMakerValueError: If the tuple length is invalid or an entry is negative.
+        """
+        if value is None:
+            return None
+        if isinstance(value, (str, bytes)):
+            raise GBMakerTypeError("termination_ids must be a two-entry integer tuple.")
+        try:
+            values = tuple(value)
+        except TypeError as exc:
+            raise GBMakerTypeError(
+                "termination_ids must be a two-entry integer tuple."
+            ) from exc
+        if len(values) != 2:
+            raise GBMakerValueError(
+                "termination_ids must contain exactly two entries."
+            )
+        normalized: list[int] = []
+        for index, item in enumerate(values):
+            if isinstance(item, (bool, np.bool_)) or not isinstance(
+                item, (int, np.integer)
+            ):
+                raise GBMakerTypeError(
+                    f"termination_ids[{index}] must be an integer; got {item!r}."
+                )
+            integer = int(item)
+            if integer < 0:
+                raise GBMakerValueError("termination_ids must be nonnegative.")
+            normalized.append(integer)
+        return normalized[0], normalized[1]
+
+    @staticmethod
+    def __validate_provenance(
+        value: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        """Return a defensive copy of caller-supplied construction provenance.
+
+        :param value: Source-row or campaign provenance mapping, or ``None``.
+        :return: Defensive dictionary copy with string keys.
+        :raises GBMakerTypeError: If ``value`` is not a mapping or a key is not a string.
+        """
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise GBMakerTypeError("provenance must be a mapping or None.")
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise GBMakerTypeError(
+                    f"provenance keys must be strings; got {key!r}."
+                )
+            result[key] = deepcopy(item)
+        return result
+
+    def __resolve_bicrystal_topology(
+        self,
+    ) -> tuple[BicrystalTopology, str]:
+        """Resolve the requested topology once at construction time.
+
+        :return: Resolved topology and a string identifying its resolution source.
+        :raises GBMakerValueError: If periodic topology is combined with nonzero vacuum.
+        """
+        if self.__requested_topology is None:
+            topology: BicrystalTopology = (
+                "periodic_bicrystal"
+                if float(self.__vacuum_thickness) == 0.0
+                else "single_interface_slab"
+            )
+            source = "legacy_vacuum_inference"
+        else:
+            topology = self.__requested_topology
+            source = "explicit"
+
+        if topology == "periodic_bicrystal" and self.__vacuum_thickness != 0.0:
+            raise GBMakerValueError(
+                "periodic_bicrystal topology requires vacuum=0 so the x faces form "
+                "the second physical grain boundary."
+            )
+        return topology, source
+
+    def __resolve_boundary_conditions(
+        self,
+    ) -> tuple[
+        tuple[BoundaryCondition, BoundaryCondition, BoundaryCondition],
+        str,
+    ]:
+        """Resolve explicit x/y/z boundary conditions for the generated state.
+
+        :return: Resolved x/y/z condition tuple and its resolution source.
+        :raises GBMakerValueError: If x conflicts with topology or an in-plane axis is
+            declared periodic when the constructed embedding is not commensurate.
+        """
+        if self.__requested_boundary_conditions is None:
+            x_condition: BoundaryCondition = (
+                "periodic" if self.__topology == "periodic_bicrystal" else "fixed"
+            )
+            conditions = (
+                x_condition,
+                "periodic" if self.__inplane_periodic[0] else "fixed",
+                "periodic" if self.__inplane_periodic[1] else "fixed",
+            )
+            source = "construction_default"
+        else:
+            conditions = self.__requested_boundary_conditions
+            source = "explicit"
+
+        expected_x = (
+            "periodic" if self.__topology == "periodic_bicrystal" else "fixed"
+        )
+        if conditions[0] != expected_x:
+            raise GBMakerValueError(
+                f"topology={self.__topology!r} requires x boundary condition "
+                f"{expected_x!r}; got {conditions[0]!r}."
+            )
+        for index, generated_periodic in enumerate(self.__inplane_periodic, start=1):
+            if conditions[index] == "periodic" and not generated_periodic:
+                axis_name = "y" if index == 1 else "z"
+                raise GBMakerValueError(
+                    f"The generated boundary is not commensurate in {axis_name}; "
+                    "that axis cannot be declared periodic."
+                )
+        return conditions, source
+
+    @staticmethod
+    def __boundary_spec_metadata(boundary) -> dict[str, object] | None:
+        """Return a deterministic JSON representation of a boundary specification.
+
+        :param boundary: Normalized boundary-spec dataclass or ``None``.
+        :return: JSON-compatible boundary description or ``None``.
+        """
+        if boundary is None:
+            return None
+        if isinstance(boundary, PQSpec):
+            return {
+                "type": "PQSpec",
+                "basis_mode": boundary.basis_mode,
+                "P": np.asarray(boundary.P, dtype=object).tolist(),
+                "Q": np.asarray(boundary.Q, dtype=object).tolist(),
+            }
+        if isinstance(boundary, CSLExactSpec):
+            return {
+                "type": "CSLExactSpec",
+                "axis": list(boundary.axis),
+                "plane": list(boundary.plane),
+                "sigma": boundary.sigma,
+                "quat": list(boundary.quat),
+            }
+        if isinstance(boundary, CSLApproxSpec):
+            return {
+                "type": "CSLApproxSpec",
+                "axis": list(boundary.axis),
+                "plane": list(boundary.plane),
+                "sigma": boundary.sigma,
+                "angle_deg": float(boundary.angle_deg),
+            }
+        if isinstance(boundary, FiveDOFSpec):
+            return {
+                "type": "FiveDOFSpec",
+                "params": [float(value) for value in boundary.params],
+            }
+        return {"type": type(boundary).__name__, "repr": repr(boundary)}
+
+    @staticmethod
+    def __embedding_metadata(embedding) -> dict[str, object] | None:
+        """Return deterministic metadata for the resolved boundary embedding.
+
+        :param embedding: Resolved boundary embedding or ``None``.
+        :return: JSON-compatible embedding metadata or ``None``.
+        """
+        if embedding is None:
+            return None
+        primitive = None
+        if embedding.metadata is not None:
+            metadata = embedding.metadata
+            primitive = {
+                "basis_mode": metadata.basis_mode,
+                "primitive_area_index": metadata.primitive_area_index,
+                "plane": list(metadata.plane),
+                "rotation_denominator": metadata.rotation_denominator,
+                "input_area_index": metadata.input_area_index,
+                "orientation_area_index": metadata.orientation_area_index,
+                "input_reduction_index": metadata.input_reduction_index,
+                "conventional_cell_multiplier": metadata.conventional_cell_multiplier,
+            }
+        return {
+            "source": embedding.source,
+            "exact": bool(embedding.exact),
+            "coherent": bool(embedding.coherent),
+            "P": None if embedding.P is None else np.asarray(embedding.P).tolist(),
+            "Q": None if embedding.Q is None else np.asarray(embedding.Q).tolist(),
+            "R_left": np.asarray(embedding.R_left, dtype=float).tolist(),
+            "R_right": np.asarray(embedding.R_right, dtype=float).tolist(),
+            "primitive_cell": primitive,
+        }
+
+    def __construction_metadata(self) -> dict[str, object]:
+        """Return deterministic metadata sufficient to reproduce this seed.
+
+        :return: JSON-compatible construction configuration, embedding, and provenance.
+        """
+        strain = {
+            axis: {
+                "left_repeats": value.left_repeats,
+                "right_repeats": value.right_repeats,
+                "left_unstrained_length": value.left_unstrained_length,
+                "right_unstrained_length": value.right_unstrained_length,
+                "box_length": value.box_length,
+                "left_scale": value.left_scale,
+                "right_scale": value.right_scale,
+                "mismatch": value.mismatch,
+            }
+            for axis, value in sorted(self.__strain_accommodation.items())
+        }
+        boundary = self.__boundary_spec_metadata(self.__boundary_spec)
+        if boundary is None:
+            boundary = {
+                "type": "legacy_five_dof",
+                "params": [float(value) for value in self.misorientation],
+            }
+        return {
+            "generator": "GBOpt.GBMaker",
+            "construction_mode": self.__construction_mode,
+            "gb_id": self.__id,
+            "a0": float(self.__a0),
+            "structure": self.__structure,
+            "atom_type_map": dict(sorted(self.__unit_cell.type_map.items())),
+            "boundary_spec": boundary,
+            "embedding": self.__embedding_metadata(self.__embedding),
+            "repeat_factor": [int(value) for value in self.__repeat_factor],
+            "x_dim_min": float(self.__x_dim_min),
+            "gb_thickness": float(self.__gb_thickness),
+            "vacuum_thickness": float(self.__vacuum_thickness),
+            "interaction_distance": float(self.__interaction_distance),
+            "epsilon": float(self.__epsilon),
+            "mismatch_tol": self.__mismatch_tol,
+            "mismatch_max_cells": self.__mismatch_max_cells,
+            "strain_grain": self.__strain_grain,
+            "strain_accommodation": strain,
+            "topology_source": self.__topology_source,
+            "boundary_conditions_source": self.__boundary_conditions_source,
+            "provenance": deepcopy(self.__provenance),
+        }
+
+    def __state_descriptors(self) -> tuple[
+        tuple[InterfaceDescriptor, ...],
+        tuple[SurfaceDescriptor, ...],
+        tuple[RegionDescriptor, ...],
+    ]:
+        """Return topology-specific interfaces, external surfaces, and vacuum.
+
+        External surface descriptors are emitted for every fixed box axis. On the
+        boundary-normal x axis, slab surfaces separate the solid domain from vacuum;
+        fixed y/z faces are represented at their corresponding box bounds.
+
+        :return: Interface, external-surface, and vacuum-region descriptor tuples.
+        """
+        xlo, xhi = (float(value) for value in self.__box_dims[0])
+        central = InterfaceDescriptor(
+            interface_id="central_gb",
+            axis=0,
+            location="interior",
+            position=float(self.gb_plane_x),
+            minus_grain_id=LEFT_GRAIN_ID,
+            plus_grain_id=RIGHT_GRAIN_ID,
+            normal_lab=(1.0, 0.0, 0.0),
+        )
+        surfaces: list[SurfaceDescriptor] = []
+        vacuum: list[RegionDescriptor] = []
+
+        if self.__topology == "periodic_bicrystal":
+            periodic = InterfaceDescriptor(
+                interface_id="periodic_gb",
+                axis=0,
+                location="periodic_boundary",
+                position=xlo,
+                periodic_partner_position=xhi,
+                minus_grain_id=RIGHT_GRAIN_ID,
+                plus_grain_id=LEFT_GRAIN_ID,
+                normal_lab=(1.0, 0.0, 0.0),
+            )
+            interfaces = (central, periodic)
+        else:
+            interfaces = (central,)
+            left_surface_x = float(self.__vacuum_thickness)
+            right_surface_x = float(self.__vacuum_thickness + self.__x_dim)
+            surfaces.extend(
+                (
+                    SurfaceDescriptor(
+                        surface_id="left_surface",
+                        axis=0,
+                        position=left_surface_x,
+                        outward_normal_lab=(-1.0, 0.0, 0.0),
+                        grain_ids=(LEFT_GRAIN_ID,),
+                    ),
+                    SurfaceDescriptor(
+                        surface_id="right_surface",
+                        axis=0,
+                        position=right_surface_x,
+                        outward_normal_lab=(1.0, 0.0, 0.0),
+                        grain_ids=(RIGHT_GRAIN_ID,),
+                    ),
+                )
+            )
+            if left_surface_x > xlo:
+                vacuum.append(
+                    RegionDescriptor(
+                        region_id="left_vacuum",
+                        kind="vacuum",
+                        axis=0,
+                        lower=xlo,
+                        upper=left_surface_x,
+                    )
+                )
+            if right_surface_x < xhi:
+                vacuum.append(
+                    RegionDescriptor(
+                        region_id="right_vacuum",
+                        kind="vacuum",
+                        axis=0,
+                        lower=right_surface_x,
+                        upper=xhi,
+                    )
+                )
+
+        axis_names = ("x", "y", "z")
+        for axis in (1, 2):
+            if self.__boundary_conditions[axis] != "fixed":
+                continue
+            lower, upper = (float(value) for value in self.__box_dims[axis])
+            lower_normal = [0.0, 0.0, 0.0]
+            upper_normal = [0.0, 0.0, 0.0]
+            lower_normal[axis] = -1.0
+            upper_normal[axis] = 1.0
+            axis_name = axis_names[axis]
+            surfaces.extend(
+                (
+                    SurfaceDescriptor(
+                        surface_id=f"{axis_name}_lower_surface",
+                        axis=axis,
+                        position=lower,
+                        outward_normal_lab=tuple(lower_normal),
+                        grain_ids=(LEFT_GRAIN_ID, RIGHT_GRAIN_ID),
+                    ),
+                    SurfaceDescriptor(
+                        surface_id=f"{axis_name}_upper_surface",
+                        axis=axis,
+                        position=upper,
+                        outward_normal_lab=tuple(upper_normal),
+                        grain_ids=(LEFT_GRAIN_ID, RIGHT_GRAIN_ID),
+                    ),
+                )
+            )
+
+        return interfaces, tuple(surfaces), tuple(vacuum)
+
+    def __refresh_bicrystal_state(self) -> None:
+        """Rebuild the immutable generation-time state from current construction data.
+
+        :return: ``None``. Replaces ``self.__bicrystal_state`` when atoms exist.
+        :raises BicrystalStateError: If current geometry, topology, identity arrays, or
+            metadata violate the generation-time state contract.
+        """
+        if not hasattr(self, "_GBMaker__whole_system"):
+            return
+        interfaces, surfaces, vacuum = self.__state_descriptors()
+        self.__bicrystal_state = BicrystalState(
+            atoms=self.__whole_system,
+            box_dims=self.__box_dims,
+            topology=self.__topology,
+            boundary_conditions=self.__boundary_conditions,
+            atom_ids=self.__atom_ids,
+            grain_ids=self.__grain_ids,
+            interfaces=interfaces,
+            external_surfaces=surfaces,
+            vacuum_regions=vacuum,
+            fixed_regions=(),
+            buffer_regions=(),
+            relative_translation_lab=self.__relative_translation_lab,
+            termination_ids=self.__termination_ids,
+            metadata=self.__construction_metadata(),
+        )
+
 
     @staticmethod
     def __validate_mismatch_tol(value: object) -> float | None:
@@ -1625,6 +2175,17 @@ class GBMaker:
         )
 
         self.__whole_system = np.hstack((self.__left_grain, self.__right_grain))
+        self.__atom_ids = np.arange(
+            1,
+            len(self.__whole_system) + 1,
+            dtype=np.int64,
+        )
+        self.__grain_ids = np.concatenate(
+            (
+                np.full(len(self.__left_grain), LEFT_GRAIN_ID, dtype=np.int8),
+                np.full(len(self.__right_grain), RIGHT_GRAIN_ID, dtype=np.int8),
+            )
+        )
 
     def __calculate_periodic_spacing(self, threshold: float = None) -> dict:
         """
@@ -3032,6 +3593,7 @@ class GBMaker:
 
         self.__generate_gb()
         self.__set_gb_region()
+        self.__refresh_bicrystal_state()
 
     def __validate(
         self,
@@ -3162,6 +3724,10 @@ class GBMaker:
         :param threshold: The maximum allowed value that any spacing can take
         """
         self.__spacing = self.__calculate_periodic_spacing(threshold)
+        (
+            self.__boundary_conditions,
+            self.__boundary_conditions_source,
+        ) = self.__resolve_boundary_conditions()
         self.__update_dims()
 
     def write_lammps(
@@ -3308,6 +3874,7 @@ class GBMaker:
     def epsilon(self, value: Number) -> None:
         self.__epsilon = self.__validate(
             value, Number, "epsilon", strictly_positive=True)
+        self.__refresh_bicrystal_state()
 
     @property
     def gb_thickness(self) -> float:
@@ -3318,6 +3885,8 @@ class GBMaker:
         self.__gb_thickness = self.__validate(
             value, Number, "gb_thickness", positive=True)
         self.__box_dims = self.__calculate_box_dimensions()
+        self.__set_gb_region()
+        self.__refresh_bicrystal_state()
 
     @property
     def id(self) -> int:
@@ -3326,6 +3895,7 @@ class GBMaker:
     @id.setter
     def id(self, value: int):
         self.__id = self.__validate(value, int, "id", positive=True)
+        self.__refresh_bicrystal_state()
 
     @property
     def interaction_distance(self) -> float:
@@ -3354,9 +3924,11 @@ class GBMaker:
             Rotation.from_euler("z", misorientation[4])
             * Rotation.from_euler("y", misorientation[3])
         ).as_matrix()
-        # Discard any active embedding so update_spacing uses the new Euler
-        # angles rather than the stale embedding-derived rotation matrices.
+        # Discard exact-spec provenance with the stale embedding. The replacement
+        # geometry is now defined by the assigned legacy five-DOF parameters.
         self.__embedding = None
+        self.__boundary_spec = None
+        self.__construction_mode = "legacy"
         self.update_spacing()
 
     @property
@@ -3393,16 +3965,22 @@ class GBMaker:
 
     @vacuum_thickness.setter
     def vacuum_thickness(self, value: Number):
-        old_vacuum = self.__vacuum_thickness
-        self.__vacuum_thickness = self.__validate(
+        new_vacuum = self.__validate(
             value, Number, "vacuum_thickness", positive=True
         )
+        if self.__topology == "periodic_bicrystal" and new_vacuum != 0.0:
+            raise GBMakerValueError(
+                "periodic_bicrystal topology requires vacuum_thickness=0."
+            )
+        old_vacuum = self.__vacuum_thickness
+        self.__vacuum_thickness = new_vacuum
         delta = self.__vacuum_thickness - old_vacuum
         self.__left_grain["x"] += delta
         self.__right_grain["x"] += delta
         self.__whole_system["x"] += delta
         self.__gb_region["x"] += delta
         self.__box_dims = self.__calculate_box_dimensions()
+        self.__refresh_bicrystal_state()
 
     @property
     def x_dim_min(self) -> np.ndarray:
@@ -3416,6 +3994,40 @@ class GBMaker:
         self.__box_dims = self.__calculate_box_dimensions()
 
     # Additional getters for other class properties
+    @property
+    def bicrystal_state(self) -> BicrystalState:
+        """Return the immutable generation-time state for this constructed seed."""
+        if self.__bicrystal_state is None:
+            raise GBMakerError("Bicrystal state has not been initialized.")
+        return self.__bicrystal_state
+
+    @property
+    def atom_ids(self) -> np.ndarray:
+        """Return stable one-based atom identifiers in whole-system order."""
+        return self.bicrystal_state.atom_ids
+
+    @property
+    def grain_ids(self) -> np.ndarray:
+        """Return stable left/right grain identifiers in whole-system order."""
+        return self.bicrystal_state.grain_ids
+
+    @property
+    def topology(self) -> BicrystalTopology:
+        """Return the explicit generation topology."""
+        return self.__topology
+
+    @property
+    def boundary_conditions(
+        self,
+    ) -> tuple[BoundaryCondition, BoundaryCondition, BoundaryCondition]:
+        """Return explicit x/y/z boundary conditions for the generated seed."""
+        return self.__boundary_conditions
+
+    @property
+    def termination_ids(self) -> tuple[int, int] | None:
+        """Return the retained left/right interface termination identifiers."""
+        return self.__termination_ids
+
     @property
     def inplane_periodic(self) -> tuple:
         """Read-only view of the in-plane periodicity flags (y, z)."""
