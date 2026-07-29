@@ -1,6 +1,8 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
 import math
+from dataclasses import dataclass
+from numbers import Integral
 from typing import Sequence, Tuple, Union
 
 import numpy as np
@@ -29,6 +31,159 @@ class UnitCellRuntimeError(UnitCellError):
     pass
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class RationalBasis:
+    """Exact fractional basis coordinates for a conventional unit cell.
+
+    ``numerators / denominator`` gives the fractional conventional-cell
+    coordinate of each basis site. The stored array is copied, normalized to
+    Python integers, and marked read-only during construction.
+    """
+
+    names: tuple[str, ...]
+    numerators: np.ndarray
+    denominator: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.denominator, bool) or not isinstance(
+                self.denominator, Integral):
+            raise UnitCellTypeError("The rational-basis denominator must be an int.")
+
+        denominator = int(self.denominator)
+        if denominator <= 0:
+            raise UnitCellValueError(
+                "The rational-basis denominator must be greater than zero."
+            )
+
+        if isinstance(self.names, str):
+            raise UnitCellTypeError(
+                "Rational-basis names must be a sequence of strings."
+            )
+        names = tuple(self.names)
+        if any(not isinstance(name, str) for name in names):
+            raise UnitCellTypeError("Every rational-basis name must be a string.")
+
+        numerators = np.asarray(self.numerators, dtype=object)
+        if numerators.ndim != 2 or numerators.shape[1] != 3:
+            raise UnitCellValueError(
+                "Rational-basis numerators must have shape (basis_size, 3)."
+            )
+        if numerators.shape[0] != len(names):
+            raise UnitCellValueError(
+                "Rational-basis names and numerator rows must have equal lengths."
+            )
+        if not names:
+            raise UnitCellValueError("A rational basis must contain at least one site.")
+
+        normalized = np.empty(numerators.shape, dtype=object)
+        for index, value in np.ndenumerate(numerators):
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise UnitCellTypeError(
+                    "Every rational-basis numerator must be an int."
+                )
+            integer = int(value)
+            if integer < 0 or integer >= denominator:
+                raise UnitCellValueError(
+                    "Rational-basis coordinates must lie in the half-open interval "
+                    "[0, denominator)."
+                )
+            normalized[index] = integer
+
+        rows = [tuple(row) for row in normalized.tolist()]
+        if len(rows) != len(set(rows)):
+            raise UnitCellValueError(
+                "Rational-basis coordinates must be unique within the conventional "
+                "cell."
+            )
+
+        normalized.setflags(write=False)
+        readonly_numerators = normalized.view()
+        readonly_numerators.setflags(write=False)
+        object.__setattr__(self, "names", names)
+        object.__setattr__(self, "numerators", readonly_numerators)
+        object.__setattr__(self, "denominator", denominator)
+
+
+_RATIONAL_BASIS_SPECS = {
+    "sc": (
+        1,
+        ((0, 0, 0, 0),),
+    ),
+    "bcc": (
+        2,
+        (
+            (0, 0, 0, 0),
+            (0, 1, 1, 1),
+        ),
+    ),
+    "fcc": (
+        2,
+        (
+            (0, 0, 0, 0),
+            (0, 0, 1, 1),
+            (0, 1, 0, 1),
+            (0, 1, 1, 0),
+        ),
+    ),
+    "diamond": (
+        4,
+        (
+            (0, 0, 0, 0),
+            (0, 0, 2, 2),
+            (0, 2, 0, 2),
+            (0, 2, 2, 0),
+            (0, 1, 1, 1),
+            (0, 3, 3, 1),
+            (0, 3, 1, 3),
+            (0, 1, 3, 3),
+        ),
+    ),
+    "fluorite": (
+        4,
+        (
+            (0, 0, 0, 0),
+            (0, 0, 2, 2),
+            (0, 2, 0, 2),
+            (0, 2, 2, 0),
+            (1, 1, 1, 1),
+            (1, 1, 1, 3),
+            (1, 1, 3, 1),
+            (1, 1, 3, 3),
+            (1, 3, 1, 1),
+            (1, 3, 1, 3),
+            (1, 3, 3, 1),
+            (1, 3, 3, 3),
+        ),
+    ),
+    "rocksalt": (
+        2,
+        (
+            (0, 0, 0, 0),
+            (0, 0, 1, 1),
+            (0, 1, 0, 1),
+            (0, 1, 1, 0),
+            (1, 0, 0, 1),
+            (1, 0, 1, 0),
+            (1, 1, 0, 0),
+            (1, 1, 1, 1),
+        ),
+    ),
+    "zincblende": (
+        4,
+        (
+            (0, 0, 0, 0),
+            (0, 0, 2, 2),
+            (0, 2, 0, 2),
+            (0, 2, 2, 0),
+            (1, 1, 1, 1),
+            (1, 3, 3, 1),
+            (1, 3, 1, 3),
+            (1, 1, 3, 3),
+        ),
+    ),
+}
+
+
 class UnitCell:
     """
     Helper class for the managing a unit cell and the types of each atom.
@@ -37,9 +192,8 @@ class UnitCell:
 
     __slots__ = ["__unit_cell", "__conventional", "__primitive", "__a0",
                  "__radius", "__reciprocal", "__ideal_bond_lengths",
-                 "__ratio", "__type_map"]
+                 "__ratio", "__type_map", "__rational_basis"]
 
-    # TODO: Basis might be needed for more complicated structures.
     def __init__(self):
         self.__unit_cell = []
         self.__primitive = np.zeros((3, 3))
@@ -49,6 +203,7 @@ class UnitCell:
         self.__ideal_bond_lengths = {}
         self.__ratio = {1: 1}
         self.__type_map = {}
+        self.__rational_basis = None
 
     def init_by_structure(
             self, structure: str, a0: float, atoms: Union[str, Tuple[str, ...]],
@@ -93,13 +248,38 @@ class UnitCell:
                 [0.0, 0.0, 1.0]
             ]
         )
+
+        try:
+            denominator, basis_spec = _RATIONAL_BASIS_SPECS[structure]
+        except KeyError as exc:
+            raise NotImplementedError(
+                f"Lattice structure {structure} not recognized/implemented"
+            ) from exc
+
+        required_atom_count = max(entry[0] for entry in basis_spec) + 1
+        if required_atom_count == 2 and len(atoms) != 2:
+            raise UnitCellValueError(
+                "The specified crystal structure requires 2 atom types."
+            )
+
+        self.__rational_basis = RationalBasis(
+            names=tuple(atoms[entry[0]] for entry in basis_spec),
+            numerators=np.array([entry[1:] for entry in basis_spec], dtype=object),
+            denominator=denominator,
+        )
+        unit_cell = [
+            Atom(
+                name,
+                *(float(value) / self.__rational_basis.denominator for value in row),
+            )
+            for name, row in zip(
+                self.__rational_basis.names,
+                self.__rational_basis.numerators,
+            )
+        ]
+        self.__ratio = {1: 1}
+
         if structure == "fcc":
-            unit_cell = [
-                Atom(atoms[0], 0.0, 0.0, 0.0),
-                Atom(atoms[0], 0.0, 0.5, 0.5),
-                Atom(atoms[0], 0.5, 0.0, 0.5),
-                Atom(atoms[0], 0.5, 0.5, 0.0)
-            ]
             self.__radius = math.sqrt(2) * 0.25
             self.__primitive = np.array(
                 [
@@ -112,10 +292,6 @@ class UnitCell:
                 (1, 1): unit_cell[0].position.distance(unit_cell[1].position)
             }
         elif structure == "bcc":
-            unit_cell = [
-                Atom(atoms[0], 0.0, 0.0, 0.0),
-                Atom(atoms[0], 0.5, 0.5, 0.5)
-            ]
             self.__radius = math.sqrt(3) * 0.25
             self.__primitive = np.array(
                 [
@@ -128,7 +304,6 @@ class UnitCell:
                 (1, 1): unit_cell[0].position.distance(unit_cell[1].position)
             }
         elif structure == "sc":
-            unit_cell = [Atom(atoms[0], 0.0, 0.0, 0.0)]
             self.__radius = 0.5
             # multiply by 2 here since we multiply by half the lattice parameter later
             self.__primitive = 2 * np.array(
@@ -140,16 +315,6 @@ class UnitCell:
             )
             self.__ideal_bond_lengths = {(1, 1): self.__a0}
         elif structure == "diamond":
-            unit_cell = [
-                Atom(atoms[0], 0, 0, 0),
-                Atom(atoms[0], 0, 0.5, 0.5),
-                Atom(atoms[0], 0.5, 0, 0.5),
-                Atom(atoms[0], 0.5, 0.5, 0),
-                Atom(atoms[0], 0.25, 0.25, 0.25),
-                Atom(atoms[0], 0.75, 0.75, 0.25),
-                Atom(atoms[0], 0.75, 0.25, 0.75),
-                Atom(atoms[0], 0.25, 0.75, 0.75)
-            ]
             self.__radius = math.sqrt(3) * 0.125
             self.__primitive = np.array(
                 [
@@ -162,23 +327,6 @@ class UnitCell:
                 (1, 1): unit_cell[0].position.distance(unit_cell[4].position)
             }
         elif structure == "fluorite":
-            if len(atoms) != 2:
-                raise UnitCellValueError(
-                    "The specified crystal structure requires 2 atom types.")
-            unit_cell = [
-                Atom(atoms[0], 0, 0, 0),
-                Atom(atoms[0], 0, 0.5, 0.5),
-                Atom(atoms[0], 0.5, 0, 0.5),
-                Atom(atoms[0], 0.5, 0.5, 0),
-                Atom(atoms[1], 0.25, 0.25, 0.25),
-                Atom(atoms[1], 0.25, 0.25, 0.75),
-                Atom(atoms[1], 0.25, 0.75, 0.25),
-                Atom(atoms[1], 0.25, 0.75, 0.75),
-                Atom(atoms[1], 0.75, 0.25, 0.25),
-                Atom(atoms[1], 0.75, 0.25, 0.75),
-                Atom(atoms[1], 0.75, 0.75, 0.25),
-                Atom(atoms[1], 0.75, 0.75, 0.75)
-            ]
             self.__radius = math.sqrt(3) * 0.125
             self.__primitive = np.array(
                 [
@@ -194,20 +342,6 @@ class UnitCell:
             }
             self.__ratio = {1: 1, 2: 2}
         elif structure == "rocksalt":
-            if len(atoms) != 2:
-                raise UnitCellValueError(
-                    "The specified crystal structure requires 2 atom types.")
-
-            unit_cell = [
-                Atom(atoms[0], 0, 0, 0),
-                Atom(atoms[0], 0, 0.5, 0.5),
-                Atom(atoms[0], 0.5, 0, 0.5),
-                Atom(atoms[0], 0.5, 0.5, 0),
-                Atom(atoms[1], 0, 0, 0.5),
-                Atom(atoms[1], 0, 0.5, 0),
-                Atom(atoms[1], 0.5, 0, 0),
-                Atom(atoms[1], 0.5, 0.5, 0.5)
-            ]
             self.__radius = 0.25
             self.__primitive = np.array(
                 [
@@ -222,20 +356,7 @@ class UnitCell:
                 (2, 2): unit_cell[4].position.distance(unit_cell[5].position)
             }
             self.__ratio = {1: 1, 2: 1}
-        elif structure == "zincblende":
-            if len(atoms) != 2:
-                raise UnitCellValueError(
-                    "The specified crystal structure requires 2 atom types.")
-            unit_cell = [
-                Atom(atoms[0], 0, 0, 0),
-                Atom(atoms[0], 0, 0.5, 0.5),
-                Atom(atoms[0], 0.5, 0, 0.5),
-                Atom(atoms[0], 0.5, 0.5, 0),
-                Atom(atoms[1], 0.25, 0.25, 0.25),
-                Atom(atoms[1], 0.75, 0.75, 0.25),
-                Atom(atoms[1], 0.75, 0.25, 0.75),
-                Atom(atoms[1], 0.25, 0.75, 0.75)
-            ]
+        else:  # zincblende
             self.__radius = math.sqrt(3) * 0.125
             self.__primitive = np.array(
                 [
@@ -250,9 +371,6 @@ class UnitCell:
                 (2, 2): unit_cell[4].position.distance(unit_cell[6].position)
             }
             self.__ratio = {1: 1, 2: 1}
-        else:
-            raise NotImplementedError(
-                f"Lattice structure {structure} not recognized/implemented")
         for i in range(len(unit_cell)):
             unit_cell[i]["position"] *= a0
         self.__unit_cell = unit_cell
@@ -335,6 +453,7 @@ class UnitCell:
             Atom(t, x, y, z)
             for (t, (x, y, z)) in zip(cell_types, unit_cell)
         ]
+        self.__rational_basis = None
 
         if not isinstance(conventional, np.ndarray):
             conventional = np.array(reciprocal)
@@ -437,6 +556,16 @@ class UnitCell:
     @property
     def conventional(self) -> np.ndarray:
         return self.__conventional
+
+    @property
+    def rational_basis(self) -> RationalBasis | None:
+        """Return the immutable exact fractional basis, when one is defined.
+
+        Built-in structures always provide a :class:`RationalBasis`. Custom and
+        uninitialized cells return ``None`` because their floating-point input
+        is not assumed to have an exact rational representation.
+        """
+        return self.__rational_basis
 
     def asarray(self) -> np.ndarray:
         """

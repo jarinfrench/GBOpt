@@ -313,7 +313,7 @@ def test_vacuum_zero_exact_atoms_are_within_x_box(
 # --------------------------------------------------------------------------------------
 
 
-def test_vacuum_zero_periodic_gap_is_not_smaller_than_central_gap(build_gb):
+def test_vacuum_zero_projected_interface_gaps_are_nonnegative(build_gb):
     gb = build_gb(vacuum=0.0)
 
     central_gap = float(
@@ -324,9 +324,11 @@ def test_vacuum_zero_periodic_gap_is_not_smaller_than_central_gap(build_gb):
         + np.min(gb.left_grain["x"])
     )
 
-    assert periodic_gap >= central_gap - gb.epsilon, (
-        f"periodic gap {periodic_gap:.8f} is smaller than central gap "
-        f"{central_gap:.8f}"
+    assert central_gap >= -gb.epsilon, (
+        f"central projected gap {central_gap:.8f} indicates an x overlap"
+    )
+    assert periodic_gap >= -gb.epsilon, (
+        f"periodic projected gap {periodic_gap:.8f} indicates an x overlap"
     )
 
 

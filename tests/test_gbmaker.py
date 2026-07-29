@@ -2930,16 +2930,64 @@ def _assert_atoms_inside_vacuum_zero_x_bounds(
     )
 
 
-def _assert_periodic_x_gap_not_smaller_than_central_gap(
+def _assert_no_duplicate_periodic_representatives(
     gb: GBMaker,
     *,
     label: str,
 ) -> None:
+    """Assert that the assembled bicrystal has no duplicate y/z-periodic sites."""
+    atoms = gb.whole_system
+    assert atoms is not None and atoms.size > 0, f"{label}: whole_system is empty"
+
+    tolerance = max(1e-8, 100.0 * gb.epsilon)
+    positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
+    positions[:, 0] -= float(np.min(positions[:, 0]))
+    positions[:, 1] = np.remainder(positions[:, 1], gb.y_dim)
+    positions[:, 2] = np.remainder(positions[:, 2], gb.z_dim)
+
+    for axis, dimension in ((1, gb.y_dim), (2, gb.z_dim)):
+        near_upper_face = np.isclose(
+            positions[:, axis],
+            dimension,
+            atol=tolerance,
+            rtol=0.0,
+        )
+        positions[near_upper_face, axis] = 0.0
+
+    x_span = float(np.ptp(positions[:, 0]))
+    nonperiodic_x_box = 2.0 * (x_span + 1.0)
+    duplicate_pairs = KDTree(
+        positions,
+        boxsize=(nonperiodic_x_box, gb.y_dim, gb.z_dim),
+    ).query_pairs(tolerance)
+    assert not duplicate_pairs, (
+        f"{label}: found {len(duplicate_pairs)} duplicate periodic "
+        "representative pairs"
+    )
+
+
+def _assert_nonnegative_projected_x_interface_gaps(
+    gb: GBMaker,
+    *,
+    label: str,
+) -> None:
+    """Assert that neither bicrystal interface overlaps in projected x.
+
+    Exact decorated-site construction preserves the complete periodic atomic slab.
+    The central and periodic interfaces can therefore expose different atomic-plane
+    terminations and need not have equal global-extrema x gaps. Local three-dimensional
+    interface-gap and overlap acceptance is handled by the dedicated interface-metrics
+    workflow rather than by deleting exact atomic planes.
+    """
     central_gap, periodic_gap = _vacuum_zero_gap_metrics(gb)
     eps = max(1e-8, 100.0 * gb.epsilon)
-    assert periodic_gap >= central_gap - eps, (
-        f"{label}: periodic_gap={periodic_gap:.8f} A is smaller than "
+    assert central_gap >= -eps, (
+        f"{label}: central interface has a projected x overlap: "
         f"central_gap={central_gap:.8f} A"
+    )
+    assert periodic_gap >= -eps, (
+        f"{label}: periodic interface has a projected x overlap: "
+        f"periodic_gap={periodic_gap:.8f} A"
     )
 
 
@@ -2989,6 +3037,223 @@ def _assert_no_intra_grain_cartesian_degeneracy(
 
 def _zhang_basis_mode(entry: dict) -> str:
     return "primitive" if entry["type"] in {"ST", "TW"} else "supplied"
+
+
+ZHANG_001_ST_100_P = [[0, 18, -1], [0, 1, 18], [1, 0, 0]]
+ZHANG_001_ST_100_Q = [[0, 1, -18], [0, 18, 1], [1, 0, 0]]
+ZHANG_041_TW_100_P = [[0, 0, 1], [4, 1, 0], [-1, 4, 0]]
+ZHANG_041_TW_100_Q = [[0, 0, 1], [4, -1, 0], [1, 4, 0]]
+
+
+ZHANG_DECORATED_SITE_CONTROLS = (
+    pytest.param(
+        "zhang_001_ST_100",
+        ZHANG_001_ST_100_P,
+        ZHANG_001_ST_100_Q,
+        19_500,
+        id="zhang-001-st-100",
+    ),
+    pytest.param(
+        "zhang_041_TW_100",
+        ZHANG_041_TW_100_P,
+        ZHANG_041_TW_100_Q,
+        2_448,
+        id="zhang-041-tw-100",
+    ),
+)
+
+NONFLUORITE_DECORATED_SITE_CONTROLS = (
+    pytest.param(
+        "fcc",
+        "Cu",
+        816,
+        {"Cu": 816},
+        id="monatomic-fcc",
+    ),
+    pytest.param(
+        "rocksalt",
+        ("Na", "Cl"),
+        1_632,
+        {"Cl": 816, "Na": 816},
+        id="rocksalt",
+    ),
+    pytest.param(
+        "zincblende",
+        ("Zn", "S"),
+        1_632,
+        {"S": 816, "Zn": 816},
+        id="zincblende",
+    ),
+)
+
+
+def _build_zhang_decorated_site_control(
+    P,
+    Q,
+    *,
+    structure: str = "fluorite",
+    atom_types: str | tuple[str, ...] = ("U", "O"),
+) -> GBMaker:
+    """Build one supplied-P/Q cubic control with campaign dimensions."""
+    return GBMaker.from_boundary_spec(
+        5.454,
+        structure,
+        atom_types,
+        PQSpec(P=P, Q=Q, basis_mode="supplied"),
+        mode="exact",
+        gb_thickness=0.0,
+        vacuum=0.0,
+        repeat_factor=(1, 1),
+        x_dim_min=60.0,
+        interaction_distance=11.0,
+    )
+
+
+@pytest.mark.filterwarnings(
+    r"ignore:Repeat factor in [yz] modified to \d+ to satisfy the "
+    r"minimum in-plane dimension cutoff of .* A\.:UserWarning"
+)
+@pytest.mark.filterwarnings(
+    r"ignore:Recommended repeat factor is at least 2\.:UserWarning"
+)
+@pytest.mark.parametrize(
+    ("boundary_name", "P", "Q", "expected_atoms_per_grain"),
+    ZHANG_DECORATED_SITE_CONTROLS,
+)
+def test_exact_path_populates_complete_decorated_zhang_controls(
+    boundary_name,
+    P,
+    Q,
+    expected_atoms_per_grain,
+    monkeypatch,
+):
+    def reject_complete_origin_filter(*_args, **_kwargs):
+        raise AssertionError(
+            "The exact decorated-site path must not filter conventional origins."
+        )
+
+    monkeypatch.setattr(
+        GBMaker,
+        "_GBMaker__filter_complete_origins",
+        reject_complete_origin_filter,
+    )
+
+    gb = _build_zhang_decorated_site_control(P, Q)
+
+    for grain_label, grain in (
+        ("left grain", gb.left_grain),
+        ("right grain", gb.right_grain),
+    ):
+        assert len(grain) == expected_atoms_per_grain, (
+            f"{boundary_name} {grain_label}: expected "
+            f"{expected_atoms_per_grain} decorated sites, got {len(grain)}"
+        )
+        _assert_fluorite_stoichiometry(
+            grain,
+            label=f"{boundary_name} {grain_label}",
+        )
+        counts = _species_counts(grain)
+        assert counts == {
+            "O": 2 * expected_atoms_per_grain // 3,
+            "U": expected_atoms_per_grain // 3,
+        }
+
+    assert len(gb.whole_system) == 2 * expected_atoms_per_grain
+    _assert_atoms_inside_vacuum_zero_x_bounds(gb, label=boundary_name)
+    _assert_grains_do_not_cross_interface(gb, label=boundary_name)
+    _assert_no_duplicate_periodic_representatives(gb, label=boundary_name)
+
+
+@pytest.mark.filterwarnings(
+    r"ignore:Recommended repeat factor is at least 2\.:UserWarning"
+)
+@pytest.mark.parametrize(
+    ("structure", "atom_types", "expected_atoms_per_grain", "expected_counts"),
+    NONFLUORITE_DECORATED_SITE_CONTROLS,
+)
+def test_exact_path_supports_representative_nonfluorite_rational_bases(
+    structure,
+    atom_types,
+    expected_atoms_per_grain,
+    expected_counts,
+):
+    gb = _build_zhang_decorated_site_control(
+        ZHANG_041_TW_100_P,
+        ZHANG_041_TW_100_Q,
+        structure=structure,
+        atom_types=atom_types,
+    )
+
+    for grain_label, grain in (
+        ("left grain", gb.left_grain),
+        ("right grain", gb.right_grain),
+    ):
+        assert len(grain) == expected_atoms_per_grain, (
+            f"{structure} {grain_label}: expected {expected_atoms_per_grain} "
+            f"decorated sites, got {len(grain)}"
+        )
+        assert _species_counts(grain) == expected_counts
+
+    assert len(gb.whole_system) == 2 * expected_atoms_per_grain
+    _assert_atoms_inside_vacuum_zero_x_bounds(gb, label=structure)
+    _assert_grains_do_not_cross_interface(gb, label=structure)
+    _assert_no_duplicate_periodic_representatives(gb, label=structure)
+
+
+@pytest.mark.filterwarnings(
+    r"ignore:Recommended repeat factor is at least 2\.:UserWarning"
+)
+def test_exact_gap_handling_bypasses_float_layer_deletion(monkeypatch):
+    def reject_float_equalization(*_args, **_kwargs):
+        raise AssertionError(
+            "Exact decorated-site construction must not delete atomic planes."
+        )
+
+    monkeypatch.setattr(
+        GBMaker,
+        "_GBMaker__equalize_float_periodic_gap",
+        reject_float_equalization,
+    )
+
+    gb = _build_zhang_decorated_site_control(
+        ZHANG_041_TW_100_P,
+        ZHANG_041_TW_100_Q,
+    )
+
+    assert len(gb.left_grain) == 2_448
+    assert len(gb.right_grain) == 2_448
+
+
+@pytest.mark.filterwarnings(
+    r"ignore:Recommended repeat factor is at least 2\.:UserWarning"
+)
+def test_exact_path_rejects_unit_cell_without_rational_basis():
+    gb = _build_zhang_decorated_site_control(
+        ZHANG_041_TW_100_P,
+        ZHANG_041_TW_100_Q,
+    )
+    custom_cell = UnitCell()
+    custom_cell.init_by_custom(
+        unit_cell=np.array([[0.0, 0.0, 0.0]]),
+        unit_cell_types=["Cu"],
+        a0=1.0,
+        conventional=np.eye(3),
+        reciprocal=np.eye(3),
+        ideal_bond_lengths={(1, 1): 1.0},
+    )
+    gb._GBMaker__unit_cell = custom_cell
+
+    with pytest.raises(
+        GBMakerValueError,
+        match="requires a UnitCell with an exact rational basis",
+    ):
+        gb._GBMaker__generate_grain_exact(
+            gb._GBMaker__R_left,
+            np.asarray(ZHANG_041_TW_100_P, dtype=object),
+            gb._GBMaker__left_x,
+            0.0,
+            "left",
+        )
 
 
 ZHANG_2021_EXACT_CASES = tuple(
@@ -3076,7 +3341,7 @@ def test_zhang_2021_exact_boundary_build_quality(
     )
     _assert_positive_finite_box(gb, label=boundary_name)
     _assert_atoms_inside_vacuum_zero_x_bounds(gb, label=boundary_name)
-    _assert_periodic_x_gap_not_smaller_than_central_gap(
+    _assert_nonnegative_projected_x_interface_gaps(
         gb,
         label=boundary_name,
     )
@@ -3176,7 +3441,7 @@ def test_olmsted_2009_exact_boundary_build_quality(
     _assert_positive_finite_box(gb, label=label)
     _assert_atoms_inside_vacuum_zero_x_bounds(gb, label=label)
     _assert_grains_do_not_cross_interface(gb, label=label)
-    _assert_periodic_x_gap_not_smaller_than_central_gap(gb, label=label)
+    _assert_nonnegative_projected_x_interface_gaps(gb, label=label)
     _assert_no_intra_grain_cartesian_degeneracy(
         gb,
         expected_nearest_neighbor=3.52 / math.sqrt(2.0),
