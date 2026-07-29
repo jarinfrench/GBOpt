@@ -7,6 +7,8 @@ from GBOpt.BicrystalState import (
     LEFT_GRAIN_ID,
     RIGHT_GRAIN_ID,
     STATE_SCHEMA_VERSION,
+    TRANSLATION_HISTORY_KEY,
+    TRANSLATION_OPERATION_SCHEMA_VERSION,
     TRANSLATION_CONVENTION,
     BicrystalState,
     BicrystalStateError,
@@ -14,9 +16,11 @@ from GBOpt.BicrystalState import (
     BicrystalStateValueError,
     BicrystalTopology,
     BoundaryCondition,
+    GrainSelector,
     InterfaceDescriptor,
     RegionDescriptor,
     SurfaceDescriptor,
+    translate_grain,
 )
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import GBManipulator

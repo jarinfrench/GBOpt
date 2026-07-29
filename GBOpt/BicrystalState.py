@@ -15,6 +15,7 @@ import hashlib
 import io
 import json
 import math
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -26,6 +27,8 @@ import numpy as np
 LEFT_GRAIN_ID = 0
 RIGHT_GRAIN_ID = 1
 STATE_SCHEMA_VERSION = 1
+TRANSLATION_OPERATION_SCHEMA_VERSION = 1
+TRANSLATION_HISTORY_KEY = "rigid_translation_history"
 TRANSLATION_CONVENTION = (
     "relative_translation_lab is the cumulative displacement of the right grain "
     "relative to the left grain in lab-frame Angstroms; positive components move "
@@ -39,6 +42,7 @@ BicrystalTopology: TypeAlias = Literal[
 ]
 InterfaceLocation: TypeAlias = Literal["interior", "periodic_boundary"]
 RegionKind: TypeAlias = Literal["vacuum", "fixed", "buffer"]
+GrainSelector: TypeAlias = Literal["right", 1]
 
 _VALID_BOUNDARY_CONDITIONS = frozenset({"periodic", "fixed"})
 _VALID_TOPOLOGIES = frozenset({"periodic_bicrystal", "single_interface_slab"})
@@ -927,6 +931,220 @@ class BicrystalState:
         return state
 
 
+def _validated_translation_grain(state: BicrystalState, grain: object) -> int:
+    """Return the documented moving grain ID for a valid public selector."""
+    if isinstance(grain, str):
+        if grain != "right":
+            raise BicrystalStateValueError(
+                "grain must select the documented moving grain: 'right' "
+                f"(grain ID {RIGHT_GRAIN_ID}); got {grain!r}."
+            )
+        grain_id = RIGHT_GRAIN_ID
+    elif isinstance(grain, (bool, np.bool_)) or not isinstance(
+        grain, (int, np.integer)
+    ):
+        raise BicrystalStateTypeError(
+            "grain must be 'right' or the right-grain integer ID "
+            f"{RIGHT_GRAIN_ID}; got {grain!r}."
+        )
+    else:
+        grain_id = int(grain)
+        if grain_id != RIGHT_GRAIN_ID:
+            raise BicrystalStateValueError(
+                "grain must select the documented moving grain: 'right' "
+                f"(grain ID {RIGHT_GRAIN_ID}); got {grain_id}."
+            )
+    if state.moving_grain_id != grain_id:
+        raise BicrystalStateValueError(
+            "The requested grain does not match BicrystalState.moving_grain_id."
+        )
+    if not np.any(state.grain_ids == grain_id):
+        raise BicrystalStateValueError(
+            f"BicrystalState contains no atoms for selected grain ID {grain_id}."
+        )
+    return grain_id
+
+
+def _validated_displacement(displacement: object) -> tuple[float, float, float]:
+    """Return a finite, three-component lab-frame displacement."""
+    if isinstance(displacement, (str, bytes)):
+        raise BicrystalStateTypeError(
+            "displacement must be a three-component numeric sequence."
+        )
+    try:
+        raw = tuple(displacement)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise BicrystalStateTypeError(
+            "displacement must be a three-component numeric sequence."
+        ) from exc
+    if len(raw) != 3:
+        raise BicrystalStateValueError(
+            f"displacement must contain exactly three components; got {len(raw)}."
+        )
+    normalized: list[float] = []
+    for axis, value in enumerate(raw):
+        if isinstance(value, np.ndarray) and value.ndim != 0:
+            raise BicrystalStateTypeError(
+                f"displacement[{axis}] must be a scalar finite float; "
+                f"got an array with shape {value.shape}."
+            )
+        normalized.append(_finite_float(value, f"displacement[{axis}]"))
+    return tuple(normalized)  # type: ignore[return-value]
+
+
+def _canonical_periodic_component(value: float, length: float) -> float:
+    """Return the half-open ``[0, length)`` representative of a periodic shift."""
+    result = float(np.remainder(value, length))
+    return 0.0 if result == 0.0 else result
+
+
+def _translation_metadata(
+    state: BicrystalState,
+    *,
+    grain_id: int,
+    displacement_lab: tuple[float, float, float],
+    relative_translation_after: tuple[float, float, float],
+    periodic_axes: tuple[int, ...],
+) -> dict[str, Any]:
+    """Return thawed metadata with one deterministic rigid-translation record."""
+    metadata = _thaw_json(state.metadata)
+    # Defensive: state validation already enforces this invariant.
+    if not isinstance(metadata, dict):
+        raise BicrystalStateTypeError("BicrystalState.metadata must be a mapping.")
+    raw_history = metadata.get(TRANSLATION_HISTORY_KEY, [])
+    if not isinstance(raw_history, list) or any(
+        not isinstance(item, dict) for item in raw_history
+    ):
+        raise BicrystalStateValueError(
+            f"metadata[{TRANSLATION_HISTORY_KEY!r}] must be a sequence of mappings."
+        )
+    operation = {
+        "operation": "translate_grain",
+        "schema_version": TRANSLATION_OPERATION_SCHEMA_VERSION,
+        "grain": "right",
+        "grain_id": grain_id,
+        "coordinates": "lab",
+        "displacement_lab": list(displacement_lab),
+        "periodic_axes": list(periodic_axes),
+        "box_bounds_lab": state.box_dims.tolist(),
+        "relative_translation_before_lab": list(state.relative_translation_lab),
+        "relative_translation_after_lab": list(relative_translation_after),
+        "input_structure_hash": state.structure_hash,
+        "input_state_hash": state.state_hash,
+    }
+    metadata[TRANSLATION_HISTORY_KEY] = [*raw_history, operation]
+    return metadata
+
+
+def translate_grain(
+    state: BicrystalState,
+    *,
+    grain: GrainSelector = "right",
+    displacement: Sequence[float],
+    coordinates: Literal["lab"] = "lab",
+) -> BicrystalState:
+    """Return a new state after a reproducible rigid translation of the right grain.
+
+    ``displacement`` is interpreted in laboratory Cartesian coordinates. The state
+    contract defines the right grain as the moving grain, so ``grain`` is explicit but
+    intentionally accepts only ``"right"`` or grain ID ``1``. Coordinates are wrapped
+    with the state's actual lower/upper bounds only on axes declared ``"periodic"``;
+    fixed-axis coordinates are shifted without wrapping. The returned state records a
+    deterministic operation history and a cumulative right-relative-to-left
+    translation. Periodic displacement components are canonicalized to ``[0, L)`` so
+    translations differing by whole box vectors produce identical states and hashes.
+
+    :param state: Valid source state. It is never modified.
+    :param grain: Explicit selector for the documented moving right grain.
+    :param displacement: Three-component ``(dx, dy, dz)`` lab-frame displacement in
+        Angstroms.
+    :param coordinates: Coordinate frame; only ``"lab"`` is supported in Phase 5.
+    :return: A new validated :class:`BicrystalState`.
+    :raises BicrystalStateTypeError: If an argument has an invalid type.
+    :raises BicrystalStateValueError: If a selector, displacement, metadata history,
+        or resulting fixed-axis placement is invalid.
+    """
+    if not isinstance(state, BicrystalState):
+        raise BicrystalStateTypeError(
+            f"state must be a BicrystalState; got {type(state).__name__}."
+        )
+    if not isinstance(coordinates, str):
+        raise BicrystalStateTypeError(
+            f"coordinates must be 'lab'; got {coordinates!r}."
+        )
+    if coordinates != "lab":
+        raise BicrystalStateValueError(
+            f"coordinates must be 'lab'; got {coordinates!r}."
+        )
+    grain_id = _validated_translation_grain(state, grain)
+    requested = _validated_displacement(displacement)
+    lower = np.asarray(state.box_dims[:, 0], dtype=np.float64)
+    lengths = np.asarray(state.box_dims[:, 1] - lower, dtype=np.float64)
+    periodic_axes = tuple(
+        axis
+        for axis, condition in enumerate(state.boundary_conditions)
+        if condition == "periodic"
+    )
+    canonical = list(requested)
+    for axis in periodic_axes:
+        canonical[axis] = _canonical_periodic_component(
+            requested[axis], lengths[axis]
+        )
+    displacement_lab = tuple(canonical)  # type: ignore[assignment]
+
+    atoms = state.atoms.copy()
+    mask = state.grain_ids == grain_id
+    for axis, field in enumerate(_COORDINATE_FIELDS):
+        field_dtype = atoms.dtype.fields[field][0]
+        if not np.issubdtype(field_dtype, np.floating):
+            raise BicrystalStateTypeError(
+                f"atoms[{field!r}] must use a floating dtype for rigid translation; "
+                f"got {field_dtype}."
+            )
+        shift = displacement_lab[axis]
+        if shift == 0.0:
+            continue
+        values = np.asarray(atoms[field][mask], dtype=np.float64)
+        if axis in periodic_axes:
+            values = (
+                np.remainder(values - lower[axis] + shift, lengths[axis])
+                + lower[axis]
+            )
+        else:
+            values = values + shift
+        atoms[field][mask] = values
+
+    cumulative: list[float] = []
+    for axis in range(3):
+        if axis in periodic_axes:
+            current = _canonical_periodic_component(
+                state.relative_translation_lab[axis], lengths[axis]
+            )
+            cumulative.append(
+                _canonical_periodic_component(
+                    current + displacement_lab[axis], lengths[axis]
+                )
+            )
+        else:
+            cumulative.append(
+                float(state.relative_translation_lab[axis] + requested[axis])
+            )
+    relative_translation_after = tuple(cumulative)  # type: ignore[assignment]
+    metadata = _translation_metadata(
+        state,
+        grain_id=grain_id,
+        displacement_lab=displacement_lab,
+        relative_translation_after=relative_translation_after,
+        periodic_axes=periodic_axes,
+    )
+    return replace(
+        state,
+        atoms=atoms,
+        relative_translation_lab=relative_translation_after,
+        metadata=metadata,
+    )
+
+
 __all__ = [
     "LEFT_GRAIN_ID",
     "RIGHT_GRAIN_ID",
@@ -941,4 +1159,5 @@ __all__ = [
     "SurfaceDescriptor",
     "RegionDescriptor",
     "BicrystalState",
+    "translate_grain",
 ]
