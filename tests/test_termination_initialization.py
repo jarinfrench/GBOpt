@@ -42,6 +42,14 @@ SIGMA5_PQ = PQSpec(
 )
 
 
+# Phase 7 tests intentionally use one in-plane repeat to keep exact
+# reconstruction and termination enumeration small. GBMaker's warning
+# behavior for repeat factors below two is covered separately.
+pytestmark = pytest.mark.filterwarnings(
+    r"ignore:Recommended repeat factor is at least 2\.:UserWarning"
+)
+
+
 def _reconstruction(
     *,
     structure: str = "fcc",
