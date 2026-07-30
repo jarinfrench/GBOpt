@@ -259,3 +259,85 @@ def test_fixed_inplane_conditions_emit_side_surface_descriptors():
         "z_lower_surface",
         "z_upper_surface",
     }
+
+
+def test_slab_fixed_and_surface_buffer_regions_are_physical_state_descriptors():
+    gb = GBMaker.from_boundary_spec(
+        3.615,
+        "fcc",
+        "Cu",
+        IDENTITY_FIVE_DOF,
+        mode="approximate",
+        gb_thickness=0.0,
+        repeat_factor=2,
+        x_dim_min=8.0,
+        vacuum=3.0,
+        fixed_region_thickness=1.0,
+        surface_buffer_thickness=1.5,
+        interaction_distance=1.0,
+        topology="single_interface_slab",
+        boundary_conditions=("fixed", "periodic", "periodic"),
+    )
+    state = gb.bicrystal_state
+    surfaces = {surface.surface_id: surface for surface in state.external_surfaces}
+    fixed = {region.region_id: region for region in state.fixed_regions}
+    buffers = {region.region_id: region for region in state.buffer_regions}
+
+    assert set(fixed) == {"left_fixed", "right_fixed"}
+    assert set(buffers) == {"left_surface_buffer", "right_surface_buffer"}
+    assert fixed["left_fixed"].lower == surfaces["left_surface"].position
+    assert fixed["left_fixed"].upper == buffers["left_surface_buffer"].lower
+    assert buffers["right_surface_buffer"].upper == fixed["right_fixed"].lower
+    assert fixed["right_fixed"].upper == surfaces["right_surface"].position
+    assert fixed["left_fixed"].grain_ids == (0,)
+    assert fixed["right_fixed"].grain_ids == (1,)
+    assert state.metadata["fixed_region_thickness"] == 1.0
+    assert state.metadata["surface_buffer_thickness"] == 1.5
+
+
+@pytest.mark.parametrize(
+    ("topology", "vacuum", "fixed", "buffer", "match"),
+    [
+        pytest.param(
+            "periodic_bicrystal",
+            0.0,
+            1.0,
+            0.0,
+            "does not support slab fixed",
+            id="periodic-fixed-region",
+        ),
+        pytest.param(
+            "single_interface_slab",
+            3.0,
+            100.0,
+            1.0,
+            "exceeds the available solid thickness",
+            id="slab-region-too-wide",
+        ),
+    ],
+)
+def test_invalid_slab_region_construction_is_rejected(
+    topology, vacuum, fixed, buffer, match
+):
+    conditions = (
+        ("periodic", "periodic", "periodic")
+        if topology == "periodic_bicrystal"
+        else ("fixed", "periodic", "periodic")
+    )
+    with pytest.raises(GBMakerValueError, match=match):
+        GBMaker.from_boundary_spec(
+            3.615,
+            "fcc",
+            "Cu",
+            IDENTITY_FIVE_DOF,
+            mode="approximate",
+            gb_thickness=0.0,
+            repeat_factor=2,
+            x_dim_min=8.0,
+            vacuum=vacuum,
+            fixed_region_thickness=fixed,
+            surface_buffer_thickness=buffer,
+            interaction_distance=1.0,
+            topology=topology,
+            boundary_conditions=conditions,
+        )

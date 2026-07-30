@@ -15,6 +15,7 @@ setup(
         "pandas",
         "matplotlib",
         "spglib",
+        "tomli; python_version < '3.11'",
     ],
     extras_require={
         "test": ["pytest"]

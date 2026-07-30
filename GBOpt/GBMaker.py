@@ -413,6 +413,12 @@ class GBMaker:
         parameter, optional, defaults to ``50``.
     :param vacuum: Vacuum thickness around the grains in the x dimension (Angstroms).
         Keyword parameter, optional, defaults to ``10``.
+    :param fixed_region_thickness: Thickness of the fixed interval adjacent to each
+        external slab surface (Angstroms). Periodic bicrystals require zero. Keyword
+        parameter, optional, defaults to ``0.0``.
+    :param surface_buffer_thickness: Thickness of the movable buffer interval immediately
+        inward of each fixed slab interval (Angstroms). Periodic bicrystals require zero.
+        Keyword parameter, optional, defaults to ``0.0``.
     :param interaction_distance: Maximum atom interaction distance (Angstroms). Keyword
         parameter, optional, defaults to ``15.0``.
     :param gb_id: Grain-boundary identifier. Keyword parameter, optional, defaults to
@@ -465,7 +471,9 @@ class GBMaker:
                  _mismatch_max_cells: int = 50,
                  _strain_grain: str = "both",
                  repeat_factor: int | Sequence[int] = 2, x_dim_min: float = 50,
-                 vacuum: float = 10, interaction_distance: float = 15.0,
+                 vacuum: float = 10, fixed_region_thickness: float = 0.0,
+                 surface_buffer_thickness: float = 0.0,
+                 interaction_distance: float = 15.0,
                  gb_id: int = 1, epsilon: float = 1e-10,
                  topology: BicrystalTopology | None = None,
                  boundary_conditions: Sequence[BoundaryCondition] | None = None,
@@ -504,6 +512,18 @@ class GBMaker:
             x_dim_min, Number, "x_dim_min", positive=True)
         self.__vacuum_thickness = self.__validate(
             vacuum, Number, "vacuum_thickness", positive=True
+        )
+        self.__fixed_region_thickness = self.__validate(
+            fixed_region_thickness,
+            Number,
+            "fixed_region_thickness",
+            positive=True,
+        )
+        self.__surface_buffer_thickness = self.__validate(
+            surface_buffer_thickness,
+            Number,
+            "surface_buffer_thickness",
+            positive=True,
         )
         self.__interaction_distance = self.__validate(
             interaction_distance, Number, "interaction_distance", positive=True
@@ -559,6 +579,8 @@ class GBMaker:
         repeat_factor=2,
         x_dim_min: float = 50,
         vacuum: float = 10,
+        fixed_region_thickness: float = 0.0,
+        surface_buffer_thickness: float = 0.0,
         interaction_distance: float = 15.0,
         gb_id: int = 1,
         mismatch_tol=None,
@@ -589,6 +611,10 @@ class GBMaker:
         :param repeat_factor: In-plane repeat factor(s), default 2.
         :param x_dim_min: Minimum grain thickness in x (Angstroms), default 50.
         :param vacuum: Vacuum thickness (Angstroms), default 10.
+        :param fixed_region_thickness: Fixed interval adjacent to each external slab
+            surface (Angstroms), default 0.
+        :param surface_buffer_thickness: Buffer interval immediately inward of each
+            fixed slab interval (Angstroms), default 0.
         :param interaction_distance: Maximum atom interaction distance, default 15.
         :param gb_id: Grain boundary identifier, default 1.
         :param mismatch_tol: Maximum allowed relative mismatch for commensurate in-plane
@@ -631,6 +657,8 @@ class GBMaker:
             repeat_factor=repeat_factor,
             x_dim_min=x_dim_min,
             vacuum=vacuum,
+            fixed_region_thickness=fixed_region_thickness,
+            surface_buffer_thickness=surface_buffer_thickness,
             interaction_distance=interaction_distance,
             gb_id=gb_id,
             topology=topology,
@@ -654,6 +682,8 @@ class GBMaker:
         repeat_factor: int | Sequence[int] = 2,
         x_dim_min: float = 50,
         vacuum: float = 10,
+        fixed_region_thickness: float = 0.0,
+        surface_buffer_thickness: float = 0.0,
         interaction_distance: float = 15.0,
         gb_id: int = 1,
         mismatch_tol: float | None = None,
@@ -728,6 +758,12 @@ class GBMaker:
             argument, optional, defaults to ``50``.
         :param vacuum: Vacuum thickness around the bicrystal along x in Angstroms.
             Keyword argument, optional, defaults to ``10``.
+        :param fixed_region_thickness: Fixed interval adjacent to each external slab
+            surface in Angstroms. Periodic bicrystals require zero. Keyword argument,
+            optional, defaults to ``0.0``.
+        :param surface_buffer_thickness: Buffer interval immediately inward of each fixed
+            slab interval in Angstroms. Periodic bicrystals require zero. Keyword
+            argument, optional, defaults to ``0.0``.
         :param interaction_distance: Maximum atom interaction distance in Angstroms.
             In-plane dimensions are enlarged when necessary to satisfy twice this
             distance. Keyword argument, optional, defaults to ``15.0``.
@@ -883,6 +919,8 @@ class GBMaker:
             repeat_factor=repeat_factor,
             x_dim_min=x_dim_min,
             vacuum=vacuum,
+            fixed_region_thickness=fixed_region_thickness,
+            surface_buffer_thickness=surface_buffer_thickness,
             interaction_distance=interaction_distance,
             gb_id=gb_id,
             mismatch_tol=mismatch_tol,
@@ -1113,6 +1151,26 @@ class GBMaker:
             )
         return topology, source
 
+    def __validate_slab_region_settings(self) -> None:
+        """Validate physical fixed/buffer intervals against the constructed slab."""
+        fixed = float(self.__fixed_region_thickness)
+        buffer = float(self.__surface_buffer_thickness)
+        if self.__topology == "periodic_bicrystal":
+            if fixed != 0.0 or buffer != 0.0:
+                raise GBMakerValueError(
+                    "periodic_bicrystal does not support slab fixed or surface-buffer "
+                    "regions; both thicknesses must be zero."
+                )
+            return
+        available_left = float(self.__left_x)
+        available_right = float(self.__x_dim - self.__left_x)
+        required = fixed + buffer
+        if required > min(available_left, available_right) + float(self.__epsilon):
+            raise GBMakerValueError(
+                "fixed_region_thickness + surface_buffer_thickness exceeds the "
+                "available solid thickness of at least one slab grain."
+            )
+
     def __resolve_boundary_conditions(
         self,
     ) -> tuple[
@@ -1265,6 +1323,8 @@ class GBMaker:
             "x_dim_min": float(self.__x_dim_min),
             "gb_thickness": float(self.__gb_thickness),
             "vacuum_thickness": float(self.__vacuum_thickness),
+            "fixed_region_thickness": float(self.__fixed_region_thickness),
+            "surface_buffer_thickness": float(self.__surface_buffer_thickness),
             "interaction_distance": float(self.__interaction_distance),
             "epsilon": float(self.__epsilon),
             "mismatch_tol": self.__mismatch_tol,
@@ -1290,6 +1350,8 @@ class GBMaker:
         tuple[InterfaceDescriptor, ...],
         tuple[SurfaceDescriptor, ...],
         tuple[RegionDescriptor, ...],
+        tuple[RegionDescriptor, ...],
+        tuple[RegionDescriptor, ...],
     ]:
         """Return topology-specific interfaces, external surfaces, and vacuum.
 
@@ -1297,7 +1359,7 @@ class GBMaker:
         boundary-normal x axis, slab surfaces separate the solid domain from vacuum;
         fixed y/z faces are represented at their corresponding box bounds.
 
-        :return: Interface, external-surface, and vacuum-region descriptor tuples.
+        :return: Interface, external-surface, vacuum, fixed, and buffer descriptors.
         """
         xlo, xhi = (float(value) for value in self.__box_dims[0])
         central = InterfaceDescriptor(
@@ -1311,6 +1373,8 @@ class GBMaker:
         )
         surfaces: list[SurfaceDescriptor] = []
         vacuum: list[RegionDescriptor] = []
+        fixed: list[RegionDescriptor] = []
+        buffer: list[RegionDescriptor] = []
 
         if self.__topology == "periodic_bicrystal":
             periodic = InterfaceDescriptor(
@@ -1367,6 +1431,51 @@ class GBMaker:
                     )
                 )
 
+            fixed_width = float(self.__fixed_region_thickness)
+            buffer_width = float(self.__surface_buffer_thickness)
+            if fixed_width > 0.0:
+                fixed.extend(
+                    (
+                        RegionDescriptor(
+                            region_id="left_fixed",
+                            kind="fixed",
+                            axis=0,
+                            lower=left_surface_x,
+                            upper=left_surface_x + fixed_width,
+                            grain_ids=(LEFT_GRAIN_ID,),
+                        ),
+                        RegionDescriptor(
+                            region_id="right_fixed",
+                            kind="fixed",
+                            axis=0,
+                            lower=right_surface_x - fixed_width,
+                            upper=right_surface_x,
+                            grain_ids=(RIGHT_GRAIN_ID,),
+                        ),
+                    )
+                )
+            if buffer_width > 0.0:
+                buffer.extend(
+                    (
+                        RegionDescriptor(
+                            region_id="left_surface_buffer",
+                            kind="buffer",
+                            axis=0,
+                            lower=left_surface_x + fixed_width,
+                            upper=left_surface_x + fixed_width + buffer_width,
+                            grain_ids=(LEFT_GRAIN_ID,),
+                        ),
+                        RegionDescriptor(
+                            region_id="right_surface_buffer",
+                            kind="buffer",
+                            axis=0,
+                            lower=right_surface_x - fixed_width - buffer_width,
+                            upper=right_surface_x - fixed_width,
+                            grain_ids=(RIGHT_GRAIN_ID,),
+                        ),
+                    )
+                )
+
         axis_names = ("x", "y", "z")
         for axis in (1, 2):
             if self.__boundary_conditions[axis] != "fixed":
@@ -1396,7 +1505,13 @@ class GBMaker:
                 )
             )
 
-        return interfaces, tuple(surfaces), tuple(vacuum)
+        return (
+            interfaces,
+            tuple(surfaces),
+            tuple(vacuum),
+            tuple(fixed),
+            tuple(buffer),
+        )
 
     def __refresh_bicrystal_state(self) -> None:
         """Rebuild the immutable generation-time state from current construction data.
@@ -1407,7 +1522,7 @@ class GBMaker:
         """
         if not hasattr(self, "_GBMaker__whole_system"):
             return
-        interfaces, surfaces, vacuum = self.__state_descriptors()
+        interfaces, surfaces, vacuum, fixed, buffer = self.__state_descriptors()
         self.__bicrystal_state = BicrystalState(
             atoms=self.__whole_system,
             box_dims=self.__box_dims,
@@ -1418,8 +1533,8 @@ class GBMaker:
             interfaces=interfaces,
             external_surfaces=surfaces,
             vacuum_regions=vacuum,
-            fixed_regions=(),
-            buffer_regions=(),
+            fixed_regions=fixed,
+            buffer_regions=buffer,
             relative_translation_lab=self.__relative_translation_lab,
             termination_ids=self.__termination_ids,
             metadata=self.__construction_metadata(),
@@ -3707,6 +3822,7 @@ class GBMaker:
         for axis_name in ("y", "z"):
             self.__ensure_minimum_inplane_dim(axis_name, cutoff)
         self.__box_dims = self.__calculate_box_dimensions()
+        self.__validate_slab_region_settings()
 
         self.__generate_gb()
         self.__set_gb_region()

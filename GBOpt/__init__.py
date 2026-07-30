@@ -23,7 +23,6 @@ from GBOpt.BicrystalState import (
     translate_grain,
 )
 from GBOpt.GBMaker import GBMaker
-from GBOpt.GBManipulator import GBManipulator
 from GBOpt.Position import Position
 from GBOpt.UnitCell import UnitCell
 
@@ -32,6 +31,16 @@ French, J. C. and Bhave, C. V. (2026). GBOpt: Grain Boundary Structure Optimizat
 Using Monte Carlo and Evolutionary Algorithms. SoftwareX, 35, 102763.
 https://doi.org/10.1016/j.softx.2026.102763
 """
+from GBOpt.clean_generation import (
+    CLEAN_GENERATION_CONFIG_SCHEMA_VERSION,
+    CleanGenerationConfigError,
+    CleanGenerationSettings,
+    RationalPhase,
+    TerminationDomainSelection,
+    feasibility_override_from_mapping,
+    feasibility_policy_from_mapping,
+    translation_domain_from_mapping,
+)
 from GBOpt.geometry_audit import GeometryAuditError
 from GBOpt.geometry_validation import (
     BicrystalFeasibilityReport,
@@ -84,3 +93,13 @@ from GBOpt.termination_initialization import (
     TerminationSeedKind,
     generate_termination_seeds,
 )
+
+
+def __getattr__(name: str):
+    """Load optimization-only public classes without burdening clean generation."""
+    if name == "GBManipulator":
+        from GBOpt.GBManipulator import GBManipulator
+
+        globals()[name] = GBManipulator
+        return GBManipulator
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

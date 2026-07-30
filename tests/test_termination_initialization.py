@@ -15,6 +15,7 @@ from GBOpt.BoundarySpec import PQSpec
 from GBOpt.GBMaker import GBMaker, GBMakerValueError
 from GBOpt.geometry_validation import (
     ContactPolicy,
+    FeasibilityOverride,
     FeasibilityPolicy,
     SpeciesPairThresholds,
     VoidPolicy,
@@ -162,6 +163,30 @@ def test_default_phase_reconstructs_original_exact_geometry() -> None:
     np.testing.assert_array_equal(legacy.box_dims, phased.box_dims)
     assert legacy.bicrystal_state.structure_hash == phased.bicrystal_state.structure_hash
     assert phased.termination_ids == (0, 0)
+
+
+def test_reason_bearing_override_propagates_through_phase7_and_nested_phase6() -> None:
+    reconstruction = _reconstruction()
+    domain, _ = _domain_and_gb(reconstruction)
+    override = FeasibilityOverride("feasible", "approved exact seed exception")
+
+    result = generate_termination_seeds(
+        reconstruction=reconstruction,
+        feasibility_policy=_permissive_policy(hard=10.0),
+        feasibility_override=override,
+        termination_domain=TerminationDomain(
+            left=(domain.left[0],), right=(domain.right[0],)
+        ),
+        translation_domain=_translation_domain(),
+        max_seeds=1,
+    )
+
+    assert result.seeds[0].report.raw_status == "infeasible"
+    assert result.seeds[0].report.status == "feasible"
+    assert result.feasibility_override == override
+    assert result.to_dict()["feasibility_override"]["reason"] == (
+        "approved exact seed exception"
+    )
 
 
 def test_legacy_termination_ids_alone_remain_metadata_only() -> None:

@@ -26,6 +26,7 @@ from GBOpt.BicrystalState import (
 )
 from GBOpt.geometry_validation import (
     BicrystalFeasibilityReport,
+    FeasibilityOverride,
     FeasibilityPolicy,
     FeasibilityStatus,
     GeometryValidationError,
@@ -600,6 +601,7 @@ class TranslationSearchResult:
     invalid_reasons: tuple[str, ...] = ()
     phase7_handoff: str | None = None
     schema_version: int = INITIALIZATION_SCHEMA_VERSION
+    feasibility_override: FeasibilityOverride | None = None
 
     def __post_init__(self) -> None:
         attempts = tuple(self.attempts)
@@ -623,6 +625,12 @@ class TranslationSearchResult:
             )
         if not isinstance(self.retain_warnings, bool):
             raise InterfaceInitializationError("retain_warnings must be a bool.")
+        if self.feasibility_override is not None and not isinstance(
+            self.feasibility_override, FeasibilityOverride
+        ):
+            raise InterfaceInitializationError(
+                "feasibility_override must be a FeasibilityOverride or None."
+            )
         if not isinstance(self.seed_limit_reached, bool) or not isinstance(
             self.domain_exhausted, bool
         ):
@@ -764,6 +772,14 @@ class TranslationSearchResult:
             "translated_seed_count": self.translated_seed_count,
             "invalid_reasons": list(self.invalid_reasons),
             "phase7_handoff": self.phase7_handoff,
+            "feasibility_override": (
+                None
+                if self.feasibility_override is None
+                else {
+                    "status": self.feasibility_override.status,
+                    "reason": self.feasibility_override.reason,
+                }
+            ),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -786,6 +802,7 @@ class InterfaceInitializer:
     state: BicrystalState
     feasibility_policy: FeasibilityPolicy
     retain_warnings: bool = False
+    feasibility_override: FeasibilityOverride | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, BicrystalState):
@@ -798,6 +815,12 @@ class InterfaceInitializer:
             )
         if not isinstance(self.retain_warnings, bool):
             raise InterfaceInitializationError("retain_warnings must be a bool.")
+        if self.feasibility_override is not None and not isinstance(
+            self.feasibility_override, FeasibilityOverride
+        ):
+            raise InterfaceInitializationError(
+                "feasibility_override must be a FeasibilityOverride or None."
+            )
         _derived_axes(self.state)
 
     def generate_translation_seeds(
@@ -820,6 +843,7 @@ class InterfaceInitializer:
                 state=self.state,
                 retain_warnings=self.retain_warnings,
                 max_seeds=None,
+                feasibility_override=self.feasibility_override,
                 domain=(
                     translation_domain
                     if isinstance(translation_domain, CartesianTranslationDomain)
@@ -885,6 +909,7 @@ class InterfaceInitializer:
                 report = validate_bicrystal_state(
                     candidate_state,
                     policy=self.feasibility_policy,
+                    override=self.feasibility_override,
                 )
             except (GeometryValidationError, ValueError, TypeError) as exc:
                 # The Phase 4 public API normally converts measurement failures into
@@ -897,6 +922,7 @@ class InterfaceInitializer:
                         retain_warnings=self.retain_warnings,
                         max_seeds=limit,
                         domain=domain,
+                        feasibility_override=self.feasibility_override,
                     )
                 attempts.append(
                     TranslationAttempt(
@@ -932,6 +958,7 @@ class InterfaceInitializer:
                     seeds=(),
                     max_seeds=limit,
                     retain_warnings=self.retain_warnings,
+                    feasibility_override=self.feasibility_override,
                     source_structure_hash=source_structure_hash,
                     source_state_hash=source_state_hash,
                     translation_domain=domain,
@@ -1002,6 +1029,7 @@ class InterfaceInitializer:
                         seeds=tuple(seeds),
                         max_seeds=limit,
                         retain_warnings=self.retain_warnings,
+                        feasibility_override=self.feasibility_override,
                         source_structure_hash=source_structure_hash,
                         source_state_hash=source_state_hash,
                         translation_domain=domain,
@@ -1031,6 +1059,7 @@ class InterfaceInitializer:
             seeds=tuple(seeds),
             max_seeds=limit,
             retain_warnings=self.retain_warnings,
+            feasibility_override=self.feasibility_override,
             source_structure_hash=source_structure_hash,
             source_state_hash=source_state_hash,
             translation_domain=domain,
@@ -1060,6 +1089,7 @@ def _invalid_result(
     retain_warnings: bool,
     max_seeds: int | None,
     domain: CartesianTranslationDomain | None,
+    feasibility_override: FeasibilityOverride | None = None,
 ) -> TranslationSearchResult:
     return TranslationSearchResult(
         status="invalid_input",
@@ -1067,6 +1097,7 @@ def _invalid_result(
         seeds=(),
         max_seeds=max_seeds,
         retain_warnings=retain_warnings,
+        feasibility_override=feasibility_override,
         source_structure_hash=(None if state is None else state.structure_hash),
         source_state_hash=(None if state is None else state.state_hash),
         translation_domain=domain,
@@ -1083,6 +1114,7 @@ def generate_translation_seeds(
     translation_domain: object,
     max_seeds: object,
     retain_warnings: object = False,
+    feasibility_override: object = None,
 ) -> TranslationSearchResult:
     """Safe one-shot Phase 6 entry point returning ``invalid_input`` on bad input."""
     if not isinstance(retain_warnings, bool):
@@ -1097,11 +1129,26 @@ def generate_translation_seeds(
                 else None
             ),
         )
+    if feasibility_override is not None and not isinstance(
+        feasibility_override, FeasibilityOverride
+    ):
+        return _invalid_result(
+            "feasibility_override must be a FeasibilityOverride or None.",
+            state=state if isinstance(state, BicrystalState) else None,
+            retain_warnings=retain_warnings,
+            max_seeds=None,
+            domain=(
+                translation_domain
+                if isinstance(translation_domain, CartesianTranslationDomain)
+                else None
+            ),
+        )
     try:
         initializer = InterfaceInitializer(
             state=state,  # type: ignore[arg-type]
             feasibility_policy=feasibility_policy,  # type: ignore[arg-type]
             retain_warnings=retain_warnings,
+            feasibility_override=feasibility_override,
         )
     except InterfaceInitializationError as exc:
         return _invalid_result(
@@ -1112,6 +1159,11 @@ def generate_translation_seeds(
             domain=(
                 translation_domain
                 if isinstance(translation_domain, CartesianTranslationDomain)
+                else None
+            ),
+            feasibility_override=(
+                feasibility_override
+                if isinstance(feasibility_override, FeasibilityOverride)
                 else None
             ),
         )

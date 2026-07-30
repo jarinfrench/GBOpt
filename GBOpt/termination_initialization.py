@@ -31,6 +31,7 @@ from GBOpt.BoundarySpec import (
 from GBOpt.GBMaker import GBMaker
 from GBOpt.geometry_validation import (
     BicrystalFeasibilityReport,
+    FeasibilityOverride,
     FeasibilityPolicy,
     validate_bicrystal_state,
 )
@@ -265,6 +266,8 @@ class ExactBoundaryReconstruction:
     boundary_conditions: tuple[str, str, str] | None = None
     provenance: Mapping[str, object] | None = None
     schema_version: int = TERMINATION_INITIALIZATION_SCHEMA_VERSION
+    fixed_region_thickness: float = 0.0
+    surface_buffer_thickness: float = 0.0
 
     def __post_init__(self) -> None:
         a0 = _finite_float(self.a0, "a0")
@@ -304,6 +307,16 @@ class ExactBoundaryReconstruction:
         )
         x_dim_min = _finite_float(self.x_dim_min, "x_dim_min", nonnegative=True)
         vacuum = _finite_float(self.vacuum, "vacuum", nonnegative=True)
+        fixed_region_thickness = _finite_float(
+            self.fixed_region_thickness,
+            "fixed_region_thickness",
+            nonnegative=True,
+        )
+        surface_buffer_thickness = _finite_float(
+            self.surface_buffer_thickness,
+            "surface_buffer_thickness",
+            nonnegative=True,
+        )
         interaction = _finite_float(
             self.interaction_distance, "interaction_distance", nonnegative=True
         )
@@ -336,6 +349,8 @@ class ExactBoundaryReconstruction:
         object.__setattr__(self, "gb_thickness", gb_thickness)
         object.__setattr__(self, "x_dim_min", x_dim_min)
         object.__setattr__(self, "vacuum", vacuum)
+        object.__setattr__(self, "fixed_region_thickness", fixed_region_thickness)
+        object.__setattr__(self, "surface_buffer_thickness", surface_buffer_thickness)
         object.__setattr__(self, "interaction_distance", interaction)
         object.__setattr__(self, "mismatch_tol", mismatch_tol)
         object.__setattr__(self, "boundary_conditions", conditions)
@@ -359,6 +374,8 @@ class ExactBoundaryReconstruction:
             repeat_factor=self.repeat_factor,
             x_dim_min=self.x_dim_min,
             vacuum=self.vacuum,
+            fixed_region_thickness=self.fixed_region_thickness,
+            surface_buffer_thickness=self.surface_buffer_thickness,
             interaction_distance=self.interaction_distance,
             gb_id=self.gb_id,
             mismatch_tol=self.mismatch_tol,
@@ -384,6 +401,8 @@ class ExactBoundaryReconstruction:
             "repeat_factor": list(self.repeat_factor),
             "x_dim_min": self.x_dim_min,
             "vacuum": self.vacuum,
+            "fixed_region_thickness": self.fixed_region_thickness,
+            "surface_buffer_thickness": self.surface_buffer_thickness,
             "interaction_distance": self.interaction_distance,
             "gb_id": self.gb_id,
             "mismatch_tol": self.mismatch_tol,
@@ -765,6 +784,7 @@ class TerminationSearchResult:
     source_state_hash: str | None = None
     invalid_reasons: tuple[str, ...] = ()
     schema_version: int = TERMINATION_INITIALIZATION_SCHEMA_VERSION
+    feasibility_override: FeasibilityOverride | None = None
 
     def __post_init__(self) -> None:
         if self.status not in _VALID_STATUSES:
@@ -797,6 +817,12 @@ class TerminationSearchResult:
         ):
             raise TerminationInitializationError(
                 "exhaustion requires no seeds and a fully exhausted domain."
+            )
+        if self.feasibility_override is not None and not isinstance(
+            self.feasibility_override, FeasibilityOverride
+        ):
+            raise TerminationInitializationError(
+                "feasibility_override must be a FeasibilityOverride or None."
             )
         object.__setattr__(self, "attempts", attempts)
         object.__setattr__(self, "seeds", seeds)
@@ -839,6 +865,14 @@ class TerminationSearchResult:
             "source_structure_hash": self.source_structure_hash,
             "source_state_hash": self.source_state_hash,
             "invalid_reasons": list(self.invalid_reasons),
+            "feasibility_override": (
+                None
+                if self.feasibility_override is None
+                else {
+                    "status": self.feasibility_override.status,
+                    "reason": self.feasibility_override.reason,
+                }
+            ),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -863,6 +897,7 @@ class TerminationInitializer:
     termination_domain: TerminationDomain
     translation_domain: CartesianTranslationDomain
     retain_warnings: bool = False
+    feasibility_override: FeasibilityOverride | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reconstruction, ExactBoundaryReconstruction):
@@ -883,6 +918,12 @@ class TerminationInitializer:
             )
         if not isinstance(self.retain_warnings, bool):
             raise TerminationInitializationError("retain_warnings must be a bool.")
+        if self.feasibility_override is not None and not isinstance(
+            self.feasibility_override, FeasibilityOverride
+        ):
+            raise TerminationInitializationError(
+                "feasibility_override must be a FeasibilityOverride or None."
+            )
 
     def generate_seeds(self, *, max_seeds: object) -> TerminationSearchResult:
         limit = _positive_int(max_seeds, "max_seeds")
@@ -895,6 +936,7 @@ class TerminationInitializer:
                 termination_domain=self.termination_domain,
                 translation_domain=self.translation_domain,
                 retain_warnings=self.retain_warnings,
+                feasibility_override=self.feasibility_override,
             )
         if not source_gb.uses_exact_construction:
             return _invalid_result(
@@ -903,6 +945,7 @@ class TerminationInitializer:
                 termination_domain=self.termination_domain,
                 translation_domain=self.translation_domain,
                 retain_warnings=self.retain_warnings,
+                feasibility_override=self.feasibility_override,
             )
         source_state = source_gb.bicrystal_state
         if source_state.topology not in {"periodic_bicrystal", "single_interface_slab"}:
@@ -912,6 +955,7 @@ class TerminationInitializer:
                 termination_domain=self.termination_domain,
                 translation_domain=self.translation_domain,
                 retain_warnings=self.retain_warnings,
+                feasibility_override=self.feasibility_override,
             )
         available_left, available_right = source_gb.available_termination_descriptors
         unsupported = [
@@ -927,6 +971,7 @@ class TerminationInitializer:
                 termination_domain=self.termination_domain,
                 translation_domain=self.translation_domain,
                 retain_warnings=self.retain_warnings,
+                feasibility_override=self.feasibility_override,
             )
 
         expected_counts = (len(source_gb.left_grain), len(source_gb.right_grain))
@@ -970,7 +1015,9 @@ class TerminationInitializer:
             population = _population_check(gbmaker, expected_counts)
             try:
                 zero_report = validate_bicrystal_state(
-                    state, policy=self.feasibility_policy
+                    state,
+                    policy=self.feasibility_policy,
+                    override=self.feasibility_override,
                 )
             except Exception as exc:
                 attempts.append(
@@ -1062,6 +1109,7 @@ class TerminationInitializer:
                     translation_domain=self.translation_domain,
                     max_seeds=max(1, remaining),
                     retain_warnings=self.retain_warnings,
+                    feasibility_override=self.feasibility_override,
                 )
                 for translated in nested.seeds:
                     translated_hash = translated.state.structure_hash
@@ -1123,6 +1171,7 @@ class TerminationInitializer:
                     seeds=tuple(seeds[:limit]),
                     max_seeds=limit,
                     retain_warnings=self.retain_warnings,
+                    feasibility_override=self.feasibility_override,
                     seed_limit_reached=True,
                     domain_exhausted=False,
                     source_structure_hash=source_state.structure_hash,
@@ -1148,6 +1197,7 @@ class TerminationInitializer:
             seeds=tuple(seeds),
             max_seeds=limit,
             retain_warnings=self.retain_warnings,
+            feasibility_override=self.feasibility_override,
             seed_limit_reached=False,
             domain_exhausted=True,
             source_structure_hash=source_state.structure_hash,
@@ -1231,6 +1281,37 @@ def _population_check(
     )
 
 
+def check_decorated_population(
+    gbmaker: GBMaker,
+    expected_counts: tuple[int, int] | None = None,
+) -> DecoratedPopulationCheck:
+    """Return the exact rational-basis decorated-population audit for a construction.
+
+    ``expected_counts`` defaults to the current left/right populations, which is
+    appropriate for auditing the default exact construction. Phase 7 supplies the
+    default counts explicitly when comparing nondefault terminations.
+    """
+    if not isinstance(gbmaker, GBMaker):
+        raise TerminationInitializationError("gbmaker must be a GBMaker instance.")
+    if expected_counts is None:
+        expected_counts = (len(gbmaker.left_grain), len(gbmaker.right_grain))
+    if (
+        not isinstance(expected_counts, tuple)
+        or len(expected_counts) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 0
+            for value in expected_counts
+        )
+    ):
+        raise TerminationInitializationError(
+            "expected_counts must contain two nonnegative integers."
+        )
+    return _population_check(
+        gbmaker,
+        (int(expected_counts[0]), int(expected_counts[1])),
+    )
+
+
 def _invalid_result(
     reason: str,
     *,
@@ -1238,6 +1319,7 @@ def _invalid_result(
     termination_domain: TerminationDomain | None,
     translation_domain: CartesianTranslationDomain | None,
     retain_warnings: bool,
+    feasibility_override: FeasibilityOverride | None = None,
 ) -> TerminationSearchResult:
     return TerminationSearchResult(
         status="invalid_input",
@@ -1248,6 +1330,7 @@ def _invalid_result(
         seeds=(),
         max_seeds=None,
         retain_warnings=retain_warnings,
+        feasibility_override=feasibility_override,
         seed_limit_reached=False,
         domain_exhausted=False,
         invalid_reasons=(reason,),
@@ -1262,6 +1345,7 @@ def generate_termination_seeds(
     translation_domain: object,
     max_seeds: object,
     retain_warnings: object = False,
+    feasibility_override: object = None,
 ) -> TerminationSearchResult:
     """Safe one-shot Phase 7 entry point returning ``invalid_input`` on bad input."""
     if not isinstance(retain_warnings, bool):
@@ -1284,6 +1368,28 @@ def generate_termination_seeds(
             ),
             retain_warnings=False,
         )
+    if feasibility_override is not None and not isinstance(
+        feasibility_override, FeasibilityOverride
+    ):
+        return _invalid_result(
+            "feasibility_override must be a FeasibilityOverride or None.",
+            reconstruction=(
+                reconstruction
+                if isinstance(reconstruction, ExactBoundaryReconstruction)
+                else None
+            ),
+            termination_domain=(
+                termination_domain
+                if isinstance(termination_domain, TerminationDomain)
+                else None
+            ),
+            translation_domain=(
+                translation_domain
+                if isinstance(translation_domain, CartesianTranslationDomain)
+                else None
+            ),
+            retain_warnings=retain_warnings,
+        )
     try:
         initializer = TerminationInitializer(
             reconstruction=reconstruction,  # type: ignore[arg-type]
@@ -1291,6 +1397,7 @@ def generate_termination_seeds(
             termination_domain=termination_domain,  # type: ignore[arg-type]
             translation_domain=translation_domain,  # type: ignore[arg-type]
             retain_warnings=retain_warnings,
+            feasibility_override=feasibility_override,
         )
         return initializer.generate_seeds(max_seeds=max_seeds)
     except (TerminationInitializationError, TypeError, ValueError) as exc:
@@ -1312,6 +1419,11 @@ def generate_termination_seeds(
                 else None
             ),
             retain_warnings=retain_warnings,
+            feasibility_override=(
+                feasibility_override
+                if isinstance(feasibility_override, FeasibilityOverride)
+                else None
+            ),
         )
 
 
@@ -1329,5 +1441,6 @@ __all__ = [
     "TerminationSearchResult",
     "TerminationSeed",
     "TerminationSeedKind",
+    "check_decorated_population",
     "generate_termination_seeds",
 ]

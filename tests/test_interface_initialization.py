@@ -19,6 +19,7 @@ from GBOpt.BicrystalState import (
 )
 from GBOpt.geometry_validation import (
     ContactPolicy,
+    FeasibilityOverride,
     FeasibilityPolicy,
     SpeciesPairThresholds,
     validate_bicrystal_state,
@@ -152,6 +153,26 @@ def test_zero_translation_is_original_state_and_first_seed() -> None:
     assert result.seeds[0].candidate.kind == "zero"
     assert result.attempts[0].candidate.order == 0
     assert result.attempts[0].disposition == "retained"
+
+
+def test_reason_bearing_override_is_applied_and_hashed_in_phase6_result() -> None:
+    override = FeasibilityOverride("feasible", "approved synthetic contact exception")
+    result = InterfaceInitializer(
+        _periodic_state(),
+        _policy(hard=10.0),
+        feasibility_override=override,
+    ).generate_translation_seeds(
+        translation_domain=_domain(),
+        max_seeds=1,
+    )
+
+    assert result.seeds[0].report.raw_status == "infeasible"
+    assert result.seeds[0].report.status == "feasible"
+    assert result.feasibility_override == override
+    assert result.to_dict()["feasibility_override"] == {
+        "status": "feasible",
+        "reason": "approved synthetic contact exception",
+    }
 
 
 def test_source_state_is_immutable_through_full_enumeration() -> None:
