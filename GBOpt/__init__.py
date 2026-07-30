@@ -60,3 +60,27 @@ from GBOpt.interface_initialization import (
     TranslationSeed,
     generate_translation_seeds,
 )
+from GBOpt.termination import (
+    CutConvention,
+    GrainSide,
+    GrainTermination,
+    TerminationError,
+    TerminationPair,
+    enumerate_grain_terminations,
+)
+from GBOpt.termination_initialization import (
+    TERMINATION_INITIALIZATION_SCHEMA_VERSION,
+    DecoratedPopulationCheck,
+    ExactBoundaryReconstruction,
+    TerminationAttempt,
+    TerminationCandidate,
+    TerminationDisposition,
+    TerminationDomain,
+    TerminationInitializationError,
+    TerminationInitializationStatus,
+    TerminationInitializer,
+    TerminationSearchResult,
+    TerminationSeed,
+    TerminationSeedKind,
+    generate_termination_seeds,
+)

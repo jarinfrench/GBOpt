@@ -47,6 +47,13 @@ from GBOpt.gbmaker_supercell import (
     build_supercell_matrix,
     enumerate_supercell_sites,
 )
+from GBOpt.termination import (
+    GrainTermination,
+    TerminationError,
+    TerminationPair,
+    enumerate_grain_terminations,
+    shifted_crystal_coordinates,
+)
 from GBOpt.UnitCell import UnitCell
 
 _LEGACY_CONSTRUCTOR_DEPRECATION = (
@@ -453,6 +460,7 @@ class GBMaker:
                  _embedding=None,
                  _boundary_spec=None,
                  _construction_mode: str = "legacy",
+                 _termination_pair: TerminationPair | None = None,
                  _mismatch_tol=None,
                  _mismatch_max_cells: int = 50,
                  _strain_grain: str = "both",
@@ -505,6 +513,7 @@ class GBMaker:
         self.__embedding = _embedding
         self.__boundary_spec = _boundary_spec
         self.__construction_mode = str(_construction_mode)
+        self.__termination_pair = self.__validate_termination_pair(_termination_pair)
         self.__requested_topology = self.__validate_bicrystal_topology(topology)
         self.__requested_boundary_conditions = self.__validate_boundary_conditions(
             boundary_conditions
@@ -525,6 +534,7 @@ class GBMaker:
         self.__strain_accommodation: dict[str, _AxisStrainAccommodation] = {}
 
         self.__unit_cell = self.__init_unit_cell(atom_types)
+        self.__resolve_exact_termination_contract()
         self.__spacing = self.__calculate_periodic_spacing()  # periodic distances dict
         self.__topology, self.__topology_source = self.__resolve_bicrystal_topology()
         (
@@ -556,6 +566,7 @@ class GBMaker:
         strain_grain: str = "both",
         boundary_spec=None,
         construction_mode: str = "exact",
+        termination_pair: TerminationPair | None = None,
         topology: BicrystalTopology | None = None,
         boundary_conditions: Sequence[BoundaryCondition] | None = None,
         termination_ids: tuple[int, int] | None = (0, 0),
@@ -613,6 +624,7 @@ class GBMaker:
             _embedding=embedding,
             _boundary_spec=boundary_spec,
             _construction_mode=construction_mode,
+            _termination_pair=termination_pair,
             _mismatch_tol=mismatch_tol,
             _mismatch_max_cells=mismatch_max_cells,
             _strain_grain=strain_grain,
@@ -650,6 +662,7 @@ class GBMaker:
         topology: BicrystalTopology | None = None,
         boundary_conditions: Sequence[BoundaryCondition] | None = None,
         termination_ids: tuple[int, int] | None = (0, 0),
+        termination_pair: TerminationPair | None = None,
         provenance: Mapping[str, object] | None = None,
     ) -> GBMaker:
         """Build a grain boundary from a boundary-spec dataclass.
@@ -741,6 +754,11 @@ class GBMaker:
         :param termination_ids: Nonnegative left/right termination identifiers retained
             in the state, or ``None``. Keyword argument, optional, defaults to
             ``(0, 0)``.
+        :param termination_pair: Optional exact left/right crystallographic termination
+            pair. Each phase is applied during exact decorated-site enumeration. A
+            nonzero phase is rejected for non-exact construction. When supplied, the
+            retained ``termination_ids`` are resolved from the canonical finite phase
+            indices rather than treated as metadata-only identifiers.
         :param provenance: JSON-compatible source-row or campaign provenance retained in
             deterministic metadata. Keyword argument, optional, defaults to ``None``.
         :return: Fully initialized ``GBMaker`` instance carrying a generation-time
@@ -875,6 +893,7 @@ class GBMaker:
             topology=topology,
             boundary_conditions=boundary_conditions,
             termination_ids=termination_ids,
+            termination_pair=termination_pair,
             provenance=provenance,
         )
 
@@ -970,6 +989,80 @@ class GBMaker:
                 raise GBMakerValueError("termination_ids must be nonnegative.")
             normalized.append(integer)
         return normalized[0], normalized[1]
+
+    @staticmethod
+    def __validate_termination_pair(
+        value: TerminationPair | None,
+    ) -> TerminationPair | None:
+        """Return a validated optional exact crystallographic termination pair."""
+        if value is None:
+            return None
+        if not isinstance(value, TerminationPair):
+            raise GBMakerTypeError(
+                "termination_pair must be a TerminationPair or None."
+            )
+        return value
+
+    def __resolved_termination_options(
+        self,
+    ) -> tuple[tuple[GrainTermination, ...], tuple[GrainTermination, ...]]:
+        """Return finite exact left/right decorated-layer phase options."""
+        if (
+            self.__embedding is None
+            or not self.__embedding.exact
+            or not self.__embedding.coherent
+            or self.__embedding.P is None
+            or self.__embedding.Q is None
+        ):
+            raise GBMakerValueError(
+                "Crystallographic termination phases require an exact coherent "
+                "embedding with both P and Q matrices."
+            )
+        rational_basis = self.__unit_cell.rational_basis
+        if rational_basis is None:
+            raise GBMakerValueError(
+                "Crystallographic termination phases require an exact rational basis."
+            )
+        try:
+            left = enumerate_grain_terminations(
+                "left",
+                self.__embedding.P,
+                basis_numerators=rational_basis.numerators,
+                basis_denominator=rational_basis.denominator,
+            )
+            right = enumerate_grain_terminations(
+                "right",
+                self.__embedding.Q,
+                basis_numerators=rational_basis.numerators,
+                basis_denominator=rational_basis.denominator,
+            )
+        except (TerminationError, ValueError) as exc:
+            raise GBMakerValueError(str(exc)) from exc
+        return left, right
+
+    def __resolve_exact_termination_contract(self) -> None:
+        """Validate a requested exact phase pair and resolve canonical identifiers."""
+        self.__termination_options = None
+        if self.__termination_pair is None:
+            return
+        left_options, right_options = self.__resolved_termination_options()
+        self.__termination_options = (left_options, right_options)
+        try:
+            resolved_ids = (
+                left_options.index(self.__termination_pair.left),
+                right_options.index(self.__termination_pair.right),
+            )
+        except ValueError as exc:
+            raise GBMakerValueError(
+                "termination_pair contains a phase that is not a supported exact "
+                "decorated-layer cut for this boundary and rational basis."
+            ) from exc
+        if self.__termination_ids not in (None, (0, 0), resolved_ids):
+            raise GBMakerValueError(
+                "termination_ids conflict with the canonical indices resolved from "
+                "termination_pair."
+            )
+        self.__termination_ids = resolved_ids
 
     @staticmethod
     def __validate_provenance(
@@ -1180,6 +1273,16 @@ class GBMaker:
             "strain_accommodation": strain,
             "topology_source": self.__topology_source,
             "boundary_conditions_source": self.__boundary_conditions_source,
+            "termination_descriptors": (
+                None
+                if self.__termination_pair is None
+                else self.__termination_pair.to_dict()
+            ),
+            "termination_ids": (
+                None
+                if self.__termination_ids is None
+                else [int(value) for value in self.__termination_ids]
+            ),
             "provenance": deepcopy(self.__provenance),
         }
 
@@ -1753,11 +1856,25 @@ class GBMaker:
         atoms = np.empty(expected_site_count, dtype=unit_cell.dtype)
         atoms["name"] = unit_cell["name"][sites.basis_indices]
 
-        crystal_positions = np.asarray(
-            sites.crystal_numerators,
-            dtype=np.float64,
+        descriptor = (
+            GrainTermination(grain_side)
+            if self.__termination_pair is None
+            else (
+                self.__termination_pair.left
+                if grain_side == "left"
+                else self.__termination_pair.right
+            )
         )
-        crystal_positions *= self.__a0 / sites.denominator
+        crystal_numerators, coordinate_denominator = shifted_crystal_coordinates(
+            sites,
+            supercell,
+            descriptor.phase,
+            repeat_x=repeat_x,
+            repeat_y=repeat_y,
+            repeat_z=repeat_z,
+        )
+        crystal_positions = np.asarray(crystal_numerators, dtype=np.float64)
+        crystal_positions *= self.__a0 / coordinate_denominator
         rotated = crystal_positions @ np.asarray(R_grain, dtype=np.float64).T
 
         y_scale, z_scale = self.__grain_strain_scales(grain_side)
@@ -3864,6 +3981,7 @@ class GBMaker:
         atom_types = tuple(self.__unit_cell.names())
         self.__a0 = self.__validate(value, float, "a0", positive=True)
         self.__unit_cell = self.__init_unit_cell(atom_types)
+        self.__resolve_exact_termination_contract()
         self.update_spacing()
 
     @property
@@ -3929,6 +4047,9 @@ class GBMaker:
         self.__embedding = None
         self.__boundary_spec = None
         self.__construction_mode = "legacy"
+        self.__termination_pair = None
+        self.__termination_options = None
+        self.__termination_ids = (0, 0)
         self.update_spacing()
 
     @property
@@ -3958,6 +4079,7 @@ class GBMaker:
             atom_types = tuple(set(self.__unit_cell.names()))
 
         self.__unit_cell = self.__init_unit_cell(atom_types)
+        self.__resolve_exact_termination_contract()
 
     @property
     def vacuum_thickness(self) -> int:
@@ -4027,6 +4149,20 @@ class GBMaker:
     def termination_ids(self) -> tuple[int, int] | None:
         """Return the retained left/right interface termination identifiers."""
         return self.__termination_ids
+
+    @property
+    def termination_pair(self) -> TerminationPair | None:
+        """Return the exact crystallographic termination pair, when supplied."""
+        return self.__termination_pair
+
+    @property
+    def available_termination_descriptors(
+        self,
+    ) -> tuple[tuple[GrainTermination, ...], tuple[GrainTermination, ...]]:
+        """Return finite exact left/right decorated-layer termination options."""
+        if self.__termination_options is not None:
+            return self.__termination_options
+        return self.__resolved_termination_options()
 
     @property
     def inplane_periodic(self) -> tuple:
