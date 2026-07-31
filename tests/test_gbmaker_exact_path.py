@@ -2,6 +2,8 @@
 
 """Integration tests for GBMaker's exact integer grain-construction path."""
 
+import importlib
+
 import numpy as np
 import pytest
 from scipy.spatial import KDTree
@@ -10,6 +12,7 @@ from GBOpt.Atom import Atom
 from GBOpt.BoundarySpec import CSLExactSpec, PQSpec
 from GBOpt.crystallography import pq_spec_to_embedding
 from GBOpt.GBMaker import GBMaker
+from GBOpt.UnitCell import UnitCell
 from tests.data.zhang_2022_uo2_ceo2_gb_energies import BOUNDARIES
 
 # --------------------------------------------------------------------------------------
@@ -91,6 +94,46 @@ FLUORITE_EXACT_SPECS = [
     pytest.param(SIGMA5_TILT_EXACT_SPEC, id="csl-exact"),
 ]
 
+ZHANG_001_CASE = (
+    "zhang_001_ST_100",
+    [[0, 18, -1], [0, 1, 18], [1, 0, 0]],
+    [[0, 1, -18], [0, 18, 1], [1, 0, 0]],
+    19_500,
+    19_500,
+)
+ZHANG_031_CASE = (
+    "zhang_031_AT_100",
+    [[0, -5, 14], [1, 0, 0], [0, 14, 5]],
+    [[0, 10, 11], [1, 0, 0], [0, 11, -10]],
+    13_260,
+    13_260,
+)
+ZHANG_041_CASE = (
+    "zhang_041_TW_100",
+    [[0, 0, 1], [4, 1, 0], [-1, 4, 0]],
+    [[0, 0, 1], [4, -1, 0], [1, 4, 0]],
+    2_448,
+    2_448,
+)
+ZHANG_086_CASE = (
+    "zhang_086_AT_110",
+    [[-1, -1, 6], [1, -1, 0], [3, 3, 1]],
+    [[1, 1, 12], [1, -1, 0], [6, 6, -1]],
+    112_176,
+    220_752,
+)
+
+REPRESENTATIVE_CASES = [
+    pytest.param(*ZHANG_001_CASE, id="zhang-001-ST-100"),
+    pytest.param(*ZHANG_031_CASE, id="zhang-031-AT-100"),
+    pytest.param(*ZHANG_041_CASE, id="zhang-041-TW-100"),
+    pytest.param(
+        *ZHANG_086_CASE,
+        marks=pytest.mark.slow,
+        id="zhang-086-AT-110",
+    ),
+]
+
 
 # --------------------------------------------------------------------------------------
 # Fixtures and helpers
@@ -143,6 +186,51 @@ def _assert_fluorite_stoichiometry(atoms, *, label):
         f"{label} stoichiometry is {uranium_count} U to {oxygen_count} O; "
         "expected UO2"
     )
+
+
+def _assert_exact_fluorite_counts(atoms, expected_count, *, label):
+    """Assert complete fluorite population from its four-U/eight-O basis."""
+    assert len(atoms) == expected_count
+    assert expected_count % 12 == 0
+
+    conventional_cells = expected_count // 12
+    uranium_count = int(np.count_nonzero(atoms["name"] == "U"))
+    oxygen_count = int(np.count_nonzero(atoms["name"] == "O"))
+
+    assert uranium_count == 4 * conventional_cells, (
+        f"{label} contains {uranium_count} U atoms; expected "
+        f"{4 * conventional_cells}"
+    )
+    assert oxygen_count == 8 * conventional_cells, (
+        f"{label} contains {oxygen_count} O atoms; expected "
+        f"{8 * conventional_cells}"
+    )
+
+
+def _build_representative_boundary(P, Q):
+    """Build one representative case with the original campaign conventions."""
+    boundary = PQSpec(P=P, Q=Q, basis_mode="supplied")
+    common = {
+        "a0": 5.454,
+        "structure": "fluorite",
+        "atom_types": ("U", "O"),
+        "boundary": boundary,
+        "mode": "exact",
+        "repeat_factor": (1, 1),
+        "x_dim_min": 60.0,
+        "vacuum": 0.0,
+        "interaction_distance": 11.0,
+        "mismatch_tol": 0.005,
+        "mismatch_max_cells": 50,
+        "strain_grain": "both",
+    }
+
+    probe = GBMaker.from_boundary_spec(gb_thickness=5.454, **common)
+    gb_thickness = 2.0 * max(
+        float(probe.spacing["x"]["left"]),
+        float(probe.spacing["x"]["right"]),
+    )
+    return GBMaker.from_boundary_spec(gb_thickness=gb_thickness, **common)
 
 
 # --------------------------------------------------------------------------------------
@@ -208,22 +296,157 @@ def test_exact_embedding_uses_integer_rows_without_float_approximation(
 
 
 # --------------------------------------------------------------------------------------
-# Complete-origin construction
+# Exact decorated-site construction
 # --------------------------------------------------------------------------------------
 
 
-def test_exact_builder_returns_atom_dtype_and_complete_unit_cell_origins(build_gb):
-    gb = build_gb()
-    basis_size = len(gb.unit_cell.asarray())
+def test_exact_builder_returns_atom_dtype_and_complete_decorated_populations(
+    build_gb,
+    monkeypatch,
+):
+    gbmaker_module = importlib.import_module("GBOpt.GBMaker")
+    original_enumerator = gbmaker_module.enumerate_supercell_sites
+    enumerated_sites = []
 
+    def capture_sites(*args, **kwargs):
+        sites = original_enumerator(*args, **kwargs)
+        enumerated_sites.append(sites)
+        return sites
+
+    monkeypatch.setattr(
+        gbmaker_module,
+        "enumerate_supercell_sites",
+        capture_sites,
+    )
+
+    gb = build_gb(
+        a0=5.47,
+        structure="fluorite",
+        atom_types=("U", "O"),
+        vacuum=0.0,
+    )
+    rational_basis = gb.unit_cell.rational_basis
+
+    assert rational_basis is not None
     assert gb.whole_system.dtype == Atom.atom_dtype
     assert gb.whole_system.size == gb.left_grain.size + gb.right_grain.size
+    assert len(enumerated_sites) == 2
+
+    for label, grain, sites in zip(
+        ("left", "right"),
+        (gb.left_grain, gb.right_grain),
+        enumerated_sites,
+    ):
+        expected_per_basis = sites.supercell_index * np.prod(sites.repeats)
+        expected_count = len(rational_basis.names) * expected_per_basis
+        populations = np.bincount(
+            sites.basis_indices,
+            minlength=len(rational_basis.names),
+        )
+        decorated_keys = {
+            (tuple(row), int(basis_index))
+            for row, basis_index in zip(
+                sites.coordinate_numerators,
+                sites.basis_indices,
+            )
+        }
+        expected_names = np.asarray(rational_basis.names)[sites.basis_indices]
+
+        assert len(grain) == expected_count
+        assert np.all(populations == expected_per_basis)
+        assert len(decorated_keys) == sites.site_count
+        assert np.array_equal(grain["name"], expected_names), label
+
+
+def test_exact_builder_returns_complete_small_fcc_grains(build_gb):
+    gb = build_gb()
+    basis_size = len(gb.unit_cell.asarray())
 
     for label, grain in (("left", gb.left_grain), ("right", gb.right_grain)):
         assert grain.size > 0, f"{label} grain is empty"
         assert grain.size % basis_size == 0, (
             f"{label} grain contains {grain.size} atoms, which is not divisible by "
             f"the conventional-cell basis size {basis_size}"
+        )
+
+
+@pytest.mark.parametrize(
+    ("case_id", "P", "Q", "left_expected", "right_expected"),
+    REPRESENTATIVE_CASES,
+)
+def test_representative_exact_counts_and_species_are_complete(
+    case_id,
+    P,
+    Q,
+    left_expected,
+    right_expected,
+):
+    gb = _build_representative_boundary(P, Q)
+
+    _assert_exact_fluorite_counts(
+        gb.left_grain,
+        left_expected,
+        label=f"{case_id} left grain",
+    )
+    _assert_exact_fluorite_counts(
+        gb.right_grain,
+        right_expected,
+        label=f"{case_id} right grain",
+    )
+    _assert_exact_fluorite_counts(
+        gb.whole_system,
+        left_expected + right_expected,
+        label=f"{case_id} whole system",
+    )
+
+    assert len(gb.whole_system) == len(gb.left_grain) + len(gb.right_grain)
+    assert np.all(np.isfinite(_positions(gb.whole_system)))
+
+
+def test_high_index_exact_boundary_preserves_all_decorated_sites_near_x_boundary():
+    _, P, Q, left_expected, right_expected = ZHANG_001_CASE
+    gb = _build_representative_boundary(P, Q)
+
+    assert len(gb.left_grain) == left_expected
+    assert len(gb.right_grain) == right_expected
+    assert len(gb.whole_system) == left_expected + right_expected
+
+    tolerance = max(1e-8, 100.0 * gb.epsilon)
+    assert np.min(gb.left_grain["x"]) >= -tolerance
+    assert np.max(gb.left_grain["x"]) < gb.gb_plane_x + tolerance
+    assert np.min(gb.right_grain["x"]) >= gb.gb_plane_x - tolerance
+    assert np.max(gb.right_grain["x"]) < gb.x_dim + tolerance
+
+
+def test_exact_construction_is_deterministic_for_names_and_coordinate_order():
+    _, P, Q, _, _ = ZHANG_041_CASE
+    first = _build_representative_boundary(P, Q)
+    second = _build_representative_boundary(P, Q)
+
+    assert np.array_equal(first.whole_system["name"], second.whole_system["name"])
+    assert np.array_equal(first.whole_system, second.whole_system)
+
+
+def test_exact_construction_rejects_missing_rational_basis(monkeypatch):
+    monkeypatch.setattr(
+        UnitCell,
+        "rational_basis",
+        property(lambda _self: None),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"Exact grain generation requires UnitCell\.rational_basis",
+    ):
+        GBMaker.from_boundary_spec(
+            A0_FCC,
+            STRUCTURE_FCC,
+            ATOM_TYPES_FCC,
+            SIGMA5_TILT_PQ_SPEC,
+            mode="exact",
+            gb_thickness=0.0,
+            repeat_factor=2,
+            interaction_distance=A0_FCC,
         )
 
 
@@ -313,7 +536,7 @@ def test_vacuum_zero_exact_atoms_are_within_x_box(
 # --------------------------------------------------------------------------------------
 
 
-def test_vacuum_zero_periodic_gap_is_not_smaller_than_central_gap(build_gb):
+def test_vacuum_zero_exact_gap_metrics_are_diagnostic_only(build_gb):
     gb = build_gb(vacuum=0.0)
 
     central_gap = float(
@@ -324,10 +547,17 @@ def test_vacuum_zero_periodic_gap_is_not_smaller_than_central_gap(build_gb):
         + np.min(gb.left_grain["x"])
     )
 
-    assert periodic_gap >= central_gap - gb.epsilon, (
-        f"periodic gap {periodic_gap:.8f} is smaller than central gap "
-        f"{central_gap:.8f}"
-    )
+    assert np.isfinite(central_gap)
+    assert np.isfinite(periodic_gap)
+    assert central_gap >= -gb.epsilon
+    assert periodic_gap >= -gb.epsilon
+    assert periodic_gap < central_gap - gb.epsilon
+
+    # The exact path must retain both complete 4-site FCC populations instead of
+    # deleting a right-grain layer to reverse this diagnostic gap ordering.
+    assert len(gb.left_grain) == 1_200
+    assert len(gb.right_grain) == 1_200
+    assert len(gb.whole_system) == 2_400
 
 
 @pytest.mark.parametrize("spec", FLUORITE_EXACT_SPECS)
@@ -436,7 +666,10 @@ def test_zhang_sigma53_vacuum_zero_regression_preserves_box_gap_and_stoichiometr
         (gb.x_dim - np.max(gb.right_grain["x"]))
         + np.min(gb.left_grain["x"])
     )
-    assert periodic_gap >= central_gap - gb.epsilon
+    assert np.isfinite(central_gap)
+    assert np.isfinite(periodic_gap)
+    assert central_gap >= -gb.epsilon
+    assert periodic_gap >= -gb.epsilon
 
     _assert_fluorite_stoichiometry(gb.left_grain, label="left grain")
     _assert_fluorite_stoichiometry(gb.right_grain, label="right grain")
