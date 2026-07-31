@@ -2,11 +2,19 @@
 
 import math
 import unittest
+from collections import Counter
+from dataclasses import FrozenInstanceError
 
 import numpy as np
+import pytest
 
 from GBOpt.Atom import Atom
-from GBOpt.UnitCell import UnitCell, UnitCellTypeError, UnitCellValueError
+from GBOpt.UnitCell import (
+    RationalBasis,
+    UnitCell,
+    UnitCellTypeError,
+    UnitCellValueError,
+)
 
 
 class TestUnitCell(unittest.TestCase):
@@ -788,6 +796,258 @@ class TestUnitCell(unittest.TestCase):
         self.assertTrue(all(cell.types() == [1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2]))
         cell.type_map = {"F": 1, "Ca": 2}
         self.assertTrue(all(cell.types() == [2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1]))
+
+
+BUILTIN_RATIONAL_BASIS_CASES = [
+    pytest.param("sc", "H", 1, ("H",), [[0, 0, 0]], id="sc"),
+    pytest.param(
+        "bcc", "Fe", 2, ("Fe", "Fe"), [[0, 0, 0], [1, 1, 1]], id="bcc"
+    ),
+    pytest.param(
+        "fcc",
+        "Cu",
+        2,
+        ("Cu",) * 4,
+        [[0, 0, 0], [0, 1, 1], [1, 0, 1], [1, 1, 0]],
+        id="fcc",
+    ),
+    pytest.param(
+        "diamond",
+        "C",
+        4,
+        ("C",) * 8,
+        [
+            [0, 0, 0],
+            [0, 2, 2],
+            [2, 0, 2],
+            [2, 2, 0],
+            [1, 1, 1],
+            [3, 3, 1],
+            [3, 1, 3],
+            [1, 3, 3],
+        ],
+        id="diamond",
+    ),
+    pytest.param(
+        "fluorite",
+        ["U", "O"],
+        4,
+        ("U",) * 4 + ("O",) * 8,
+        [
+            [0, 0, 0],
+            [0, 2, 2],
+            [2, 0, 2],
+            [2, 2, 0],
+            [1, 1, 1],
+            [1, 1, 3],
+            [1, 3, 1],
+            [1, 3, 3],
+            [3, 1, 1],
+            [3, 1, 3],
+            [3, 3, 1],
+            [3, 3, 3],
+        ],
+        id="fluorite",
+    ),
+    pytest.param(
+        "rocksalt",
+        ["Na", "Cl"],
+        2,
+        ("Na",) * 4 + ("Cl",) * 4,
+        [
+            [0, 0, 0],
+            [0, 1, 1],
+            [1, 0, 1],
+            [1, 1, 0],
+            [0, 0, 1],
+            [0, 1, 0],
+            [1, 0, 0],
+            [1, 1, 1],
+        ],
+        id="rocksalt",
+    ),
+    pytest.param(
+        "zincblende",
+        ["Zn", "S"],
+        4,
+        ("Zn",) * 4 + ("S",) * 4,
+        [
+            [0, 0, 0],
+            [0, 2, 2],
+            [2, 0, 2],
+            [2, 2, 0],
+            [1, 1, 1],
+            [3, 3, 1],
+            [3, 1, 3],
+            [1, 3, 3],
+        ],
+        id="zincblende",
+    ),
+]
+
+
+INVALID_RATIONAL_BASES = [
+    pytest.param(
+        UnitCellTypeError,
+        {"names": ("A",), "numerators": [[0, 0, 0]], "denominator": 2.0},
+        id="noninteger-denominator",
+    ),
+    pytest.param(
+        UnitCellValueError,
+        {"names": ("A",), "numerators": [[0, 0, 0]], "denominator": -1},
+        id="nonpositive-denominator",
+    ),
+    pytest.param(
+        UnitCellValueError,
+        {"names": ("A",), "numerators": [0, 0, 0], "denominator": 2},
+        id="malformed-numerator-shape",
+    ),
+    pytest.param(
+        UnitCellValueError,
+        {
+            "names": ("A", "B"),
+            "numerators": [[0, 0, 0]],
+            "denominator": 2,
+        },
+        id="species-count-mismatch",
+    ),
+    pytest.param(
+        UnitCellValueError,
+        {"names": ("A",), "numerators": [[2, 0, 0]], "denominator": 2},
+        id="coordinate-outside-half-open-cell",
+    ),
+    pytest.param(
+        UnitCellValueError,
+        {
+            "names": ("A", "A"),
+            "numerators": [[0, 0, 0], [0, 0, 0]],
+            "denominator": 2,
+        },
+        id="duplicate-decorated-site",
+    ),
+    pytest.param(
+        UnitCellTypeError,
+        {"names": ("A",), "numerators": [[0.0, 0, 0]], "denominator": 2},
+        id="noninteger-numerator",
+    ),
+]
+
+
+class TestRationalBasis:
+
+    @pytest.mark.parametrize(
+        ("structure", "atoms", "denominator", "expected_names", "numerators"),
+        BUILTIN_RATIONAL_BASIS_CASES,
+    )
+    def test_builtin_structures_expose_exact_rational_basis(
+            self, structure, atoms, denominator, expected_names, numerators):
+        cell = UnitCell()
+        cell.init_by_structure(structure=structure, a0=5.454, atoms=atoms)
+
+        basis = cell.rational_basis
+
+        assert basis is not None
+        assert basis.denominator == denominator
+        assert basis.names == expected_names
+        np.testing.assert_array_equal(
+            basis.numerators,
+            np.array(numerators, dtype=object),
+        )
+
+        atom_array = cell.asarray()
+        cartesian = np.column_stack(
+            (atom_array["x"], atom_array["y"], atom_array["z"])
+        )
+        expected_fractional = np.asarray(numerators, dtype=float) / denominator
+        np.testing.assert_allclose(
+            cartesian / cell.a0,
+            expected_fractional,
+            rtol=0.0,
+            atol=1.0e-12,
+        )
+        assert tuple(atom_array["name"]) == expected_names
+
+    def test_fluorite_basis_is_complete_and_uniquely_decorated(self):
+        cell = UnitCell()
+        cell.init_by_structure("fluorite", 5.454, ["U", "O"])
+
+        basis = cell.rational_basis
+        decorated_rows = tuple(
+            (name, *row)
+            for name, row in zip(basis.names, basis.numerators.tolist())
+        )
+
+        assert len(decorated_rows) == 12
+        assert len(set(decorated_rows)) == 12
+        assert Counter(basis.names) == {"U": 4, "O": 8}
+
+    def test_fluorite_basis_is_canonical_and_deterministic(self):
+        cell = UnitCell()
+        cell.init_by_structure("fluorite", 5.454, ["U", "O"])
+
+        basis = cell.rational_basis
+        first_names = basis.names
+        first_numerators = basis.numerators
+        second_names = basis.names
+        second_numerators = basis.numerators
+
+        assert basis.denominator == 4
+        assert np.all(first_numerators >= 0)
+        assert np.all(first_numerators < basis.denominator)
+        assert first_names == second_names
+        np.testing.assert_array_equal(first_numerators, second_numerators)
+
+    def test_rational_basis_is_defensively_immutable(self):
+        names = ["A", "B"]
+        numerators = np.array([[0, 0, 0], [1, 1, 1]], dtype=object)
+        basis = RationalBasis(names=names, numerators=numerators, denominator=2)
+
+        names[0] = "changed"
+        numerators[0, 0] = 1
+
+        assert basis.names == ("A", "B")
+        np.testing.assert_array_equal(
+            basis.numerators,
+            np.array([[0, 0, 0], [1, 1, 1]], dtype=object),
+        )
+        returned = basis.numerators
+        assert not returned.flags.writeable
+        with pytest.raises(ValueError):
+            returned[0, 0] = 1
+        with pytest.raises(ValueError):
+            returned.setflags(write=True)
+        with pytest.raises(FrozenInstanceError):
+            basis.denominator = 4
+
+    def test_different_species_may_decorate_the_same_periodic_site(self):
+        basis = RationalBasis(
+            names=("A", "B"),
+            numerators=[[0, 0, 0], [0, 0, 0]],
+            denominator=1,
+        )
+
+        assert basis.names == ("A", "B")
+        assert basis.numerators.shape == (2, 3)
+
+    @pytest.mark.parametrize(("error", "kwargs"), INVALID_RATIONAL_BASES)
+    def test_rational_basis_rejects_invalid_data(self, error, kwargs):
+        with pytest.raises(error):
+            RationalBasis(**kwargs)
+
+    def test_custom_and_uninitialized_cells_do_not_guess_rational_metadata(self):
+        cell = UnitCell()
+        assert cell.rational_basis is None
+
+        cell.init_by_custom(
+            unit_cell=np.array([[0.0, 0.0, 0.0]]),
+            unit_cell_types=["H"],
+            a0=1.0,
+            conventional=np.eye(3),
+            reciprocal=np.eye(3),
+            ideal_bond_lengths={(1, 1): 1.0},
+        )
+
+        assert cell.rational_basis is None
 
 
 if __name__ == '__main__':
