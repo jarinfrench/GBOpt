@@ -34,8 +34,7 @@ from GBOpt.crystallography._limits import (
 from GBOpt.crystallography.types import CrystallographyError
 from GBOpt.gbmaker_supercell import (
     build_supercell_matrix,
-    enumerate_supercell_origins,
-    supercell_axis_numerators,
+    enumerate_supercell_sites,
 )
 from GBOpt.UnitCell import UnitCell
 
@@ -1127,38 +1126,103 @@ class GBMaker:
         x_length: float,
         x_offset: float,
         grain_side: str,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Build one grain using the integer membership kernel (exact path).
+    ) -> np.ndarray:
+        """Build one grain from exact decorated repeated-supercell sites.
 
-        Enumerates conventional-cell origins via pure-integer arithmetic, expands each
-        accepted origin to the full ``UnitCell.asarray()`` basis, rotates to the lab
-        frame, translates by ``x_offset``, wraps periodic y/z, and filters complete
-        origins into the x slab.
+        Enumerates every rational decorated basis site in the repeated integer
+        supercell before any floating-point conversion. Exact conventional
+        coordinates are reconstructed from ``SupercellSites`` and converted once to
+        Cartesian crystal positions. Existing rotation, in-plane strain, placement,
+        and periodic in-plane wrapping are then applied without Cartesian membership
+        clipping or complete-origin deletion.
 
         :param R_grain: Proper rotation matrix for this grain.
         :param P_or_Q: 3x3 canonical integer orientation matrix.
         :param x_length: Equalized x-slab thickness (Angstroms).
         :param x_offset: Lab x-coordinate of the grain's lower face (Angstroms).
-        :return: Tuple of (atoms, ux_labels) where atoms is the structured atom array
-            and ux_labels[i] is the integer x-layer index of atom i.
+        :param grain_side: Grain side, either ``"left"`` or ``"right"``.
+        :return: Structured atom array for the complete decorated grain.
+        :raises GBMakerValueError: If rational basis metadata is unavailable, exact
+            enumeration violates a population invariant, or final coordinates are
+            non-finite or outside the intended grain box.
         """
+        rational_basis = self.__unit_cell.rational_basis
+        if rational_basis is None:
+            raise GBMakerValueError(
+                "Exact grain generation requires UnitCell.rational_basis; "
+                "arbitrary floating-point basis coordinates are not accepted."
+            )
+
         repeat_x, repeat_y, repeat_z = self.__exact_grain_repeats(
             P_or_Q, x_length, grain_side
         )
-        S = build_supercell_matrix(P_or_Q)
-        origins = enumerate_supercell_origins(S, repeat_x, repeat_y, repeat_z)
+        supercell = build_supercell_matrix(P_or_Q)
+        try:
+            sites = enumerate_supercell_sites(
+                supercell,
+                repeat_x,
+                repeat_y,
+                repeat_z,
+                rational_basis=rational_basis,
+            )
+        except ValueError as exc:
+            raise GBMakerValueError(
+                f"Exact decorated-site enumeration failed for the {grain_side} "
+                f"grain: {exc}"
+            ) from exc
 
-        # Cartesian origins in the crystal frame: n @ (a0 * I) = a0 * n
-        cart_origins = origins.astype(np.float64) * self.__a0
-
-        atoms = self.get_supercell(cart_origins)
-        uc_size = len(self.__unit_cell.asarray())
-        origin_ids = np.repeat(
-            np.arange(len(origins), dtype=np.int64), uc_size
+        basis_size = len(rational_basis.names)
+        repetitions_per_basis = (
+            sites.supercell_index * repeat_x * repeat_y * repeat_z
         )
+        expected_site_count = basis_size * repetitions_per_basis
+        if sites.site_count != expected_site_count:
+            raise GBMakerValueError(
+                "Exact decorated-site enumeration returned an unexpected atom "
+                f"count for the {grain_side} grain: expected "
+                f"{expected_site_count}, got {sites.site_count}."
+            )
 
-        positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
-        rotated = positions @ R_grain.T
+        basis_indices = sites.basis_indices
+        basis_populations = np.bincount(basis_indices, minlength=basis_size)
+        if (
+            len(basis_populations) != basis_size
+            or np.any(basis_populations != repetitions_per_basis)
+        ):
+            raise GBMakerValueError(
+                "Exact decorated-site enumeration did not populate every rational "
+                f"basis row equally for the {grain_side} grain: expected "
+                f"{repetitions_per_basis} each, got "
+                f"{basis_populations.tolist()}."
+            )
+
+        structured_basis = self.__unit_cell.asarray()
+        if len(structured_basis) != basis_size:
+            raise GBMakerValueError(
+                "UnitCell rational-basis and structured-basis sizes disagree: "
+                f"{basis_size} exact sites versus {len(structured_basis)} atoms."
+            )
+
+        atoms = np.empty(expected_site_count, dtype=structured_basis.dtype)
+        exact_names = np.asarray(
+            rational_basis.names,
+            dtype=structured_basis["name"].dtype,
+        )
+        atoms["name"] = exact_names[basis_indices]
+
+        # This is the sole exact-to-floating conversion in grain construction.
+        # SupercellSites stores canonical repeated-supercell coordinates; multiplying
+        # by S reconstructs exact conventional-cell coordinate numerators.
+        conventional_numerators = (
+            sites.coordinate_numerators @ sites.supercell_matrix
+        )
+        crystal_positions = np.asarray(
+            conventional_numerators,
+            dtype=np.float64,
+        )
+        crystal_positions *= self.__a0 / sites.coordinate_denominator
+
+        rotated = crystal_positions @ np.asarray(R_grain, dtype=np.float64).T
 
         y_scale, z_scale = self.__grain_strain_scales(grain_side)
         strain_scales = np.array([1.0, y_scale, z_scale], dtype=np.float64)
@@ -1196,32 +1260,55 @@ class GBMaker:
             box_coordinates,
             selection_basis,
         )
+        if not np.all(np.isfinite(rotated)):
+            raise GBMakerValueError(
+                "Exact decorated-site conversion produced non-finite Cartesian "
+                f"coordinates for the {grain_side} grain."
+            )
         atoms["x"], atoms["y"], atoms["z"] = rotated.T
 
-        x_upper = float(x_offset + x_length)
-        inside_x = (
-            (atoms["x"] >= float(x_offset) - self.__epsilon)
-            & (atoms["x"] < x_upper - self.__epsilon)
+        lower_x = float(x_offset)
+        upper_x = lower_x + float(x_length)
+        outside_x = (
+            (atoms["x"] < lower_x - self.__epsilon)
+            | (atoms["x"] >= upper_x + self.__epsilon)
         )
-        atoms, origin_ids = self.__filter_complete_origins(
-            atoms, origin_ids, inside_x, uc_size
-        )
-        if len(atoms) == 0:
+        if np.any(outside_x):
+            offending = atoms["x"][outside_x]
             raise GBMakerValueError(
-                "Exact builder x-bound filtering removed all complete unit-cell "
-                f"origins for the {grain_side} grain."
-            )
-        if len(atoms) % uc_size != 0:
-            raise GBMakerValueError(
-                "Exact builder x-bound filtering produced incomplete unit-cell "
-                f"origins: {len(atoms)} atoms is not divisible by {uc_size}."
+                "Exact decorated-site conversion produced atoms outside the "
+                f"{grain_side} half-open x slab [{lower_x:.8f}, "
+                f"{upper_x:.8f}): min={float(np.min(offending)):.8f}, "
+                f"max={float(np.max(offending)):.8f}."
             )
 
-        # Expand fine exact x-coordinate labels from origins to atoms for layer
-        # trimming.
-        n0_by_origin = supercell_axis_numerators(S, origins, axis=0)
-        n0_labels = n0_by_origin[origin_ids]
-        return atoms, n0_labels
+        for axis_name, dimension, is_periodic in zip(
+            ("y", "z"),
+            (self.__y_dim, self.__z_dim),
+            self.__inplane_periodic,
+        ):
+            if not is_periodic:
+                continue
+            coordinates = atoms[axis_name]
+            near_lower = (coordinates < 0.0) & (
+                coordinates >= -self.__epsilon
+            )
+            near_upper = (coordinates >= dimension) & (
+                coordinates < dimension + self.__epsilon
+            )
+            coordinates[near_lower | near_upper] = 0.0
+
+            outside = (coordinates < 0.0) | (coordinates >= dimension)
+            if np.any(outside):
+                offending = coordinates[outside]
+                raise GBMakerValueError(
+                    "Exact decorated-site conversion produced atoms outside the "
+                    f"periodic {axis_name} box [0, {dimension:.8f}): "
+                    f"min={float(np.min(offending)):.8f}, "
+                    f"max={float(np.max(offending)):.8f}."
+                )
+
+        return atoms
 
     def __grain_x_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """Return initial lab-frame x bounds for the left and right grains.
@@ -1271,12 +1358,13 @@ class GBMaker:
         self,
         left_bounds: np.ndarray,
         right_bounds: np.ndarray,
-    ) -> np.ndarray:
-        """Generate both grains using the exact integer membership path.
+    ) -> None:
+        """Generate both grains using exact decorated-site enumeration.
 
         :param left_bounds: Length-2 x-bound array for the left grain.
         :param right_bounds: Length-2 x-bound array for the right grain.
-        :return: Right-grain x-layer labels parallel to ``self.__right_grain``.
+        :return: ``None``. Updates ``self.__left_grain`` and
+            ``self.__right_grain``.
         :raises GBMakerValueError: If the exact embedding is missing P or Q.
         """
         if (
@@ -1288,22 +1376,20 @@ class GBMaker:
                 "Exact grain generation requires an embedding with both P and Q."
             )
 
-        self.__left_grain, _ = self.__generate_grain_exact(
+        self.__left_grain = self.__generate_grain_exact(
             self.__R_left,
             self.__embedding.P,
             self.__left_x,
             left_bounds[0],
             "left",
         )
-        self.__right_grain, right_x_layer_labels = self.__generate_grain_exact(
+        self.__right_grain = self.__generate_grain_exact(
             self.__R_right,
             self.__embedding.Q,
             self.__right_x,
             right_bounds[0],
             "right",
         )
-
-        return right_x_layer_labels
 
     def __generate_float_grains(
         self,
@@ -1394,71 +1480,6 @@ class GBMaker:
         ) + (left_min_x - left_bounds[0])
 
         return central_gap, periodic_gap, left_min_x, right_max_x
-
-    def __equalize_exact_periodic_gap(
-        self,
-        *,
-        central_gap: float,
-        left_min_x: float,
-        left_bounds: np.ndarray,
-        right_effective_bounds: np.ndarray,
-        right_x_layer_labels: np.ndarray | None,
-    ) -> None:
-        """Equalize the periodic gap by removing whole exact x layers.
-
-        :param central_gap: Current central GB gap (Angstroms).
-        :param left_min_x: Minimum left-grain x coordinate (Angstroms).
-        :param left_bounds: Effective left-grain x bounds.
-        :param right_effective_bounds: Effective right-grain x bounds.
-        :param right_x_layer_labels: Integer x-layer labels parallel to the right-grain
-            atom array.
-        :return: ``None``. May update ``self.__right_grain``.
-        :raises GBMakerValueError: If ``right_x_layer_labels`` is ``None``.
-        """
-        if right_x_layer_labels is None:
-            raise GBMakerValueError(
-                "Exact gap equalization requires right-grain x-layer labels."
-            )
-
-        x_layer_labels = right_x_layer_labels.copy()
-        removed_layers = 0
-        unique_layers = np.sort(np.unique(x_layer_labels))
-
-        while len(unique_layers) > 1:
-            top_layer = unique_layers[-1]
-            keep_mask = x_layer_labels != top_layer
-
-            trial_grain = self.__right_grain[keep_mask]
-            trial_labels = x_layer_labels[keep_mask]
-            new_right_max_x = float(np.max(trial_grain["x"]))
-            new_periodic_gap = (
-                right_effective_bounds[1] - new_right_max_x
-            ) + (left_min_x - left_bounds[0])
-
-            self.__right_grain = trial_grain
-            x_layer_labels = trial_labels
-            removed_layers += 1
-            unique_layers = unique_layers[:-1]
-
-            within_box = new_right_max_x <= right_effective_bounds[1] + self.__epsilon
-            gap_ok = new_periodic_gap >= central_gap - self.__epsilon
-            if within_box and gap_ok:
-                break
-
-        final_max_x = float(np.max(self.__right_grain["x"]))
-        final_periodic_gap = (
-            right_effective_bounds[1] - final_max_x
-        ) + (left_min_x - left_bounds[0])
-
-        if final_periodic_gap < central_gap - self.__epsilon:
-            warnings.warn(
-                f"Exact gap equalization: after removing {removed_layers} "
-                f"x-layer(s), periodic_gap ({final_periodic_gap:.4f} A) < "
-                f"central_gap ({central_gap:.4f} A). Stoichiometry preserved; "
-                "residual gap mismatch reported.",
-                UserWarning,
-                stacklevel=3,
-            )
 
     def __equalize_float_periodic_gap(
         self,
@@ -1551,23 +1572,28 @@ class GBMaker:
         left_bounds: np.ndarray,
         right_effective_bounds: np.ndarray,
         use_exact: bool,
-        right_x_layer_labels: np.ndarray | None,
         right_float_result: _FloatGrainBuildResult | None,
         vacuum0_trim_applied: bool,
         x_period_right: float | None,
     ) -> None:
-        """Equalize the periodic x-boundary gap with the central GB gap if needed.
+        """Handle a periodic x-gap mismatch for the selected construction path.
+
+        The floating path retains its existing complete-origin trimming behavior.
+        The exact decorated-site path returns without deleting atomic layers because
+        projected central/periodic gap ordering is not a completeness invariant.
 
         :param left_bounds: Effective left-grain x bounds.
         :param right_effective_bounds: Effective right-grain x bounds.
-        :param use_exact: Whether the exact integer grain-generation path was used.
-        :param right_x_layer_labels: Right-grain x-layer labels for the exact path.
+        :param use_exact: Whether the exact decorated-site path was used.
         :param right_float_result: Right-grain build metadata for the float path.
         :param vacuum0_trim_applied: Whether the vacuum-zero pre-trim was applied.
         :param x_period_right: Right-grain x period for the float path.
         :return: ``None``. May update ``self.__right_grain``.
-        :raises GBMakerValueError: If required exact or float metadata is missing.
+        :raises GBMakerValueError: If required float metadata is missing.
         """
+        if use_exact:
+            return
+
         (
             central_gap,
             periodic_gap,
@@ -1576,16 +1602,6 @@ class GBMaker:
         ) = self.__current_gap_metrics(left_bounds, right_effective_bounds)
 
         if periodic_gap >= central_gap - self.__epsilon:
-            return
-
-        if use_exact:
-            self.__equalize_exact_periodic_gap(
-                central_gap=central_gap,
-                left_min_x=left_min_x,
-                left_bounds=left_bounds,
-                right_effective_bounds=right_effective_bounds,
-                right_x_layer_labels=right_x_layer_labels,
-            )
             return
 
         if self.__vacuum_thickness == 0 and vacuum0_trim_applied:
@@ -1612,31 +1628,26 @@ class GBMaker:
 
         Builds each grain using the exact integer path when a coherent exact
         boundary embedding with integer P/Q matrices is available; otherwise uses
-        the floating-point grain-generation path. After grain construction, the
-        method equalizes the central GB gap and periodic x-boundary gap where
-        possible while preserving complete conventional-cell origin groups.
+        the floating-point grain-generation path. Periodic x-gap equalization remains
+        available only to the floating path. Exact decorated grains retain every
+        enumerated site and are assembled without x-layer deletion.
 
         :return: ``None``. Updates ``self.__left_grain``, ``self.__right_grain``,
             and ``self.__whole_system``.
         :raises GBMakerValueError: If exact grain generation requires missing P/Q
-            data, if exact gap equalization requires missing x-layer labels, if
-            float-path gap equalization lacks right-grain build metadata, or if a
-            downstream grain-generation helper fails.
+            data, if float-path gap equalization lacks right-grain build metadata,
+            or if a downstream grain-generation helper fails.
         """
         left_bounds, right_bounds = self.__grain_x_bounds()
         right_effective_bounds = right_bounds.copy()
 
         use_exact = self.__use_exact_grain_generation()
-        right_x_layer_labels: np.ndarray | None = None
         right_float_result: _FloatGrainBuildResult | None = None
         vacuum0_trim_applied = False
         x_period_right: float | None = None
 
         if use_exact:
-            right_x_layer_labels = self.__generate_exact_grains(
-                left_bounds,
-                right_bounds,
-            )
+            self.__generate_exact_grains(left_bounds, right_bounds)
         else:
             (
                 right_float_result,
@@ -1649,7 +1660,6 @@ class GBMaker:
             left_bounds=left_bounds,
             right_effective_bounds=right_effective_bounds,
             use_exact=use_exact,
-            right_x_layer_labels=right_x_layer_labels,
             right_float_result=right_float_result,
             vacuum0_trim_applied=vacuum0_trim_applied,
             x_period_right=x_period_right,
