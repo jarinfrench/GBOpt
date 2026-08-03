@@ -10,11 +10,14 @@ from dataclasses import dataclass
 from numbers import Integral, Real
 from pathlib import Path
 import re
-from typing import Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import numpy as np
 
 from GBOpt.Atom import Atom
+
+if TYPE_CHECKING:
+    from GBOpt.GBManipulator import GBManipulator
 
 LEFT_GRAIN_LABEL = 0
 RIGHT_GRAIN_LABEL = 1
@@ -206,16 +209,28 @@ class GrainOwnership:
 
 @dataclass(frozen=True, slots=True, init=False)
 class LammpsAtomData:
-    """Parsed atom IDs, species/coordinates, and orthogonal box bounds."""
+    """Parsed atom IDs, species/coordinates, box bounds, and optional BC flags."""
 
     _atom_ids: np.ndarray
     _atoms: np.ndarray
     _box_dims: np.ndarray
+    boundary_periodic: tuple[bool, bool, bool] | None
+    selected_frame: int | None
 
-    def __init__(self, atom_ids: np.ndarray, atoms: np.ndarray, box_dims: np.ndarray) -> None:
+    def __init__(
+        self,
+        atom_ids: np.ndarray,
+        atoms: np.ndarray,
+        box_dims: np.ndarray,
+        *,
+        boundary_periodic: tuple[bool, bool, bool] | None = None,
+        selected_frame: int | None = None,
+    ) -> None:
         object.__setattr__(self, "_atom_ids", _readonly_copy(atom_ids, dtype=np.int64))
         object.__setattr__(self, "_atoms", _readonly_copy(atoms, dtype=Atom.atom_dtype))
         object.__setattr__(self, "_box_dims", _readonly_copy(box_dims, dtype=float))
+        object.__setattr__(self, "boundary_periodic", boundary_periodic)
+        object.__setattr__(self, "selected_frame", selected_frame)
 
     @property
     def atom_ids(self) -> np.ndarray:
@@ -382,3 +397,357 @@ def read_lammps_data_file(
     if len(np.unique(atoms["name"])) > n_types:
         raise LammpsDataError("atom rows contain more species than declared atom types")
     return LammpsAtomData(atom_ids, atoms, box_dims)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class CandidateFileMapping:
+    """One candidate's transient serialization map and expected topology.
+
+    IDs are always freshly assigned in deterministic row order (1..N). They are
+    valid only for the candidate/evaluator-return round trip represented here.
+    Persistent grain identity remains in ``labels``.
+    """
+
+    _atom_ids: np.ndarray
+    _labels: np.ndarray
+    _species: np.ndarray
+    _box_dims: np.ndarray
+    gb_plane_x: float
+    inplane_periodic: tuple[bool, bool]
+    _right_grain_x_bounds: np.ndarray
+    coordinate_tolerance: float
+    periodic_outer_x_interface: bool
+
+    def __init__(
+        self,
+        *,
+        atom_ids: np.ndarray,
+        labels: np.ndarray,
+        species: np.ndarray,
+        box_dims: np.ndarray,
+        gb_plane_x: float,
+        inplane_periodic: tuple[bool, bool],
+        right_grain_x_bounds: np.ndarray | tuple[float, float],
+        coordinate_tolerance: float,
+        periodic_outer_x_interface: bool,
+    ) -> None:
+        ownership = GrainOwnership(
+            atom_ids=atom_ids,
+            labels=labels,
+            gb_plane_x=gb_plane_x,
+            inplane_periodic=inplane_periodic,
+            right_grain_x_bounds=right_grain_x_bounds,
+            coordinate_tolerance=coordinate_tolerance,
+            periodic_outer_x_interface=periodic_outer_x_interface,
+        )
+        raw_species = np.asarray(species)
+        if raw_species.ndim != 1 or raw_species.size != ownership.atom_ids.size:
+            raise GrainOwnershipError(
+                "candidate species length must equal candidate atom ID count"
+            )
+        normalized_species = np.asarray([str(value) for value in raw_species.tolist()], dtype="U8")
+        if np.any(normalized_species == ""):
+            raise GrainOwnershipError("candidate species names must be nonempty")
+        bounds = np.asarray(box_dims, dtype=float)
+        if bounds.shape != (3, 2) or not np.all(np.isfinite(bounds)):
+            raise GrainOwnershipError("candidate box_dims must have shape (3, 2) and be finite")
+        if np.any(bounds[:, 0] >= bounds[:, 1]):
+            raise GrainOwnershipError("candidate box bounds must be strictly ordered")
+        tolerance = ownership.coordinate_tolerance
+        if not bounds[0, 0] < ownership.gb_plane_x < bounds[0, 1]:
+            raise GrainOwnershipError("candidate gb_plane_x must lie inside the x box")
+        grain_bounds = ownership.right_grain_x_bounds
+        if (
+            grain_bounds[0] < bounds[0, 0] - tolerance
+            or grain_bounds[1] > bounds[0, 1] + tolerance
+        ):
+            raise GrainOwnershipError(
+                "candidate right-grain x bounds must lie inside the candidate box"
+            )
+        object.__setattr__(self, "_atom_ids", ownership.atom_ids)
+        object.__setattr__(self, "_labels", ownership.labels)
+        object.__setattr__(self, "_species", _readonly_copy(normalized_species))
+        object.__setattr__(self, "_box_dims", _readonly_copy(bounds, dtype=float))
+        object.__setattr__(self, "gb_plane_x", ownership.gb_plane_x)
+        object.__setattr__(self, "inplane_periodic", ownership.inplane_periodic)
+        object.__setattr__(self, "_right_grain_x_bounds", ownership.right_grain_x_bounds)
+        object.__setattr__(self, "coordinate_tolerance", tolerance)
+        object.__setattr__(
+            self, "periodic_outer_x_interface", ownership.periodic_outer_x_interface
+        )
+
+    @classmethod
+    def from_candidate(
+        cls,
+        atoms: np.ndarray,
+        labels: np.ndarray,
+        *,
+        box_dims: np.ndarray,
+        gb_plane_x: float,
+        inplane_periodic: tuple[bool, bool],
+        right_grain_x_bounds: np.ndarray | tuple[float, float],
+        coordinate_tolerance: float,
+        periodic_outer_x_interface: bool,
+    ) -> "CandidateFileMapping":
+        structured = np.asarray(atoms)
+        if structured.ndim != 1 or structured.dtype.names is None or "name" not in structured.dtype.names:
+            raise GrainOwnershipError("candidate atoms must be a one-dimensional structured atom array")
+        candidate_labels = np.asarray(labels)
+        if candidate_labels.ndim != 1 or candidate_labels.size != structured.size:
+            raise GrainOwnershipError("ownership length must equal candidate atom count")
+        # GBMaker.write_lammps emits this exact fresh deterministic ID sequence.
+        atom_ids = np.arange(1, structured.size + 1, dtype=np.int64)
+        return cls(
+            atom_ids=atom_ids,
+            labels=candidate_labels,
+            species=np.asarray(structured["name"], dtype="U8"),
+            box_dims=box_dims,
+            gb_plane_x=gb_plane_x,
+            inplane_periodic=inplane_periodic,
+            right_grain_x_bounds=right_grain_x_bounds,
+            coordinate_tolerance=coordinate_tolerance,
+            periodic_outer_x_interface=periodic_outer_x_interface,
+        )
+
+    @property
+    def atom_ids(self) -> np.ndarray:
+        return _readonly_copy(self._atom_ids)
+
+    @property
+    def labels(self) -> np.ndarray:
+        return _readonly_copy(self._labels)
+
+    @property
+    def species(self) -> np.ndarray:
+        return _readonly_copy(self._species)
+
+    @property
+    def box_dims(self) -> np.ndarray:
+        return _readonly_copy(self._box_dims)
+
+    @property
+    def right_grain_x_bounds(self) -> np.ndarray:
+        return _readonly_copy(self._right_grain_x_bounds)
+
+    @property
+    def expected_count(self) -> int:
+        return int(self._atom_ids.size)
+
+    def ownership_for_file_ids(self, file_ids: np.ndarray) -> GrainOwnership:
+        base = GrainOwnership(
+            atom_ids=self._atom_ids,
+            labels=self._labels,
+            gb_plane_x=self.gb_plane_x,
+            inplane_periodic=self.inplane_periodic,
+            right_grain_x_bounds=self._right_grain_x_bounds,
+            coordinate_tolerance=self.coordinate_tolerance,
+            periodic_outer_x_interface=self.periodic_outer_x_interface,
+        )
+        return base.aligned_to(file_ids)
+
+
+def _dump_boundary_flags(tokens: list[str]) -> tuple[bool, bool, bool] | None:
+    if len(tokens) < 3:
+        return None
+    flags = tokens[-3:]
+    if not all(len(flag) == 2 and set(flag).issubset(set("pfsm")) for flag in flags):
+        return None
+    return tuple(flag == "pp" for flag in flags)
+
+
+def read_lammps_dump_file(
+    path: str | Path, *, type_dict: Mapping[object, object] | None = None
+) -> LammpsAtomData:
+    """Read exactly the first LAMMPS dump frame, matching the legacy loader.
+
+    Multi-frame dumps are never concatenated. Validation applies only to frame zero;
+    a malformed first frame is an error even if a later frame is valid.
+    """
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise FileNotFoundError(str(file_path))
+    lines = file_path.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0].strip() != "ITEM: TIMESTEP":
+        raise LammpsDataError("LAMMPS dump must begin with ITEM: TIMESTEP")
+    try:
+        int(lines[1].strip())
+    except (IndexError, ValueError) as exc:
+        raise LammpsDataError("selected dump frame has an invalid timestep") from exc
+    index = 2
+    if index >= len(lines) or lines[index].strip() != "ITEM: NUMBER OF ATOMS":
+        raise LammpsDataError("selected dump frame is missing NUMBER OF ATOMS")
+    try:
+        n_atoms = int(lines[index + 1].strip())
+    except (IndexError, ValueError) as exc:
+        raise LammpsDataError("selected dump frame has an invalid atom count") from exc
+    if n_atoms < 0:
+        raise LammpsDataError("selected dump frame atom count must be nonnegative")
+    index += 2
+    if index >= len(lines) or not lines[index].startswith("ITEM: BOX BOUNDS"):
+        raise LammpsDataError("selected dump frame is missing BOX BOUNDS")
+    boundary_periodic = _dump_boundary_flags(lines[index].split()[3:])
+    bounds_rows: list[tuple[float, float]] = []
+    for offset in range(1, 4):
+        try:
+            parts = lines[index + offset].split()
+            if len(parts) != 2:
+                raise ValueError
+            lower, upper = float(parts[0]), float(parts[1])
+        except (IndexError, ValueError) as exc:
+            raise LammpsDataError(
+                "explicit ownership supports orthogonal two-column dump bounds only"
+            ) from exc
+        bounds_rows.append((lower, upper))
+    box_dims = np.asarray(bounds_rows, dtype=float)
+    if not np.all(np.isfinite(box_dims)) or np.any(box_dims[:, 0] >= box_dims[:, 1]):
+        raise LammpsDataError("selected dump frame box bounds are invalid")
+    index += 4
+    if index >= len(lines) or not lines[index].startswith("ITEM: ATOMS"):
+        raise LammpsDataError("selected dump frame is missing ATOMS")
+    attributes = lines[index].split()[2:]
+    for required in ("id", "x", "y", "z"):
+        if required not in attributes:
+            raise LammpsDataError(f"selected dump frame is missing atom attribute {required!r}")
+    if "typelabel" in attributes:
+        species_attr = "typelabel"
+    elif "type" in attributes:
+        species_attr = "type"
+    else:
+        raise LammpsDataError("selected dump frame requires type or typelabel")
+    attr_index = {name: attributes.index(name) for name in ("id", species_attr, "x", "y", "z")}
+    id_to_name = _normalize_type_mapping(type_dict)
+    inverse_default = {number: name for name, number in Atom._numbers.items()}
+    ids: list[int] = []
+    rows: list[tuple[str, float, float, float]] = []
+    index += 1
+    for row_index in range(n_atoms):
+        if index + row_index >= len(lines) or lines[index + row_index].startswith("ITEM:"):
+            raise LammpsDataError(
+                f"selected dump frame expected {n_atoms} atom rows, found {row_index}"
+            )
+        parts = lines[index + row_index].split()
+        if len(parts) < len(attributes):
+            raise LammpsDataError("selected dump frame contains a short atom row")
+        atom_id = _strict_id_token(parts[attr_index["id"]])
+        species_token = parts[attr_index[species_attr]]
+        if species_attr == "typelabel":
+            species = species_token
+        else:
+            if not _INTEGER_TOKEN.fullmatch(species_token):
+                raise LammpsDataError("dump type values must be integral")
+            type_id = int(species_token)
+            if type_id <= 0:
+                raise LammpsDataError("dump type IDs must be positive")
+            if id_to_name:
+                if type_id not in id_to_name:
+                    raise LammpsDataError(f"type id {type_id} not found in type mapping")
+                species = id_to_name[type_id]
+            elif type_id in inverse_default:
+                species = inverse_default[type_id]
+            else:
+                raise LammpsDataError(f"unknown atom type id {type_id}")
+        try:
+            xyz = tuple(float(parts[attr_index[axis]]) for axis in ("x", "y", "z"))
+        except ValueError as exc:
+            raise LammpsDataError("dump coordinates must be numeric") from exc
+        if not np.all(np.isfinite(xyz)):
+            raise LammpsDataError("dump coordinates must be finite")
+        ids.append(atom_id)
+        rows.append((species, *xyz))
+    next_index = index + n_atoms
+    while next_index < len(lines) and not lines[next_index].strip():
+        next_index += 1
+    if (
+        next_index < len(lines)
+        and lines[next_index].strip() != "ITEM: TIMESTEP"
+    ):
+        raise LammpsDataError(
+            "selected dump frame contains unexpected content after its atom rows"
+        )
+    atom_ids = np.asarray(ids, dtype=np.int64)
+    if np.unique(atom_ids).size != atom_ids.size:
+        raise LammpsDataError("atom IDs must be unique")
+    return LammpsAtomData(
+        atom_ids,
+        np.asarray(rows, dtype=Atom.atom_dtype),
+        box_dims,
+        boundary_periodic=boundary_periodic,
+        selected_frame=0,
+    )
+
+
+def read_lammps_structure_file(
+    path: str | Path, *, type_dict: Mapping[object, object] | None = None
+) -> LammpsAtomData:
+    """Read a supported data file or the first frame of a LAMMPS dump."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise FileNotFoundError(str(file_path))
+    with file_path.open(encoding="utf-8") as stream:
+        first = stream.readline().strip()
+    if first == "ITEM: TIMESTEP":
+        return read_lammps_dump_file(file_path, type_dict=type_dict)
+    return read_lammps_data_file(file_path, type_dict=type_dict)
+
+
+def reload_explicit_manipulator(
+    returned_structure: str | Path,
+    *,
+    candidate_mapping: CandidateFileMapping,
+    unit_cell: Any,
+    gb_thickness: float,
+    type_dict: Mapping[object, object] | None = None,
+) -> "GBManipulator":
+    """Validate and reconstruct one evaluator-returned explicit-ownership candidate.
+
+    This is the authoritative reload path for explicit-ownership GA execution.
+    """
+    snapshot = read_lammps_structure_file(returned_structure, type_dict=type_dict)
+    file_ids = snapshot.atom_ids
+    if snapshot.atoms.size != candidate_mapping.expected_count:
+        raise GrainOwnershipError(
+            "evaluator output atom count does not match the candidate"
+        )
+    expected_ids = candidate_mapping.atom_ids
+    if not np.array_equal(np.sort(file_ids), expected_ids):
+        raise GrainOwnershipError("evaluator output atom IDs do not match the candidate")
+    order = np.argsort(file_ids, kind="stable")
+    expected_species = candidate_mapping.species
+    actual_species = np.asarray(snapshot.atoms["name"], dtype="U8")[order]
+    if not np.array_equal(actual_species, expected_species):
+        raise GrainOwnershipError(
+            "evaluator output changed species/type for one or more atom IDs"
+        )
+    tolerance = candidate_mapping.coordinate_tolerance
+    if not np.allclose(
+        snapshot.box_dims, candidate_mapping.box_dims, atol=tolerance, rtol=0.0
+    ):
+        raise GrainOwnershipError(
+            "evaluator output changed box bounds; variable-cell relaxation is unsupported"
+        )
+    if snapshot.selected_frame is not None and snapshot.boundary_periodic is None:
+        raise GrainOwnershipError(
+            "evaluator dump does not encode unambiguous boundary topology"
+        )
+    if snapshot.boundary_periodic is not None:
+        expected_periodic = (
+            candidate_mapping.periodic_outer_x_interface,
+            *candidate_mapping.inplane_periodic,
+        )
+        if snapshot.boundary_periodic != expected_periodic:
+            raise GrainOwnershipError("evaluator output changed boundary topology")
+    ownership = candidate_mapping.ownership_for_file_ids(file_ids)
+    # Local import avoids a module cycle with GBManipulator -> FileGrainOwnership.
+    from GBOpt.GBManipulator import GBManipulator
+
+    manipulator = GBManipulator(
+        str(returned_structure),
+        unit_cell=unit_cell,
+        gb_thickness=gb_thickness,
+        type_dict=type_dict,
+        grain_ownership=ownership,
+    )
+    parent = manipulator.parents[0]
+    if parent.grain_labels is None or len(parent.grain_labels) != candidate_mapping.expected_count:
+        raise GrainOwnershipError("reloaded ownership length does not match atom count")
+    return manipulator

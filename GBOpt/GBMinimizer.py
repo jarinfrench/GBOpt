@@ -4,6 +4,7 @@ import math
 import shutil
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from time import time
 from typing import Any, Optional
@@ -11,7 +12,28 @@ from typing import Any, Optional
 import numpy as np
 
 from GBOpt import GBMaker, GBManipulator
-from GBOpt.FileGrainOwnership import GrainOwnership
+from GBOpt.FileGrainOwnership import (
+    CandidateFileMapping,
+    GrainOwnership,
+    GrainOwnershipError,
+    reload_explicit_manipulator,
+)
+
+
+PENALTY = 1.0e30
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateEvaluation:
+    """Aligned result for one GA candidate evaluation."""
+
+    input_index: int
+    energy: float
+    structure_path: str | None
+    mapping: CandidateFileMapping | None
+    manipulator: GBManipulator | None
+    success: bool
+    failure_reason: str | None = None
 
 
 class Mutator:
@@ -267,6 +289,10 @@ class GeneticAlgorithmMinimizer:
         return manip
 
     def _make_manipulator_from_file(self, filename: str) -> GBManipulator:
+        if self.initial_ownership is not None:
+            raise RuntimeError(
+                "explicit-ownership file reloads must use reload_explicit_manipulator"
+            )
         manipulator = GBManipulator(
             filename,
             unit_cell=self.GB.unit_cell,
@@ -274,6 +300,252 @@ class GeneticAlgorithmMinimizer:
         )
         manipulator.rng = self.local_random
         return manipulator
+
+    def _candidate_file_mapping(
+        self, manipulator: GBManipulator, atoms: np.ndarray
+    ) -> CandidateFileMapping:
+        labels = manipulator.candidate_grain_labels
+        if labels is None:
+            raise GrainOwnershipError(
+                "explicit-ownership mutation did not propagate grain labels"
+            )
+        parent = manipulator.parents[0]
+        return CandidateFileMapping.from_candidate(
+            atoms,
+            labels,
+            box_dims=parent.box_dims,
+            gb_plane_x=parent.gb_plane_x,
+            inplane_periodic=parent.inplane_periodic,
+            right_grain_x_bounds=parent.right_grain_x_bounds,
+            coordinate_tolerance=parent.coordinate_tolerance,
+            periodic_outer_x_interface=parent.periodic_outer_x_interface,
+        )
+
+    def _reload_owned_mapping(
+        self, structure_path: str, mapping: CandidateFileMapping
+    ) -> GBManipulator:
+        manipulator = reload_explicit_manipulator(
+            structure_path,
+            candidate_mapping=mapping,
+            unit_cell=self.GB.unit_cell,
+            gb_thickness=self.GB.gb_thickness,
+            type_dict=self.GB.unit_cell.type_map,
+        )
+        manipulator.rng = self.local_random
+        return manipulator
+
+    def _failed_evaluation(
+        self, input_index: int, reason: str, mapping: CandidateFileMapping | None = None
+    ) -> CandidateEvaluation:
+        return CandidateEvaluation(
+            input_index=input_index,
+            energy=PENALTY,
+            structure_path=None,
+            mapping=mapping,
+            manipulator=None,
+            success=False,
+            failure_reason=reason,
+        )
+
+    def _record_owned_result(
+        self,
+        *,
+        input_index: int,
+        mapping: CandidateFileMapping,
+        energy: object,
+        structure_path: object,
+    ) -> CandidateEvaluation:
+        try:
+            numeric_energy = float(energy)
+        except (TypeError, ValueError) as exc:
+            return self._failed_evaluation(input_index, f"invalid energy: {exc}", mapping)
+        if not np.isfinite(numeric_energy):
+            return self._failed_evaluation(input_index, "energy must be finite", mapping)
+        if not isinstance(structure_path, (str, Path)) or not self._is_valid_file(str(structure_path)):
+            return self._failed_evaluation(
+                input_index, "evaluator did not return a valid structure path", mapping
+            )
+        path = str(structure_path)
+        try:
+            manipulator = self._reload_owned_mapping(path, mapping)
+        except Exception as exc:
+            return self._failed_evaluation(input_index, str(exc), mapping)
+        return CandidateEvaluation(
+            input_index=input_index,
+            energy=numeric_energy,
+            structure_path=path,
+            mapping=mapping,
+            manipulator=manipulator,
+            success=True,
+        )
+
+    def _evaluate_owned_candidate(
+        self,
+        manipulator: GBManipulator,
+        atoms: np.ndarray,
+        unique_id: str,
+        input_index: int,
+    ) -> CandidateEvaluation:
+        try:
+            mapping = self._candidate_file_mapping(manipulator, atoms)
+        except Exception as exc:
+            return self._failed_evaluation(input_index, str(exc))
+        try:
+            energy, structure_path = self.gb_energy_func(
+                self.GB, manipulator, atoms, unique_id
+            )
+        except Exception as exc:
+            return self._failed_evaluation(input_index, str(exc), mapping)
+        return self._record_owned_result(
+            input_index=input_index,
+            mapping=mapping,
+            energy=energy,
+            structure_path=structure_path,
+        )
+
+    def _evaluate_owned_generation(
+        self,
+        population_manipulators: list[GBManipulator],
+        population_structures: list[np.ndarray],
+        population_lineages: list[list[str]],
+        gen: int,
+        unique_id: int | uuid.UUID,
+    ) -> list[CandidateEvaluation]:
+        population_length = len(population_structures)
+        if not (
+            len(population_manipulators)
+            == len(population_lineages)
+            == population_length
+        ):
+            raise ValueError(
+                "explicit-ownership population manipulators, structures, and "
+                "lineages must remain index-aligned"
+            )
+        unique_ids = [
+            f"GA_{unique_id}_g{gen}_c{i}" for i in range(population_length)
+        ]
+        if self.gb_batch_energy_func is None:
+            return [
+                self._evaluate_owned_candidate(manipulator, atoms, candidate_id, index)
+                for index, (manipulator, atoms, candidate_id) in enumerate(
+                    zip(population_manipulators, population_structures, unique_ids)
+                )
+            ]
+
+        records: list[CandidateEvaluation | None] = [None] * population_length
+        valid_indices: list[int] = []
+        valid_mappings: list[CandidateFileMapping] = []
+        for index, (manipulator, atoms) in enumerate(
+            zip(population_manipulators, population_structures)
+        ):
+            try:
+                mapping = self._candidate_file_mapping(manipulator, atoms)
+            except Exception as exc:
+                records[index] = self._failed_evaluation(index, str(exc))
+                continue
+            valid_indices.append(index)
+            valid_mappings.append(mapping)
+        if not valid_indices:
+            return [record for record in records if record is not None]
+
+        try:
+            raw_results = self.gb_batch_energy_func(
+                self.GB,
+                [population_manipulators[index] for index in valid_indices],
+                [population_structures[index] for index in valid_indices],
+                [population_lineages[index] for index in valid_indices],
+                [unique_ids[index] for index in valid_indices],
+            )
+        except Exception as exc:
+            for input_index, mapping in zip(valid_indices, valid_mappings):
+                records[input_index] = self._failed_evaluation(
+                    input_index, str(exc), mapping
+                )
+            return [record for record in records if record is not None]
+        if not isinstance(raw_results, list) or len(raw_results) != len(valid_mappings):
+            raise ValueError(
+                "explicit-ownership batch evaluation requires one ordered result "
+                "dictionary per input candidate"
+            )
+        paths = []
+        for result in raw_results:
+            if not isinstance(result, dict) or "final_dump" not in result:
+                raise ValueError(
+                    "explicit-ownership batch results require an unambiguous "
+                    "final_dump path for every input candidate"
+                )
+            path = result.get("final_dump")
+            if path is not None:
+                paths.append(str(Path(path).resolve()))
+        if len(paths) != len(set(paths)):
+            raise ValueError(
+                "explicit-ownership batch results must not reuse one output path "
+                "for multiple candidates"
+            )
+        for input_index, mapping, result in zip(
+            valid_indices, valid_mappings, raw_results
+        ):
+            records[input_index] = self._record_owned_result(
+                input_index=input_index,
+                mapping=mapping,
+                energy=result.get("energy", PENALTY),
+                structure_path=result.get("final_dump"),
+            )
+        return [record for record in records if record is not None]
+
+    def _reload_owned_record(self, record: CandidateEvaluation) -> GBManipulator:
+        if not record.success or record.structure_path is None or record.mapping is None:
+            raise ValueError("cannot reload a failed candidate evaluation")
+        return self._reload_owned_mapping(record.structure_path, record.mapping)
+
+    def _make_next_owned_generation(
+        self,
+        records: list[CandidateEvaluation],
+        intermediate_indices: list[int],
+    ) -> tuple[list[GBManipulator], list[np.ndarray], list[list[str]]]:
+        if not records:
+            raise ValueError("No valid candidate records provided for breeding")
+        if not intermediate_indices:
+            intermediate_indices = list(range(len(records)))
+        manipulators: list[GBManipulator] = []
+        candidates: list[np.ndarray] = []
+        lineages: list[list[str]] = []
+        n_slice = self.population_size // 2
+        n_mutate = self.population_size - n_slice
+
+        for _ in range(n_slice):
+            replace = len(intermediate_indices) < 2
+            idx_1, idx_2 = self.local_random.choice(
+                intermediate_indices, size=2, replace=replace
+            )
+            record1, record2 = records[int(idx_1)], records[int(idx_2)]
+            parent1 = self._reload_owned_record(record1).parents[0]
+            parent2 = self._reload_owned_record(record2).parents[0]
+            new_manipulator = GBManipulator._from_parents(
+                parent1, parent2, rng=self.local_random
+            )
+            new_structure = new_manipulator.slice_and_merge()
+            manipulators.append(new_manipulator)
+            candidates.append(new_structure)
+            lineages.append(
+                ["slice_and_merge", record1.structure_path, record2.structure_path]
+            )
+
+        selected = self.local_random.choice(
+            intermediate_indices, size=n_mutate, replace=True
+        )
+        for idx in selected:
+            record = records[int(idx)]
+            new_manipulator = self._reload_owned_record(record)
+            mutation, new_structure = self.mutator.mutate(
+                local_random=self.local_random,
+                GB=self.GB,
+                manipulator=new_manipulator,
+            )
+            manipulators.append(new_manipulator)
+            candidates.append(new_structure)
+            lineages.append([mutation, record.structure_path])
+        return manipulators, candidates, lineages
 
     def _select_indices_by_energy(self, energies: list) -> tuple[list[int], list[int]]:
         idx_sorted = sorted(range(len(energies)), key=lambda i: energies[i])
@@ -428,9 +700,7 @@ class GeneticAlgorithmMinimizer:
         """
 
         if self.initial_ownership is not None:
-            raise RuntimeError(
-                "full GA execution with explicit grain ownership is deferred to Chat 6B"
-            )
+            return self._run_owned_GA(unique_id=unique_id)
 
         if unique_id is None:
             unique_id = uuid.uuid4()
@@ -556,3 +826,115 @@ class GeneticAlgorithmMinimizer:
             population_lineages = next_lineages[:self.population_size]
 
         return (best_energy, best_dump)
+
+    def _run_owned_GA(
+        self, unique_id: int | uuid.UUID | None = None
+    ) -> tuple[float, str]:
+        """Run the GA while preserving explicit grain ownership through every reload."""
+        if unique_id is None:
+            unique_id = uuid.uuid4()
+        self.GBE_vals = []
+        self.history = []
+        self.last_generation_evaluations: list[CandidateEvaluation] = []
+
+        initial_atoms = np.array(self.manipulator.parents[0].whole_system, copy=True)
+        initial_record = self._evaluate_owned_candidate(
+            self.manipulator, initial_atoms, f"GA_initial{unique_id}", -1
+        )
+        if not initial_record.success or initial_record.structure_path is None:
+            raise RuntimeError(
+                "initial explicit-ownership evaluation failed: "
+                f"{initial_record.failure_reason}"
+            )
+        self.GBE_vals.append([initial_record.energy])
+        best_record = initial_record
+        self.best_evaluation = best_record
+
+        population_manipulators: list[GBManipulator] = []
+        population_structures: list[np.ndarray] = []
+        population_lineages: list[list[str]] = []
+
+        seed_manipulator = self._reload_owned_record(initial_record)
+        population_manipulators.append(seed_manipulator)
+        population_structures.append(
+            np.array(seed_manipulator.parents[0].whole_system, copy=True)
+        )
+        population_lineages.append(["START", initial_record.structure_path])
+
+        for _ in range(self.population_size - 1):
+            candidate_manipulator = self._reload_owned_record(initial_record)
+            mutation, candidate_structure = self.mutator.mutate(
+                local_random=self.local_random,
+                GB=self.GB,
+                manipulator=candidate_manipulator,
+            )
+            population_manipulators.append(candidate_manipulator)
+            population_structures.append(candidate_structure)
+            population_lineages.append([mutation, initial_record.structure_path])
+
+        for gen in range(self.generations):
+            records = self._evaluate_owned_generation(
+                population_manipulators,
+                population_structures,
+                population_lineages,
+                gen,
+                unique_id,
+            )
+            self.last_generation_evaluations = records
+            generation_energies = [record.energy for record in records]
+            self.GBE_vals.append(generation_energies)
+            self.history.append(list(zip(population_lineages, generation_energies)))
+            valid_records = [record for record in records if record.success]
+
+            if not valid_records:
+                next_manipulators = []
+                next_structures = []
+                next_lineages = []
+                for _ in range(self.population_size):
+                    candidate_manipulator = self._reload_owned_record(best_record)
+                    mutation, candidate_structure = self.mutator.mutate(
+                        local_random=self.local_random,
+                        GB=self.GB,
+                        manipulator=candidate_manipulator,
+                    )
+                    next_manipulators.append(candidate_manipulator)
+                    next_structures.append(candidate_structure)
+                    next_lineages.append([mutation, best_record.structure_path])
+                population_manipulators = next_manipulators
+                population_structures = next_structures
+                population_lineages = next_lineages
+                continue
+
+            for record in valid_records:
+                if record.energy < best_record.energy:
+                    best_record = record
+                    self.best_evaluation = record
+
+            valid_energies = [record.energy for record in valid_records]
+            lowest_indices, intermediate_indices = self._select_indices_by_energy(
+                valid_energies
+            )
+            next_manipulators: list[GBManipulator] = []
+            next_structures: list[np.ndarray] = []
+            next_lineages: list[list[str]] = []
+            for index in lowest_indices:
+                record = valid_records[index]
+                carryover = self._reload_owned_record(record)
+                next_manipulators.append(carryover)
+                next_structures.append(
+                    np.array(carryover.parents[0].whole_system, copy=True)
+                )
+                next_lineages.append(["carryover", record.structure_path])
+
+            new_manipulators, new_structures, new_lineages = (
+                self._make_next_owned_generation(valid_records, intermediate_indices)
+            )
+            next_manipulators.extend(new_manipulators)
+            next_structures.extend(new_structures)
+            next_lineages.extend(new_lineages)
+            population_manipulators = next_manipulators[: self.population_size]
+            population_structures = next_structures[: self.population_size]
+            population_lineages = next_lineages[: self.population_size]
+
+        self.best_evaluation = best_record
+        return best_record.energy, str(best_record.structure_path)

@@ -208,7 +208,11 @@ def _assert_exact_fluorite_counts(atoms, expected_count, *, label):
 
 
 def _build_representative_boundary(P, Q):
-    """Build one representative case with the original campaign conventions."""
+    """Build one representative case with the original campaign conventions.
+
+    Callers filter the expected repeat recommendation and automatic commensurate
+    resize warnings; those warning contracts are exercised in focused GBMaker tests.
+    """
     boundary = PQSpec(P=P, Q=Q, basis_mode="supplied")
     common = {
         "a0": 5.454,
@@ -370,6 +374,13 @@ def test_exact_builder_returns_complete_small_fcc_grains(build_gb):
         )
 
 
+@pytest.mark.filterwarnings(
+    r"ignore:Commensurate repeat pair in [yz] multiplied by \d+ to satisfy the "
+    r"minimum in-plane dimension cutoff of .* A\.:UserWarning"
+)
+@pytest.mark.filterwarnings(
+    r"ignore:Recommended repeat factor is at least 2\.:UserWarning"
+)
 @pytest.mark.parametrize(
     ("case_id", "P", "Q", "left_expected", "right_expected"),
     REPRESENTATIVE_CASES,
@@ -403,6 +414,13 @@ def test_representative_exact_counts_and_species_are_complete(
     assert np.all(np.isfinite(_positions(gb.whole_system)))
 
 
+@pytest.mark.filterwarnings(
+    r"ignore:Commensurate repeat pair in [yz] multiplied by \d+ to satisfy the "
+    r"minimum in-plane dimension cutoff of .* A\.:UserWarning"
+)
+@pytest.mark.filterwarnings(
+    r"ignore:Recommended repeat factor is at least 2\.:UserWarning"
+)
 def test_high_index_exact_boundary_preserves_all_decorated_sites_near_x_boundary():
     _, P, Q, left_expected, right_expected = ZHANG_001_CASE
     gb = _build_representative_boundary(P, Q)
@@ -418,6 +436,13 @@ def test_high_index_exact_boundary_preserves_all_decorated_sites_near_x_boundary
     assert np.max(gb.right_grain["x"]) < gb.x_dim + tolerance
 
 
+@pytest.mark.filterwarnings(
+    r"ignore:Commensurate repeat pair in [yz] multiplied by \d+ to satisfy the "
+    r"minimum in-plane dimension cutoff of .* A\.:UserWarning"
+)
+@pytest.mark.filterwarnings(
+    r"ignore:Recommended repeat factor is at least 2\.:UserWarning"
+)
 def test_exact_construction_is_deterministic_for_names_and_coordinate_order():
     _, P, Q, _, _ = ZHANG_041_CASE
     first = _build_representative_boundary(P, Q)
