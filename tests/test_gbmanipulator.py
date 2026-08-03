@@ -1,5 +1,6 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
+import copy
 import filecmp
 import importlib
 import math
@@ -14,6 +15,13 @@ import numpy as np
 import pytest
 
 from GBOpt.Atom import Atom
+from GBOpt.FileGrainOwnership import (
+    GrainOwnership,
+    GrainOwnershipError,
+    LEFT_GRAIN_LABEL,
+    RIGHT_GRAIN_LABEL,
+    read_lammps_data_file,
+)
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import (
     GBManipulator,
@@ -1061,3 +1069,181 @@ def test_translate_right_grain_rejects_crossing_vacuum_side_of_grain_slab():
 
     with pytest.raises(GBManipulatorValueError, match=r"\[3.0, 7.0\)"):
         manipulator.translate_right_grain(0.0, 0.0, dx=1.0)
+
+
+
+def _write_explicit_ownership_data(path, rows):
+    with open(path, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write("Synthetic UO2 atoms\n\n")
+        stream.write(f"{len(rows)} atoms\n")
+        stream.write("2 atom types\n")
+        stream.write("2.000000 10.000000 xlo xhi\n")
+        stream.write("-1.000000 9.000000 ylo yhi\n")
+        stream.write("5.000000 15.000000 zlo zhi\n")
+        stream.write("\nAtoms\n\n")
+        for atom_id, type_id, charge, x, y, z in rows:
+            stream.write(
+                f"{atom_id} {type_id} {charge:.6f} {x:.6f} {y:.6f} {z:.6f}\n"
+            )
+
+
+def _synthetic_file_ownership():
+    return GrainOwnership(
+        atom_ids=np.arange(1, 6, dtype=np.int64),
+        labels=np.array(
+            [LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL, RIGHT_GRAIN_LABEL,
+             RIGHT_GRAIN_LABEL, RIGHT_GRAIN_LABEL],
+            dtype=np.int8,
+        ),
+        gb_plane_x=4.0,
+        inplane_periodic=(True, False),
+        right_grain_x_bounds=(4.0, 9.5),
+        coordinate_tolerance=1.0e-8,
+        periodic_outer_x_interface=False,
+    )
+
+
+def test_explicit_file_ownership_aligns_reordered_rows_by_atom_id(tmp_path):
+    data = tmp_path / "owned.data"
+    # ID 1 is left-owned but lies right of the plane. IDs 2 and 3 are right-owned
+    # but lie left of the plane. The file rows are intentionally reordered.
+    rows = [
+        (5, 2, -1.2, 9.0, 0.0, 6.0),
+        (2, 2, -1.2, 3.0, 1.0, 7.0),
+        (1, 1, 2.4, 7.0, 2.0, 8.0),
+        (4, 1, 2.4, 8.0, 3.0, 9.0),
+        (3, 1, 2.4, 3.5, 4.0, 10.0),
+    ]
+    _write_explicit_ownership_data(data, rows)
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("fluorite", 5.454, ("U", "O"))
+
+    parent = Parent(
+        str(data),
+        unit_cell=unit_cell,
+        gb_thickness=4.0,
+        grain_ownership=_synthetic_file_ownership(),
+    )
+
+    assert np.array_equal(parent.initial_atom_ids, np.arange(1, 6))
+    assert np.array_equal(
+        parent.grain_labels,
+        np.array([0, 1, 1, 1, 1], dtype=np.int8),
+    )
+    assert len(parent.left_grain) == 1
+    assert len(parent.right_grain) == 4
+    assert parent.left_grain[0]["x"] == pytest.approx(7.0)
+    assert sorted(parent.right_grain["x"].tolist()) == [3.0, 3.5, 8.0, 9.0]
+    assert parent.gb_plane_x == 4.0
+    assert parent.inplane_periodic == (True, False)
+    assert np.array_equal(parent.right_grain_x_bounds, np.array([4.0, 9.5]))
+    # GB membership remains geometric, not label-based.
+    assert sorted(parent.gb_atoms["x"].tolist()) == [3.0, 3.5]
+
+    legacy_data = tmp_path / "legacy_atomic.data"
+    with open(legacy_data, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write("Synthetic UO2 atoms\n\n")
+        stream.write("5 atoms\n2 atom types\n")
+        stream.write("2.000000 10.000000 xlo xhi\n")
+        stream.write("-1.000000 9.000000 ylo yhi\n")
+        stream.write("5.000000 15.000000 zlo zhi\n\nAtoms\n\n")
+        for atom_id, type_id, _charge, x, y, z in rows:
+            stream.write(f"{atom_id} {type_id} {x:.6f} {y:.6f} {z:.6f}\n")
+    legacy = Parent(str(legacy_data), unit_cell=unit_cell, gb_thickness=4.0)
+    assert (len(legacy.left_grain), len(legacy.right_grain)) == (2, 3)
+
+
+def test_grain_ownership_is_defensive_and_rejects_bad_labels():
+    ownership = _synthetic_file_ownership()
+    labels = ownership.labels
+    assert labels.flags.writeable is False
+    with pytest.raises(ValueError):
+        labels[0] = RIGHT_GRAIN_LABEL
+    assert ownership.labels[0] == LEFT_GRAIN_LABEL
+
+    with pytest.raises(GrainOwnershipError, match="grain labels"):
+        GrainOwnership(
+            atom_ids=np.array([1, 2]),
+            labels=np.array([0, 2]),
+            gb_plane_x=4.0,
+            inplane_periodic=(True, True),
+            right_grain_x_bounds=(4.0, 9.0),
+            coordinate_tolerance=1.0e-8,
+            periodic_outer_x_interface=True,
+        )
+    with pytest.raises(GrainOwnershipError, match="length"):
+        GrainOwnership(
+            atom_ids=np.array([1, 2]),
+            labels=np.array([0]),
+            gb_plane_x=4.0,
+            inplane_periodic=(True, True),
+            right_grain_x_bounds=(4.0, 9.0),
+            coordinate_tolerance=1.0e-8,
+            periodic_outer_x_interface=True,
+        )
+
+
+def test_explicit_parent_copy_and_deepcopy_preserve_independent_ownership(tmp_path):
+    data = tmp_path / "owned.data"
+    rows = [
+        (1, 1, 2.4, 7.0, 2.0, 8.0),
+        (2, 2, -1.2, 3.0, 1.0, 7.0),
+        (3, 1, 2.4, 3.5, 4.0, 10.0),
+        (4, 1, 2.4, 8.0, 3.0, 9.0),
+        (5, 2, -1.2, 9.0, 0.0, 6.0),
+    ]
+    _write_explicit_ownership_data(data, rows)
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("fluorite", 5.454, ("U", "O"))
+    manipulator = GBManipulator(
+        str(data),
+        unit_cell=unit_cell,
+        gb_thickness=4.0,
+        grain_ownership=_synthetic_file_ownership(),
+    )
+
+    for copied in (copy.copy(manipulator), copy.deepcopy(manipulator)):
+        original_parent = manipulator.parents[0]
+        copied_parent = copied.parents[0]
+        assert np.array_equal(copied_parent.grain_labels, original_parent.grain_labels)
+        assert copied_parent.gb_plane_x == original_parent.gb_plane_x
+        assert copied_parent.inplane_periodic == original_parent.inplane_periodic
+        copied_parent.whole_system["x"][0] += 0.25
+        assert copied_parent.whole_system["x"][0] != original_parent.whole_system["x"][0]
+        assert np.array_equal(copied_parent.grain_labels, original_parent.grain_labels)
+
+
+def test_explicit_file_loading_rejects_duplicate_ids_without_midpoint_fallback(tmp_path):
+    data = tmp_path / "duplicate.data"
+    rows = [
+        (1, 1, 2.4, 7.0, 2.0, 8.0),
+        (1, 2, -1.2, 3.0, 1.0, 7.0),
+        (3, 1, 2.4, 3.5, 4.0, 10.0),
+        (4, 1, 2.4, 8.0, 3.0, 9.0),
+        (5, 2, -1.2, 9.0, 0.0, 6.0),
+    ]
+    _write_explicit_ownership_data(data, rows)
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("fluorite", 5.454, ("U", "O"))
+    with pytest.raises(ParentValueError, match="atom IDs must be unique"):
+        Parent(
+            str(data),
+            unit_cell=unit_cell,
+            gb_thickness=4.0,
+            grain_ownership=_synthetic_file_ownership(),
+        )
+
+
+def test_lammps_data_reader_preserves_file_row_ids_and_charge_coordinates(tmp_path):
+    data = tmp_path / "reader.data"
+    rows = [
+        (2, 2, -1.2, 3.0, 1.0, 7.0),
+        (1, 1, 2.4, 7.0, 2.0, 8.0),
+    ]
+    _write_explicit_ownership_data(data, rows)
+    parsed = read_lammps_data_file(data, type_dict={"U": 1, "O": 2})
+    assert np.array_equal(parsed.atom_ids, np.array([2, 1]))
+    assert parsed.atoms[0]["name"] == "O"
+    assert parsed.atoms[0]["x"] == pytest.approx(3.0)
+    assert parsed.atoms[1]["name"] == "U"
+    assert parsed.atoms[1]["z"] == pytest.approx(8.0)
