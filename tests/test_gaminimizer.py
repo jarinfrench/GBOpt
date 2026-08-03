@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBMinimizer import GeneticAlgorithmMinimizer
@@ -180,3 +181,58 @@ class TestGeneticAlgorithmMinimizer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_initial_owned_manipulator_preserves_counts_plane_and_blocks_full_ga(tmp_path):
+    from GBOpt.FileGrainOwnership import (
+        GrainOwnership,
+        LEFT_GRAIN_LABEL,
+        RIGHT_GRAIN_LABEL,
+    )
+
+    theta = math.radians(36.869898)
+    gb = GBMaker(
+        3.52,
+        "fcc",
+        10.0,
+        np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0]),
+        "Ni",
+        repeat_factor=(1, 1),
+        x_dim_min=12.0,
+        vacuum=0.0,
+        interaction_distance=4.0,
+    )
+    seed_path = tmp_path / "initial.data"
+    gb.write_lammps(str(seed_path), type_as_int=True, precision=12)
+    left_count = len(gb.left_grain)
+    total_count = len(gb.whole_system)
+    labels = np.full(total_count, RIGHT_GRAIN_LABEL, dtype=np.int8)
+    labels[:left_count] = LEFT_GRAIN_LABEL
+    ownership = GrainOwnership(
+        atom_ids=np.arange(1, total_count + 1),
+        labels=labels,
+        gb_plane_x=gb.gb_plane_x,
+        inplane_periodic=gb.inplane_periodic,
+        right_grain_x_bounds=(gb.gb_plane_x, gb.box_dims[0, 1]),
+        coordinate_tolerance=gb.epsilon,
+        periodic_outer_x_interface=True,
+    )
+
+    minimizer = GeneticAlgorithmMinimizer(
+        gb,
+        lambda *args: (0.0, str(seed_path)),
+        ["translate_right_grain"],
+        seed=0,
+        initial_structure=str(seed_path),
+        initial_ownership=ownership,
+        population_size=2,
+        generations=1,
+    )
+    parent = minimizer.manipulator.parents[0]
+    assert len(parent.left_grain) == left_count
+    assert len(parent.right_grain) == total_count - left_count
+    assert parent.gb_plane_x == gb.gb_plane_x
+    assert np.array_equal(parent.grain_labels, labels)
+
+    with pytest.raises(RuntimeError, match="deferred to Chat 6B"):
+        minimizer.run_GA(unique_id=1)
