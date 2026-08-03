@@ -846,6 +846,15 @@ class TestParentGBRegion(unittest.TestCase):
         self.assertAlmostEqual(self.parent._Parent__gb_plane_x,
                                self.gbm.gb_plane_x, places=10)
 
+    def test_right_grain_x_bounds_match_gbmaker_grain_slab(self):
+        expected = np.array(
+            [
+                self.gbm.gb_plane_x,
+                self.gbm.box_dims[0, 1] - self.gbm.vacuum_thickness,
+            ]
+        )
+        np.testing.assert_allclose(self.parent.right_grain_x_bounds, expected)
+
     def test_file_path_gb_plane_x_near_gbmaker_value(self):
         with tempfile.NamedTemporaryFile(suffix=".dat", delete=False) as f:
             path = f.name
@@ -908,3 +917,147 @@ class TestParentProxy(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def _translation_only_manipulator(*, periodic=(True, True)):
+    """Return a tiny deterministic manipulator with nonzero box lower bounds."""
+    left = np.array(
+        [
+            ("U", 0.0, 12.0, -4.0),
+            ("O", 2.0, 15.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    right = np.array(
+        [
+            ("O", 4.0, 19.0, 4.0),
+            ("U", 6.0, 11.0, -4.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    parent = SimpleNamespace(
+        left_grain=left,
+        right_grain=right,
+        whole_system=np.hstack((left, right)),
+        box_dims=np.array([[-2.0, 8.0], [10.0, 20.0], [-5.0, 5.0]]),
+        gb_plane_x=3.0,
+        inplane_periodic=periodic,
+    )
+    manipulator = object.__new__(GBManipulator)
+    manipulator._GBManipulator__one_parent = True
+    manipulator._GBManipulator__parents = [parent, None]
+    return manipulator, parent
+
+
+def test_translate_right_grain_two_argument_call_matches_explicit_zero_dx():
+    manipulator, _ = _translation_only_manipulator()
+
+    positional = manipulator.translate_right_grain(3.0, 2.0)
+    explicit = manipulator.translate_right_grain(3.0, 2.0, dx=0.0)
+
+    assert np.array_equal(positional, explicit)
+
+
+def test_translate_right_grain_zero_reproduces_parent_without_mutation():
+    manipulator, parent = _translation_only_manipulator()
+    left_before = parent.left_grain.copy()
+    right_before = parent.right_grain.copy()
+    whole_before = parent.whole_system.copy()
+
+    translated = manipulator.translate_right_grain(0.0, 0.0)
+
+    assert np.array_equal(translated, whole_before)
+    assert np.array_equal(parent.left_grain, left_before)
+    assert np.array_equal(parent.right_grain, right_before)
+    assert np.array_equal(parent.whole_system, whole_before)
+    assert np.array_equal(translated[:len(left_before)], left_before)
+    assert np.array_equal(translated["name"], whole_before["name"])
+
+
+def test_translate_right_grain_wraps_periodic_axes_using_actual_bounds():
+    manipulator, parent = _translation_only_manipulator()
+
+    translated = manipulator.translate_right_grain(3.0, 2.0)
+    translated_right = translated[len(parent.left_grain):]
+
+    assert np.array_equal(translated[:len(parent.left_grain)], parent.left_grain)
+    assert np.array_equal(translated_right["x"], parent.right_grain["x"])
+    assert np.allclose(translated_right["y"], [12.0, 14.0])
+    assert np.allclose(translated_right["z"], [-4.0, -2.0])
+    assert np.array_equal(translated_right["name"], parent.right_grain["name"])
+
+
+def test_translate_right_grain_accepts_small_supported_nonzero_dx():
+    manipulator, parent = _translation_only_manipulator()
+
+    translated = manipulator.translate_right_grain(0.0, 0.0, dx=0.5)
+    translated_right = translated[len(parent.left_grain):]
+
+    assert np.array_equal(translated[:len(parent.left_grain)], parent.left_grain)
+    assert np.allclose(translated_right["x"], parent.right_grain["x"] + 0.5)
+    assert np.array_equal(translated_right["y"], parent.right_grain["y"])
+    assert np.array_equal(translated_right["z"], parent.right_grain["z"])
+    assert np.array_equal(translated_right["name"], parent.right_grain["name"])
+
+
+@pytest.mark.parametrize("dx", [-1.1, 2.0])
+def test_translate_right_grain_rejects_dx_outside_contiguous_right_interval(dx):
+    manipulator, parent = _translation_only_manipulator()
+    right_before = parent.right_grain.copy()
+
+    with pytest.raises(GBManipulatorValueError, match="half-open x interval"):
+        manipulator.translate_right_grain(0.0, 0.0, dx=dx)
+
+    assert np.array_equal(parent.right_grain, right_before)
+
+
+def test_translate_right_grain_never_wraps_periodic_x_across_box_boundary():
+    manipulator, _ = _translation_only_manipulator()
+
+    with pytest.raises(GBManipulatorValueError, match=r"\[3.0, 8.0\)"):
+        manipulator.translate_right_grain(0.0, 0.0, dx=2.0)
+
+
+def test_translate_right_grain_does_not_wrap_nonperiodic_axis():
+    manipulator, parent = _translation_only_manipulator(periodic=(False, True))
+
+    translated = manipulator.translate_right_grain(0.5, 0.0)
+    translated_right = translated[len(parent.left_grain):]
+    assert np.allclose(translated_right["y"], parent.right_grain["y"] + 0.5)
+
+    with pytest.raises(GBManipulatorValueError, match="nonperiodic half-open y"):
+        manipulator.translate_right_grain(2.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("dy", "dz", "dx"),
+    [
+        (np.nan, 0.0, 0.0),
+        (0.0, np.inf, 0.0),
+        (0.0, 0.0, -np.inf),
+        ("1.0", 0.0, 0.0),
+    ],
+)
+def test_translate_right_grain_rejects_nonfinite_or_nonreal_displacements(
+    dy,
+    dz,
+    dx,
+):
+    manipulator, _ = _translation_only_manipulator()
+
+    with pytest.raises(GBManipulatorValueError, match="finite real"):
+        manipulator.translate_right_grain(dy, dz, dx=dx)
+
+
+def test_translate_right_grain_rejects_crossing_vacuum_side_of_grain_slab():
+    manipulator, parent = _translation_only_manipulator()
+    parent.right_grain_x_bounds = np.array([3.0, 7.0])
+
+    valid = manipulator.translate_right_grain(0.0, 0.0, dx=0.5)
+    assert np.allclose(
+        valid[len(parent.left_grain):]["x"],
+        parent.right_grain["x"] + 0.5,
+    )
+
+    with pytest.raises(GBManipulatorValueError, match=r"\[3.0, 7.0\)"):
+        manipulator.translate_right_grain(0.0, 0.0, dx=1.0)
