@@ -3,6 +3,7 @@
 import multiprocessing as mp
 import warnings
 from itertools import combinations_with_replacement
+from numbers import Real
 from os.path import isfile
 from typing import Union
 
@@ -162,6 +163,15 @@ class Parent:
         self.__unit_cell = system.unit_cell
         self.__atom_radius = system.radius
         self.__box_dims = system.box_dims
+        self.__inplane_periodic = system.inplane_periodic
+        self.__coordinate_tolerance = system.epsilon
+        self.__right_grain_x_bounds = np.array(
+            [
+                system.gb_plane_x,
+                system.box_dims[0, 1] - system.vacuum_thickness,
+            ],
+            dtype=float,
+        )
         # We do not use GB.x_dim because this is limited to a single grain of the GB,
         # not the entire system.
         self.__x_dim = self.__box_dims[0][1] - self.__box_dims[0][0]
@@ -194,6 +204,11 @@ class Parent:
             raise ParentValueError("Unit cell must be specified for files")
         self.__unit_cell = unit_cell
         self.__gb_thickness = gb_thickness
+        # LAMMPS data and dump files used by the current loader do not preserve
+        # per-axis boundary-condition metadata. Retain the historical behavior for
+        # file-backed parents by treating y and z as periodic.
+        self.__inplane_periodic = (True, True)
+        self.__coordinate_tolerance = 1.0e-10
         if not isfile(system_file):
             raise ParentFileNotFoundError(f"{system_file} does not exist.")
         # We need to first identify what type of file it is. Since filenames can be just
@@ -242,6 +257,14 @@ class Parent:
                 break
         else:
             raise ParentValueError(f"Unknown file format for {system_file}")
+
+        # File formats currently do not preserve the originating free-surface/vacuum
+        # metadata. The only supported contiguous right-grain interval available after
+        # reload is therefore the partition-to-box interval.
+        self.__right_grain_x_bounds = np.array(
+            [self.__gb_plane_x, self.__box_dims[0, 1]],
+            dtype=float,
+        )
 
     def __init_from_lammps_dump(
         self,
@@ -567,6 +590,26 @@ class Parent:
     @property
     def z_dim(self) -> float:
         return self.__z_dim
+
+    @property
+    def gb_plane_x(self) -> float:
+        """Return the x coordinate separating the contiguous grain populations."""
+        return self.__gb_plane_x
+
+    @property
+    def inplane_periodic(self) -> tuple[bool, bool]:
+        """Return the y/z periodicity flags used for rigid translation."""
+        return tuple(bool(value) for value in self.__inplane_periodic)
+
+    @property
+    def coordinate_tolerance(self) -> float:
+        """Return the coordinate tolerance inherited from the construction parent."""
+        return float(self.__coordinate_tolerance)
+
+    @property
+    def right_grain_x_bounds(self) -> np.ndarray:
+        """Return a copy of the supported contiguous right-grain x interval."""
+        return self.__right_grain_x_bounds.copy()
 
 
 class _ParentsProxy:
@@ -925,26 +968,111 @@ class GBManipulator:
 
     # TODO: Swap to use Atom class if it can be vectorized for each of these mutators.
 
-    def translate_right_grain(self, dy: float, dz: float) -> np.ndarray:
+    def translate_right_grain(
+        self,
+        dy: float,
+        dz: float,
+        *,
+        dx: float = 0.0,
+    ) -> np.ndarray:
         """
-        Displace the right grain in the plane of the GB by (0, dy, dz).
+        Rigidly displace only the right grain by ``(dx, dy, dz)``.
+
+        Existing positional calls ``translate_right_grain(dy, dz)`` retain their
+        original meaning because ``dx`` is keyword-only and defaults to zero.
+
+        For a ``GBMaker`` parent, the supported right-grain x interval is the half-open
+        grain slab ``[parent.gb_plane_x, box_xhi - vacuum_thickness)``. For a file
+        parent, whose current serialization does not preserve vacuum metadata, the
+        supported fallback is ``[parent.gb_plane_x, box_xhi)``. A normal displacement
+        is accepted only when every translated right-grain x coordinate remains inside
+        that interval, allowing only the construction parent's established coordinate
+        tolerance at the lower grain-partition face. The upper face remains strictly
+        half-open. X is never periodically wrapped, including for a vacuum-free
+        periodic bicrystal, because wrapping could make the right grain straddle the
+        box boundary and invalidate the contiguous grain partition represented by
+        ``gb_plane_x``.
+
+        Periodic y/z axes are wrapped into their actual half-open box intervals using
+        the stored lower and upper bounds. Nonperiodic y/z axes are not wrapped; a
+        displacement that moves any atom outside the corresponding half-open box
+        interval is rejected.
 
         :param dy: Displacement in y direction in angstroms.
         :param dz: Displacement in z direction in angstroms.
+        :param dx: Keyword-only displacement in x direction in angstroms, default 0.
+        :raises GBManipulatorValueError: If a displacement is not a finite real value
+            or would move a right-grain atom outside a supported axis interval.
         :return: Atom positions after translation of the right grain.
         """
+        displacements = {"dx": dx, "dy": dy, "dz": dz}
+        for name, value in displacements.items():
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise GBManipulatorValueError(
+                    f"{name} must be a finite real value."
+                )
+            if not np.isfinite(value):
+                raise GBManipulatorValueError(
+                    f"{name} must be a finite real value."
+                )
+
+        dx = float(dx)
+        dy = float(dy)
+        dz = float(dz)
+
         if not self.__one_parent:
             warnings.warn("Grain translation only occurring based on parent 1.")
         parent = self.__parents[0]
         updated_right_grain = np.copy(parent.right_grain)
-        # Displace all atoms in the right grain by [0, dy, dz]. We modulo by the
-        # grain dimensions so atoms do not exceed the original boundary conditions
-        # updated_right_grain[:, 2] = (
-        # updated_right_grain[:, 2] + dy) % parent.y_dim
-        # updated_right_grain[:, 3] = (
-        #     updated_right_grain[:, 3] + dz) % parent.z_dim
-        updated_right_grain["y"] = (updated_right_grain["y"] + dy) % parent.y_dim
-        updated_right_grain["z"] = (updated_right_grain["z"] + dz) % parent.z_dim
+        tolerance = float(getattr(parent, "coordinate_tolerance", 1.0e-10))
+
+        right_grain_x_bounds = np.asarray(
+            getattr(
+                parent,
+                "right_grain_x_bounds",
+                [parent.gb_plane_x, parent.box_dims[0, 1]],
+            ),
+            dtype=float,
+        )
+        x_lower = float(right_grain_x_bounds[0])
+        x_upper = float(right_grain_x_bounds[1])
+        translated_x = updated_right_grain["x"] + dx
+        if (
+            np.any(translated_x < x_lower - tolerance)
+            or np.any(translated_x >= x_upper)
+        ):
+            raise GBManipulatorValueError(
+                "dx moves one or more right-grain atoms outside the supported "
+                f"half-open x interval [{x_lower}, {x_upper})."
+            )
+        updated_right_grain["x"] = translated_x
+
+        for axis_name, displacement, is_periodic in zip(
+            ("y", "z"),
+            (dy, dz),
+            parent.inplane_periodic,
+        ):
+            axis_index = 1 if axis_name == "y" else 2
+            lower = float(parent.box_dims[axis_index, 0])
+            upper = float(parent.box_dims[axis_index, 1])
+            period = upper - lower
+            translated = updated_right_grain[axis_name] + displacement
+
+            if is_periodic:
+                updated_right_grain[axis_name] = (
+                    np.mod(translated - lower, period) + lower
+                )
+            else:
+                if (
+                    np.any(translated < lower - tolerance)
+                    or np.any(translated >= upper)
+                ):
+                    raise GBManipulatorValueError(
+                        f"d{axis_name} moves one or more right-grain atoms outside "
+                        f"the nonperiodic half-open {axis_name} interval "
+                        f"[{lower}, {upper})."
+                    )
+                updated_right_grain[axis_name] = translated
 
         return np.hstack((self.__parents[0].left_grain, updated_right_grain))
 
