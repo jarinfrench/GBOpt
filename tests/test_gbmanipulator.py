@@ -16,11 +16,14 @@ import pytest
 
 from GBOpt.Atom import Atom
 from GBOpt.FileGrainOwnership import (
+    CandidateFileMapping,
     GrainOwnership,
     GrainOwnershipError,
     LEFT_GRAIN_LABEL,
     RIGHT_GRAIN_LABEL,
     read_lammps_data_file,
+    read_lammps_dump_file,
+    reload_explicit_manipulator,
 )
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import (
@@ -1247,3 +1250,456 @@ def test_lammps_data_reader_preserves_file_row_ids_and_charge_coordinates(tmp_pa
     assert parsed.atoms[0]["x"] == pytest.approx(3.0)
     assert parsed.atoms[1]["name"] == "U"
     assert parsed.atoms[1]["z"] == pytest.approx(8.0)
+
+
+
+def _write_named_lammps_data(path, atoms, box_dims, *, ids=None, declared_types=None):
+    ids = np.arange(1, len(atoms) + 1) if ids is None else np.asarray(ids)
+    if declared_types is None:
+        declared_types = len(set(str(name) for name in atoms["name"]))
+    with open(path, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write("Owned candidate\n\n")
+        stream.write(f"{len(atoms)} atoms\n")
+        stream.write(f"{declared_types} atom types\n")
+        for axis, (lower, upper) in zip("xyz", box_dims):
+            stream.write(f"{lower:.12f} {upper:.12f} {axis}lo {axis}hi\n")
+        stream.write("\nAtoms\n\n")
+        for atom_id, atom in zip(ids, atoms):
+            stream.write(
+                f"{int(atom_id)} {atom['name']} "
+                f"{atom['x']:.12f} {atom['y']:.12f} {atom['z']:.12f}\n"
+            )
+
+
+def _owned_single_species_manipulator(tmp_path, *, suffix="a", coordinates=None):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("fcc", 3.52, "Ni")
+    if coordinates is None:
+        coordinates = [
+            ("Ni", 6.5, 1.0, 1.0),
+            ("Ni", 3.0, 2.0, 2.0),
+            ("Ni", 4.0, 3.0, 3.0),
+            ("Ni", 4.5, 4.0, 4.0),
+            ("Ni", 5.5, 5.0, 5.0),
+            ("Ni", 6.0, 6.0, 6.0),
+            ("Ni", 7.0, 7.0, 7.0),
+            ("Ni", 8.0, 8.0, 8.0),
+        ]
+    atoms = np.asarray(coordinates, dtype=Atom.atom_dtype)
+    box = np.asarray([[0.0, 10.0], [0.0, 10.0], [0.0, 10.0]])
+    path = tmp_path / f"owned_{suffix}.data"
+    _write_named_lammps_data(path, atoms, box)
+    labels = np.asarray([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int8)
+    ownership = GrainOwnership(
+        atom_ids=np.arange(1, len(atoms) + 1),
+        labels=labels,
+        gb_plane_x=5.0,
+        inplane_periodic=(True, True),
+        right_grain_x_bounds=(5.0, 10.0),
+        coordinate_tolerance=1.0,
+        periodic_outer_x_interface=True,
+    )
+    manipulator = GBManipulator(
+        str(path),
+        unit_cell=unit_cell,
+        gb_thickness=10.0,
+        grain_ownership=ownership,
+        seed=2,
+    )
+    return manipulator, atoms, labels, box
+
+
+def test_explicit_translation_propagates_labels_without_x_reclassification(tmp_path):
+    manipulator, _atoms, labels, _box = _owned_single_species_manipulator(tmp_path)
+    translated = manipulator.translate_right_grain(0.25, 0.5)
+    expected = np.hstack((labels[labels == 0], labels[labels == 1]))
+    assert np.array_equal(manipulator.candidate_grain_labels, expected)
+    assert len(translated) == len(labels)
+    assert np.count_nonzero(manipulator.candidate_grain_labels == 0) == 4
+    assert np.count_nonzero(manipulator.candidate_grain_labels == 1) == 4
+    # Left-owned atoms deliberately lie on both sides of the plane.
+    assert np.any(translated["x"][expected == 0] > 5.0)
+
+
+def test_explicit_removal_deletes_labels_at_exact_selected_indices(tmp_path):
+    manipulator, atoms, labels, _box = _owned_single_species_manipulator(tmp_path)
+
+    class FixedChoice:
+        def choice(self, choices, size=None, replace=False, p=None):
+            values = np.asarray(choices)
+            selected = values[-1]
+            if size is None:
+                return selected
+            return np.asarray([selected])
+
+    manipulator.rng = FixedChoice()
+    reduced, removed = manipulator.remove_atoms(
+        num_to_remove=1, keep_ratio=False, return_positions=True
+    )
+    removed_index = int(np.flatnonzero(atoms["x"] == removed[0]["x"])[0])
+    assert len(reduced) == len(atoms) - 1
+    assert np.array_equal(
+        manipulator.candidate_grain_labels, np.delete(labels, removed_index)
+    )
+
+
+@pytest.mark.parametrize(
+    ("target_x", "expected_label"),
+    [(3.0, LEFT_GRAIN_LABEL), (4.0, RIGHT_GRAIN_LABEL), (5.0, RIGHT_GRAIN_LABEL)],
+)
+def test_explicit_insertion_assigns_label_once_with_tolerance_band(
+    monkeypatch, tmp_path, target_x, expected_label
+):
+    manipulator, atoms, labels, _box = _owned_single_species_manipulator(tmp_path)
+    recorded = {}
+
+    class FakeKDTree:
+        def __init__(self, data):
+            array = np.asarray(data, dtype=float)
+            if len(array) > len(atoms):
+                recorded["sites"] = array
+
+        def query_ball_tree(self, other, radius):
+            return [[] for _ in range(len(atoms))]
+
+        def query(self, points, k=1):
+            return np.ones(len(points)), np.zeros(len(points), dtype=int)
+
+    class SiteChoice:
+        def choice(self, choices, size=None, replace=False, p=None):
+            choices = np.asarray(choices, dtype=int)
+            sites = recorded["sites"]
+            matches = [index for index in choices if sites[index, 0] == target_x]
+            result = matches[0]
+            if size is None:
+                return result
+            return np.asarray([result])
+
+    module = importlib.import_module("GBOpt.GBManipulator")
+    monkeypatch.setattr(module, "KDTree", FakeKDTree)
+    manipulator.rng = SiteChoice()
+    inserted, new_atoms = manipulator.insert_atoms(
+        num_to_insert=1, method="grid", keep_ratio=False, return_positions=True
+    )
+    assert len(inserted) == len(atoms) + 1
+    assert new_atoms[0]["x"] == pytest.approx(target_x)
+    assert np.array_equal(manipulator.candidate_grain_labels[:-1], labels)
+    assert manipulator.candidate_grain_labels[-1] == expected_label
+    # Later coordinate motion does not change the stored label.
+    inserted[-1]["x"] = 9.0 if expected_label == LEFT_GRAIN_LABEL else 1.0
+    assert manipulator.candidate_grain_labels[-1] == expected_label
+
+
+def test_explicit_slice_and_merge_applies_exact_source_masks_and_fresh_ids(tmp_path):
+    manip1, atoms1, labels1, box = _owned_single_species_manipulator(tmp_path, suffix="one")
+    coordinates2 = [tuple(row) for row in atoms1]
+    coordinates2 = [(name, x + 0.25, y, z) for name, x, y, z in coordinates2]
+    manip2, atoms2, labels2, _ = _owned_single_species_manipulator(
+        tmp_path, suffix="two", coordinates=coordinates2
+    )
+
+    class MidpointRng:
+        def random(self):
+            return 0.5
+
+    child_manipulator = GBManipulator._from_parents(
+        manip1.parents[0], manip2.parents[0], rng=MidpointRng()
+    )
+    child = child_manipulator.slice_and_merge()
+    mask1 = atoms1["x"] < 5.0
+    mask2 = atoms2["x"] >= 5.0
+    expected_labels = np.hstack((labels1[mask1], labels2[mask2]))
+    assert np.array_equal(child_manipulator.candidate_grain_labels, expected_labels)
+    mapping = CandidateFileMapping.from_candidate(
+        child,
+        expected_labels,
+        box_dims=box,
+        gb_plane_x=5.0,
+        inplane_periodic=(True, True),
+        right_grain_x_bounds=(5.0, 10.0),
+        coordinate_tolerance=1.0,
+        periodic_outer_x_interface=True,
+    )
+    assert np.array_equal(mapping.atom_ids, np.arange(1, len(child) + 1))
+    assert len(mapping.atom_ids) != len(atoms1) + len(atoms2)
+
+
+def test_candidate_mapping_reloads_reordered_rows_by_transient_id(tmp_path):
+    manipulator, atoms, labels, box = _owned_single_species_manipulator(tmp_path)
+    mapping = CandidateFileMapping.from_candidate(
+        atoms,
+        labels,
+        box_dims=box,
+        gb_plane_x=5.0,
+        inplane_periodic=(True, True),
+        right_grain_x_bounds=(5.0, 10.0),
+        coordinate_tolerance=1.0e-8,
+        periodic_outer_x_interface=True,
+    )
+    order = np.arange(len(atoms))[::-1]
+    returned = tmp_path / "returned_reordered.data"
+    _write_named_lammps_data(
+        returned, atoms[order], box, ids=mapping.atom_ids[order]
+    )
+    reloaded = reload_explicit_manipulator(
+        returned,
+        candidate_mapping=mapping,
+        unit_cell=manipulator.parents[0].unit_cell,
+        gb_thickness=10.0,
+        type_dict={"Ni": 1},
+    )
+    assert np.array_equal(reloaded.parents[0].grain_labels, labels)
+    assert np.array_equal(reloaded.parents[0].initial_atom_ids, mapping.atom_ids)
+
+
+@pytest.mark.parametrize("defect", ["missing", "duplicate", "renumber", "species", "box"])
+def test_candidate_reload_rejects_contract_violations(tmp_path, defect):
+    manipulator, atoms, labels, box = _owned_single_species_manipulator(tmp_path)
+    mapping = CandidateFileMapping.from_candidate(
+        atoms,
+        labels,
+        box_dims=box,
+        gb_plane_x=5.0,
+        inplane_periodic=(True, True),
+        right_grain_x_bounds=(5.0, 10.0),
+        coordinate_tolerance=1.0e-8,
+        periodic_outer_x_interface=True,
+    )
+    output_atoms = atoms.copy()
+    output_ids = mapping.atom_ids.copy()
+    output_box = box.copy()
+    declared_types = 1
+    if defect == "missing":
+        output_atoms = output_atoms[:-1]
+        output_ids = output_ids[:-1]
+    elif defect == "duplicate":
+        output_ids[-1] = output_ids[0]
+    elif defect == "renumber":
+        output_ids[-1] = 999
+    elif defect == "species":
+        output_atoms[0]["name"] = "Cu"
+        declared_types = 2
+    elif defect == "box":
+        output_box[0, 1] += 0.5
+    returned = tmp_path / f"bad_{defect}.data"
+    _write_named_lammps_data(
+        returned,
+        output_atoms,
+        output_box,
+        ids=output_ids,
+        declared_types=declared_types,
+    )
+    with pytest.raises((GrainOwnershipError, ParentValueError, ValueError)):
+        reload_explicit_manipulator(
+            returned,
+            candidate_mapping=mapping,
+            unit_cell=manipulator.parents[0].unit_cell,
+            gb_thickness=10.0,
+            type_dict={"Ni": 1, "Cu": 2},
+        )
+
+
+def _write_two_frame_dump(
+    path,
+    atoms,
+    box,
+    *,
+    first_header="id typelabel x y z",
+    first_bounds_header="pp pp pp",
+):
+    with open(path, "w", encoding="utf-8", newline="\n") as stream:
+        for timestep, shift in ((0, 0.0), (1, 1.0)):
+            stream.write("ITEM: TIMESTEP\n")
+            stream.write(f"{timestep}\n")
+            stream.write("ITEM: NUMBER OF ATOMS\n")
+            stream.write(f"{len(atoms)}\n")
+            bounds_header = first_bounds_header if timestep == 0 else "pp pp pp"
+            stream.write(f"ITEM: BOX BOUNDS {bounds_header}\n")
+            for lower, upper in box:
+                stream.write(f"{lower} {upper}\n")
+            header = first_header if timestep == 0 else "id typelabel x y z"
+            stream.write(f"ITEM: ATOMS {header}\n")
+            for atom_id, atom in enumerate(atoms, start=1):
+                if "id" not in header.split():
+                    stream.write(
+                        f"{atom['name']} {atom['x'] + shift} {atom['y']} {atom['z']}\n"
+                    )
+                else:
+                    stream.write(
+                        f"{atom_id} {atom['name']} {atom['x'] + shift} "
+                        f"{atom['y']} {atom['z']}\n"
+                    )
+
+
+def test_dump_reader_preserves_first_frame_semantics_without_concatenation(tmp_path):
+    manipulator, atoms, labels, box = _owned_single_species_manipulator(tmp_path)
+    mapping = CandidateFileMapping.from_candidate(
+        atoms,
+        labels,
+        box_dims=box,
+        gb_plane_x=5.0,
+        inplane_periodic=(True, True),
+        right_grain_x_bounds=(5.0, 10.0),
+        coordinate_tolerance=1.0e-8,
+        periodic_outer_x_interface=True,
+    )
+    dump = tmp_path / "two_frames.dump"
+    _write_two_frame_dump(dump, atoms, box)
+    parsed = read_lammps_dump_file(dump)
+    assert parsed.selected_frame == 0
+    assert len(parsed.atoms) == len(atoms)
+    np.testing.assert_allclose(parsed.atoms["x"], atoms["x"])
+    reloaded = reload_explicit_manipulator(
+        dump,
+        candidate_mapping=mapping,
+        unit_cell=manipulator.parents[0].unit_cell,
+        gb_thickness=10.0,
+        type_dict={"Ni": 1},
+    )
+    assert np.array_equal(reloaded.parents[0].grain_labels, labels)
+
+
+def test_malformed_selected_dump_frame_fails_even_when_later_frame_is_valid(tmp_path):
+    _manipulator, atoms, _labels, box = _owned_single_species_manipulator(tmp_path)
+    dump = tmp_path / "bad_first.dump"
+    _write_two_frame_dump(dump, atoms, box, first_header="typelabel x y z")
+    with pytest.raises(ValueError, match="missing atom attribute 'id'"):
+        read_lammps_dump_file(dump)
+
+
+def test_explicit_dump_requires_unambiguous_topology_flags(tmp_path):
+    manipulator, atoms, labels, box = _owned_single_species_manipulator(tmp_path)
+    mapping = CandidateFileMapping.from_candidate(
+        atoms,
+        labels,
+        box_dims=box,
+        gb_plane_x=5.0,
+        inplane_periodic=(True, True),
+        right_grain_x_bounds=(5.0, 10.0),
+        coordinate_tolerance=1.0e-8,
+        periodic_outer_x_interface=True,
+    )
+    dump = tmp_path / "missing_topology.dump"
+    _write_two_frame_dump(dump, atoms, box, first_bounds_header="")
+    with pytest.raises(GrainOwnershipError, match="unambiguous boundary topology"):
+        reload_explicit_manipulator(
+            dump,
+            candidate_mapping=mapping,
+            unit_cell=manipulator.parents[0].unit_cell,
+            gb_thickness=10.0,
+            type_dict={"Ni": 1},
+        )
+
+
+def test_dump_reader_rejects_extra_rows_in_selected_frame(tmp_path):
+    _manipulator, atoms, _labels, box = _owned_single_species_manipulator(tmp_path)
+    dump = tmp_path / "extra_selected_row.dump"
+    _write_two_frame_dump(dump, atoms, box)
+    text = dump.read_text(encoding="utf-8")
+    marker = "ITEM: TIMESTEP\n1\n"
+    extra = f"999 Ni 1.0 1.0 1.0\n{marker}"
+    dump.write_text(text.replace(marker, extra, 1), encoding="utf-8")
+    with pytest.raises(ValueError, match="unexpected content"):
+        read_lammps_dump_file(dump)
+
+
+def test_candidate_reload_rejects_per_id_species_swap_with_same_aggregate_counts(tmp_path):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("rocksalt", 3.0, ("Na", "Cl"))
+    atoms = np.asarray(
+        [
+            ("Na", 2.0, 1.0, 1.0),
+            ("Cl", 3.0, 2.0, 2.0),
+            ("Na", 6.0, 3.0, 3.0),
+            ("Cl", 7.0, 4.0, 4.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    labels = np.asarray([0, 0, 1, 1], dtype=np.int8)
+    box = np.asarray([[0.0, 10.0], [0.0, 10.0], [0.0, 10.0]])
+    mapping = CandidateFileMapping.from_candidate(
+        atoms,
+        labels,
+        box_dims=box,
+        gb_plane_x=5.0,
+        inplane_periodic=(True, True),
+        right_grain_x_bounds=(5.0, 10.0),
+        coordinate_tolerance=1.0e-8,
+        periodic_outer_x_interface=True,
+    )
+    swapped = atoms.copy()
+    swapped[0]["name"], swapped[1]["name"] = "Cl", "Na"
+    output = tmp_path / "species_swap.data"
+    _write_named_lammps_data(output, swapped, box, declared_types=2)
+    assert sorted(swapped["name"].tolist()) == sorted(atoms["name"].tolist())
+    with pytest.raises(GrainOwnershipError, match="changed species"):
+        reload_explicit_manipulator(
+            output,
+            candidate_mapping=mapping,
+            unit_cell=unit_cell,
+            gb_thickness=6.0,
+            type_dict={"Na": 1, "Cl": 2},
+        )
+
+
+def test_candidate_reload_rejects_changed_dump_topology(tmp_path):
+    manipulator, atoms, labels, box = _owned_single_species_manipulator(tmp_path)
+    mapping = CandidateFileMapping.from_candidate(
+        atoms,
+        labels,
+        box_dims=box,
+        gb_plane_x=5.0,
+        inplane_periodic=(True, True),
+        right_grain_x_bounds=(5.0, 10.0),
+        coordinate_tolerance=1.0e-8,
+        periodic_outer_x_interface=True,
+    )
+    dump = tmp_path / "changed_topology.dump"
+    with open(dump, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write("ITEM: TIMESTEP\n0\n")
+        stream.write(f"ITEM: NUMBER OF ATOMS\n{len(atoms)}\n")
+        stream.write("ITEM: BOX BOUNDS ff pp pp\n")
+        for lower, upper in box:
+            stream.write(f"{lower} {upper}\n")
+        stream.write("ITEM: ATOMS id typelabel x y z\n")
+        for atom_id, atom in enumerate(atoms, start=1):
+            stream.write(
+                f"{atom_id} {atom['name']} {atom['x']} {atom['y']} {atom['z']}\n"
+            )
+    with pytest.raises(GrainOwnershipError, match="changed boundary topology"):
+        reload_explicit_manipulator(
+            dump,
+            candidate_mapping=mapping,
+            unit_cell=manipulator.parents[0].unit_cell,
+            gb_thickness=10.0,
+            type_dict={"Ni": 1},
+        )
+
+
+def test_row_changing_mutation_gets_fresh_ids_and_copy_is_defensive(tmp_path):
+    manipulator, _atoms, _labels, box = _owned_single_species_manipulator(tmp_path)
+
+    class FixedChoice:
+        def choice(self, choices, size=None, replace=False, p=None):
+            selected = np.asarray(choices)[0]
+            return selected if size is None else np.asarray([selected])
+
+    manipulator.rng = FixedChoice()
+    child = manipulator.remove_atoms(num_to_remove=1, keep_ratio=False)
+    mapping = CandidateFileMapping.from_candidate(
+        child,
+        manipulator.candidate_grain_labels,
+        box_dims=box,
+        gb_plane_x=5.0,
+        inplane_periodic=(True, True),
+        right_grain_x_bounds=(5.0, 10.0),
+        coordinate_tolerance=1.0,
+        periodic_outer_x_interface=True,
+    )
+    assert np.array_equal(mapping.atom_ids, np.arange(1, len(child) + 1))
+    assert len(mapping.atom_ids) != len(manipulator.parents[0].initial_atom_ids)
+    copied = copy.deepcopy(manipulator)
+    copied_labels = copied.candidate_grain_labels
+    with pytest.raises(ValueError):
+        copied_labels[0] = 1 - copied_labels[0]
+    assert np.array_equal(copied.candidate_grain_labels, manipulator.candidate_grain_labels)
