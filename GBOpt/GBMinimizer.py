@@ -316,9 +316,10 @@ class GeneticAlgorithmMinimizer:
             box_dims=parent.box_dims,
             gb_plane_x=parent.gb_plane_x,
             inplane_periodic=parent.inplane_periodic,
+            left_grain_x_bounds=parent.left_grain_x_bounds,
             right_grain_x_bounds=parent.right_grain_x_bounds,
             coordinate_tolerance=parent.coordinate_tolerance,
-            periodic_outer_x_interface=parent.periodic_outer_x_interface,
+            normal_topology=parent.normal_topology,
         )
 
     def _reload_owned_mapping(

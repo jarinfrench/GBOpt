@@ -15,6 +15,10 @@ from typing import TYPE_CHECKING, Any, Mapping
 import numpy as np
 
 from GBOpt.Atom import Atom
+from GBOpt.BoundaryTopology import (
+    BoundaryNormalTopology,
+    normalize_boundary_normal_topology,
+)
 
 if TYPE_CHECKING:
     from GBOpt.GBManipulator import GBManipulator
@@ -72,19 +76,22 @@ def _normalize_type_mapping(type_dict: Mapping[object, object] | None) -> dict[i
 
 @dataclass(frozen=True, slots=True, init=False)
 class GrainOwnership:
-    """Immutable left/right labels and the topology needed by a file-backed Parent.
+    """Immutable left/right labels and geometry for a file-backed Parent.
 
-    ``atom_ids`` are initial serialization identifiers used only for row alignment.
-    The persistent state is ``labels`` aligned with the in-memory atom rows.
+    ``atom_ids`` are transient serialization identifiers used only for row
+    alignment. Persistent grain identity is represented by ``labels``. The
+    physical grain bounds may be separated by an empty interval containing
+    ``gb_plane_x``.
     """
 
     _atom_ids: np.ndarray
     _labels: np.ndarray
     gb_plane_x: float
     inplane_periodic: tuple[bool, bool]
+    _left_grain_x_bounds: np.ndarray | None
     _right_grain_x_bounds: np.ndarray
     coordinate_tolerance: float
-    periodic_outer_x_interface: bool
+    _normal_topology: BoundaryNormalTopology
 
     def __init__(
         self,
@@ -95,7 +102,9 @@ class GrainOwnership:
         inplane_periodic: tuple[bool, bool],
         right_grain_x_bounds: np.ndarray | tuple[float, float],
         coordinate_tolerance: float,
-        periodic_outer_x_interface: bool,
+        periodic_outer_x_interface: bool | None = None,
+        left_grain_x_bounds: np.ndarray | tuple[float, float] | None = None,
+        normal_topology: BoundaryNormalTopology | str | None = None,
     ) -> None:
         raw_ids = np.asarray(atom_ids)
         raw_labels = np.asarray(labels)
@@ -120,19 +129,45 @@ class GrainOwnership:
 
         plane = float(gb_plane_x)
         tolerance = float(coordinate_tolerance)
-        bounds = np.asarray(right_grain_x_bounds, dtype=float)
+        right_bounds = np.asarray(right_grain_x_bounds, dtype=float)
         if not np.isfinite(plane):
             raise GrainOwnershipError("gb_plane_x must be finite")
-        if bounds.shape != (2,) or not np.all(np.isfinite(bounds)):
+        if right_bounds.shape != (2,) or not np.all(np.isfinite(right_bounds)):
             raise GrainOwnershipError("right_grain_x_bounds must contain two finite values")
-        if bounds[0] >= bounds[1]:
+        if right_bounds[0] >= right_bounds[1]:
             raise GrainOwnershipError("right_grain_x_bounds must be strictly ordered")
         if not np.isfinite(tolerance) or tolerance <= 0.0:
             raise GrainOwnershipError("coordinate_tolerance must be finite and positive")
-        if not np.isclose(bounds[0], plane, atol=tolerance, rtol=0.0):
-            raise GrainOwnershipError("right-grain lower bound must equal gb_plane_x")
+        if right_bounds[0] < plane - tolerance:
+            raise GrainOwnershipError(
+                "right-grain lower bound must be on or to the right of gb_plane_x"
+            )
         if len(inplane_periodic) != 2:
             raise GrainOwnershipError("inplane_periodic must contain y and z flags")
+
+        normalized_left: np.ndarray | None
+        if left_grain_x_bounds is None:
+            normalized_left = None
+        else:
+            normalized_left = np.asarray(left_grain_x_bounds, dtype=float)
+            if normalized_left.shape != (2,) or not np.all(np.isfinite(normalized_left)):
+                raise GrainOwnershipError(
+                    "left_grain_x_bounds must contain two finite values"
+                )
+            if normalized_left[0] >= normalized_left[1]:
+                raise GrainOwnershipError("left_grain_x_bounds must be strictly ordered")
+            if normalized_left[1] > plane + tolerance:
+                raise GrainOwnershipError(
+                    "left-grain upper bound must be on or to the left of gb_plane_x"
+                )
+
+        try:
+            topology = normalize_boundary_normal_topology(
+                normal_topology,
+                periodic_outer_x_interface=periodic_outer_x_interface,
+            )
+        except ValueError as exc:
+            raise GrainOwnershipError(str(exc)) from exc
 
         object.__setattr__(self, "_atom_ids", _readonly_copy(normalized_ids))
         object.__setattr__(self, "_labels", _readonly_copy(normalized_labels))
@@ -140,10 +175,35 @@ class GrainOwnership:
         object.__setattr__(
             self, "inplane_periodic", tuple(bool(value) for value in inplane_periodic)
         )
-        object.__setattr__(self, "_right_grain_x_bounds", _readonly_copy(bounds))
-        object.__setattr__(self, "coordinate_tolerance", tolerance)
         object.__setattr__(
-            self, "periodic_outer_x_interface", bool(periodic_outer_x_interface)
+            self,
+            "_left_grain_x_bounds",
+            None if normalized_left is None else _readonly_copy(normalized_left),
+        )
+        object.__setattr__(self, "_right_grain_x_bounds", _readonly_copy(right_bounds))
+        object.__setattr__(self, "coordinate_tolerance", tolerance)
+        object.__setattr__(self, "_normal_topology", topology)
+
+    @classmethod
+    def from_interface_candidate(
+        cls,
+        candidate: Any,
+        *,
+        atom_ids: np.ndarray | None = None,
+    ) -> "GrainOwnership":
+        """Build explicit ownership from an InterfaceCandidate-like value object."""
+        atoms = np.asarray(candidate.atoms)
+        if atom_ids is None:
+            atom_ids = np.arange(1, atoms.size + 1, dtype=np.int64)
+        return cls(
+            atom_ids=atom_ids,
+            labels=candidate.grain_labels,
+            gb_plane_x=candidate.gb_plane_x,
+            inplane_periodic=candidate.inplane_periodic,
+            left_grain_x_bounds=candidate.left_grain_x_bounds,
+            right_grain_x_bounds=candidate.right_grain_x_bounds,
+            coordinate_tolerance=candidate.coordinate_tolerance,
+            normal_topology=candidate.normal_topology,
         )
 
     @property
@@ -157,8 +217,22 @@ class GrainOwnership:
         return _readonly_copy(self._labels)
 
     @property
+    def left_grain_x_bounds(self) -> np.ndarray | None:
+        if self._left_grain_x_bounds is None:
+            return None
+        return _readonly_copy(self._left_grain_x_bounds)
+
+    @property
     def right_grain_x_bounds(self) -> np.ndarray:
         return _readonly_copy(self._right_grain_x_bounds)
+
+    @property
+    def normal_topology(self) -> BoundaryNormalTopology:
+        return self._normal_topology
+
+    @property
+    def periodic_outer_x_interface(self) -> bool:
+        return self._normal_topology.periodic_outer_x_interface
 
     def aligned_to(self, atom_ids: np.ndarray) -> "GrainOwnership":
         """Return ownership reordered to the supplied file-row atom IDs."""
@@ -185,9 +259,10 @@ class GrainOwnership:
             labels=ordered_labels,
             gb_plane_x=self.gb_plane_x,
             inplane_periodic=self.inplane_periodic,
+            left_grain_x_bounds=self._left_grain_x_bounds,
             right_grain_x_bounds=self._right_grain_x_bounds,
             coordinate_tolerance=self.coordinate_tolerance,
-            periodic_outer_x_interface=self.periodic_outer_x_interface,
+            normal_topology=self._normal_topology,
         )
 
     def __copy__(self) -> "GrainOwnership":
@@ -196,9 +271,10 @@ class GrainOwnership:
             labels=self._labels,
             gb_plane_x=self.gb_plane_x,
             inplane_periodic=self.inplane_periodic,
+            left_grain_x_bounds=self._left_grain_x_bounds,
             right_grain_x_bounds=self._right_grain_x_bounds,
             coordinate_tolerance=self.coordinate_tolerance,
-            periodic_outer_x_interface=self.periodic_outer_x_interface,
+            normal_topology=self._normal_topology,
         )
 
     def __deepcopy__(self, memo: dict[int, object]) -> "GrainOwnership":
@@ -401,12 +477,7 @@ def read_lammps_data_file(
 
 @dataclass(frozen=True, slots=True, init=False)
 class CandidateFileMapping:
-    """One candidate's transient serialization map and expected topology.
-
-    IDs are always freshly assigned in deterministic row order (1..N). They are
-    valid only for the candidate/evaluator-return round trip represented here.
-    Persistent grain identity remains in ``labels``.
-    """
+    """One candidate's transient serialization map and expected geometry."""
 
     _atom_ids: np.ndarray
     _labels: np.ndarray
@@ -414,9 +485,10 @@ class CandidateFileMapping:
     _box_dims: np.ndarray
     gb_plane_x: float
     inplane_periodic: tuple[bool, bool]
+    _left_grain_x_bounds: np.ndarray
     _right_grain_x_bounds: np.ndarray
     coordinate_tolerance: float
-    periodic_outer_x_interface: bool
+    _normal_topology: BoundaryNormalTopology
 
     def __init__(
         self,
@@ -429,52 +501,69 @@ class CandidateFileMapping:
         inplane_periodic: tuple[bool, bool],
         right_grain_x_bounds: np.ndarray | tuple[float, float],
         coordinate_tolerance: float,
-        periodic_outer_x_interface: bool,
+        periodic_outer_x_interface: bool | None = None,
+        left_grain_x_bounds: np.ndarray | tuple[float, float] | None = None,
+        normal_topology: BoundaryNormalTopology | str | None = None,
     ) -> None:
+        bounds = np.asarray(box_dims, dtype=float)
+        if bounds.shape != (3, 2) or not np.all(np.isfinite(bounds)):
+            raise GrainOwnershipError("candidate box_dims must have shape (3, 2) and be finite")
+        if np.any(bounds[:, 0] >= bounds[:, 1]):
+            raise GrainOwnershipError("candidate box bounds must be strictly ordered")
+        plane = float(gb_plane_x)
+        if not np.isfinite(plane) or not bounds[0, 0] < plane < bounds[0, 1]:
+            raise GrainOwnershipError("candidate gb_plane_x must lie inside the x box")
+        if left_grain_x_bounds is None:
+            left_grain_x_bounds = (float(bounds[0, 0]), plane)
+
         ownership = GrainOwnership(
             atom_ids=atom_ids,
             labels=labels,
-            gb_plane_x=gb_plane_x,
+            gb_plane_x=plane,
             inplane_periodic=inplane_periodic,
+            left_grain_x_bounds=left_grain_x_bounds,
             right_grain_x_bounds=right_grain_x_bounds,
             coordinate_tolerance=coordinate_tolerance,
             periodic_outer_x_interface=periodic_outer_x_interface,
+            normal_topology=normal_topology,
         )
         raw_species = np.asarray(species)
         if raw_species.ndim != 1 or raw_species.size != ownership.atom_ids.size:
             raise GrainOwnershipError(
                 "candidate species length must equal candidate atom ID count"
             )
-        normalized_species = np.asarray([str(value) for value in raw_species.tolist()], dtype="U8")
+        normalized_species = np.asarray(
+            [str(value) for value in raw_species.tolist()], dtype="U8"
+        )
         if np.any(normalized_species == ""):
             raise GrainOwnershipError("candidate species names must be nonempty")
-        bounds = np.asarray(box_dims, dtype=float)
-        if bounds.shape != (3, 2) or not np.all(np.isfinite(bounds)):
-            raise GrainOwnershipError("candidate box_dims must have shape (3, 2) and be finite")
-        if np.any(bounds[:, 0] >= bounds[:, 1]):
-            raise GrainOwnershipError("candidate box bounds must be strictly ordered")
+
         tolerance = ownership.coordinate_tolerance
-        if not bounds[0, 0] < ownership.gb_plane_x < bounds[0, 1]:
-            raise GrainOwnershipError("candidate gb_plane_x must lie inside the x box")
-        grain_bounds = ownership.right_grain_x_bounds
+        left_bounds = ownership.left_grain_x_bounds
+        assert left_bounds is not None
+        right_bounds = ownership.right_grain_x_bounds
         if (
-            grain_bounds[0] < bounds[0, 0] - tolerance
-            or grain_bounds[1] > bounds[0, 1] + tolerance
+            left_bounds[0] < bounds[0, 0] - tolerance
+            or right_bounds[1] > bounds[0, 1] + tolerance
         ):
             raise GrainOwnershipError(
-                "candidate right-grain x bounds must lie inside the candidate box"
+                "candidate physical grain x bounds must lie inside the candidate box"
             )
+        if left_bounds[1] > plane + tolerance or right_bounds[0] < plane - tolerance:
+            raise GrainOwnershipError(
+                "candidate physical grain bounds must not cross gb_plane_x"
+            )
+
         object.__setattr__(self, "_atom_ids", ownership.atom_ids)
         object.__setattr__(self, "_labels", ownership.labels)
         object.__setattr__(self, "_species", _readonly_copy(normalized_species))
         object.__setattr__(self, "_box_dims", _readonly_copy(bounds, dtype=float))
         object.__setattr__(self, "gb_plane_x", ownership.gb_plane_x)
         object.__setattr__(self, "inplane_periodic", ownership.inplane_periodic)
-        object.__setattr__(self, "_right_grain_x_bounds", ownership.right_grain_x_bounds)
+        object.__setattr__(self, "_left_grain_x_bounds", left_bounds)
+        object.__setattr__(self, "_right_grain_x_bounds", right_bounds)
         object.__setattr__(self, "coordinate_tolerance", tolerance)
-        object.__setattr__(
-            self, "periodic_outer_x_interface", ownership.periodic_outer_x_interface
-        )
+        object.__setattr__(self, "_normal_topology", ownership.normal_topology)
 
     @classmethod
     def from_candidate(
@@ -487,15 +576,22 @@ class CandidateFileMapping:
         inplane_periodic: tuple[bool, bool],
         right_grain_x_bounds: np.ndarray | tuple[float, float],
         coordinate_tolerance: float,
-        periodic_outer_x_interface: bool,
+        periodic_outer_x_interface: bool | None = None,
+        left_grain_x_bounds: np.ndarray | tuple[float, float] | None = None,
+        normal_topology: BoundaryNormalTopology | str | None = None,
     ) -> "CandidateFileMapping":
         structured = np.asarray(atoms)
-        if structured.ndim != 1 or structured.dtype.names is None or "name" not in structured.dtype.names:
-            raise GrainOwnershipError("candidate atoms must be a one-dimensional structured atom array")
+        if (
+            structured.ndim != 1
+            or structured.dtype.names is None
+            or "name" not in structured.dtype.names
+        ):
+            raise GrainOwnershipError(
+                "candidate atoms must be a one-dimensional structured atom array"
+            )
         candidate_labels = np.asarray(labels)
         if candidate_labels.ndim != 1 or candidate_labels.size != structured.size:
             raise GrainOwnershipError("ownership length must equal candidate atom count")
-        # GBMaker.write_lammps emits this exact fresh deterministic ID sequence.
         atom_ids = np.arange(1, structured.size + 1, dtype=np.int64)
         return cls(
             atom_ids=atom_ids,
@@ -504,9 +600,26 @@ class CandidateFileMapping:
             box_dims=box_dims,
             gb_plane_x=gb_plane_x,
             inplane_periodic=inplane_periodic,
+            left_grain_x_bounds=left_grain_x_bounds,
             right_grain_x_bounds=right_grain_x_bounds,
             coordinate_tolerance=coordinate_tolerance,
             periodic_outer_x_interface=periodic_outer_x_interface,
+            normal_topology=normal_topology,
+        )
+
+    @classmethod
+    def from_interface_candidate(cls, candidate: Any) -> "CandidateFileMapping":
+        """Construct a mapping from an InterfaceCandidate-like value object."""
+        return cls.from_candidate(
+            candidate.atoms,
+            candidate.grain_labels,
+            box_dims=candidate.box_dims,
+            gb_plane_x=candidate.gb_plane_x,
+            inplane_periodic=candidate.inplane_periodic,
+            left_grain_x_bounds=candidate.left_grain_x_bounds,
+            right_grain_x_bounds=candidate.right_grain_x_bounds,
+            coordinate_tolerance=candidate.coordinate_tolerance,
+            normal_topology=candidate.normal_topology,
         )
 
     @property
@@ -526,8 +639,20 @@ class CandidateFileMapping:
         return _readonly_copy(self._box_dims)
 
     @property
+    def left_grain_x_bounds(self) -> np.ndarray:
+        return _readonly_copy(self._left_grain_x_bounds)
+
+    @property
     def right_grain_x_bounds(self) -> np.ndarray:
         return _readonly_copy(self._right_grain_x_bounds)
+
+    @property
+    def normal_topology(self) -> BoundaryNormalTopology:
+        return self._normal_topology
+
+    @property
+    def periodic_outer_x_interface(self) -> bool:
+        return self._normal_topology.periodic_outer_x_interface
 
     @property
     def expected_count(self) -> int:
@@ -539,9 +664,10 @@ class CandidateFileMapping:
             labels=self._labels,
             gb_plane_x=self.gb_plane_x,
             inplane_periodic=self.inplane_periodic,
+            left_grain_x_bounds=self._left_grain_x_bounds,
             right_grain_x_bounds=self._right_grain_x_bounds,
             coordinate_tolerance=self.coordinate_tolerance,
-            periodic_outer_x_interface=self.periodic_outer_x_interface,
+            normal_topology=self._normal_topology,
         )
         return base.aligned_to(file_ids)
 
