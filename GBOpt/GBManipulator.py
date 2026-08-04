@@ -1823,6 +1823,51 @@ class GBManipulator:
             right_dz=right_dz,
         ).atoms
 
+    def make_slab_termination_candidate(
+        self,
+        *,
+        left_phase_shift: float = 0.0,
+        right_phase_shift: float = 0.0,
+        right_dy: float = 0.0,
+        right_dz: float = 0.0,
+    ) -> InterfaceCandidate:
+        """Return a grain-local termination candidate for a free-surface slab.
+
+        Each grain is cycled only through its own physical half-open x interval.
+        Consequently, a grain's GB-facing and free-surface terminations change
+        together while atom population, box geometry, physical grain bounds, and
+        outer vacuum widths remain fixed.
+        """
+        atoms = self._cycle_slab_terminations_atoms(
+            left_phase_shift=left_phase_shift,
+            right_phase_shift=right_phase_shift,
+            right_dy=right_dy,
+            right_dz=right_dz,
+        )
+        labels = self.candidate_grain_labels
+        if labels is None:
+            labels = self.__concatenated_labels(self.__parents[0], len(atoms))
+        return self.__geometry_candidate(atoms, labels)
+
+    # TODO: Independent GB-only termination control that preserves each free-surface
+    # termination is deferred to a later update; this method intentionally cycles the
+    # complete finite grain and therefore couples its GB-facing and surface phases.
+    def cycle_slab_terminations(
+        self,
+        *,
+        left_phase_shift: float = 0.0,
+        right_phase_shift: float = 0.0,
+        right_dy: float = 0.0,
+        right_dz: float = 0.0,
+    ) -> np.ndarray:
+        """Compatibility API returning atoms after grain-local slab cycling."""
+        return self.make_slab_termination_candidate(
+            left_phase_shift=left_phase_shift,
+            right_phase_shift=right_phase_shift,
+            right_dy=right_dy,
+            right_dz=right_dz,
+        ).atoms
+
     def _cycle_grain_terminations_atoms(
         self,
         *,
@@ -1961,6 +2006,196 @@ class GBManipulator:
                 box_dims=box_dims,
                 inplane_periodic=parent.inplane_periodic,
                 tolerance=tolerance,
+            )
+
+        candidate = np.hstack((updated_left_grain, updated_right_grain))
+        labels = getattr(parent, "grain_labels", None)
+        if labels is not None:
+            candidate_labels = np.hstack((
+                labels[labels == LEFT_GRAIN_LABEL],
+                labels[labels == RIGHT_GRAIN_LABEL],
+            ))
+        else:
+            candidate_labels = None
+        self.__set_candidate_labels(candidate_labels, len(candidate))
+        return candidate
+
+    def _cycle_slab_terminations_atoms(
+        self,
+        *,
+        left_phase_shift: float = 0.0,
+        right_phase_shift: float = 0.0,
+        right_dy: float = 0.0,
+        right_dz: float = 0.0,
+    ) -> np.ndarray:
+        """Cycle finite grains through their physical x intervals.
+
+        This operation is restricted to a known single-interface slab. The left
+        grain is wrapped through ``left_grain_x_bounds`` and the right grain through
+        ``right_grain_x_bounds``. It preserves the box, GB plane, physical bounds,
+        vacuum widths, atom population, species, row order within each grain, and
+        ownership labels. Because an entire finite grain is cycled, each grain's
+        GB-facing and free-surface terminations remain physically coupled.
+
+        The optional right-grain y/z displacement follows the same periodic wrapping
+        and nonperiodic rejection rules as :meth:`translate_right_grain`.
+
+        :raises GBManipulatorValueError: If topology, geometry, metadata, or a
+            displacement is unsupported or invalid.
+        :return: Left-grain rows followed by right-grain rows after cycling.
+        """
+        left_phase_shift = _validate_finite_real(
+            "left_phase_shift", left_phase_shift
+        )
+        right_phase_shift = _validate_finite_real(
+            "right_phase_shift", right_phase_shift
+        )
+        right_dy = _validate_finite_real("right_dy", right_dy)
+        right_dz = _validate_finite_real("right_dz", right_dz)
+
+        if not self.__one_parent:
+            raise GBManipulatorValueError(
+                "Slab termination cycling requires exactly one parent."
+            )
+
+        parent = self.__parents[0]
+        topology = self.__parent_topology(parent)
+        if topology is not BoundaryNormalTopology.SINGLE_INTERFACE_SLAB:
+            raise GBManipulatorValueError(
+                "Slab termination cycling requires known single-interface slab "
+                "topology."
+            )
+
+        tolerance = float(getattr(parent, "coordinate_tolerance", 1.0e-10))
+        if not np.isfinite(tolerance) or tolerance <= 0.0:
+            raise GBManipulatorValueError(
+                "The parent coordinate tolerance must be finite and positive."
+            )
+
+        box_dims = np.asarray(parent.box_dims, dtype=float)
+        if box_dims.shape != (3, 2) or not np.all(np.isfinite(box_dims)):
+            raise GBManipulatorValueError(
+                "Slab termination cycling requires finite 3-by-2 box bounds."
+            )
+        if np.any(box_dims[:, 0] >= box_dims[:, 1]):
+            raise GBManipulatorValueError(
+                "Slab termination cycling requires strictly ordered box bounds."
+            )
+
+        box_xlo = float(box_dims[0, 0])
+        box_xhi = float(box_dims[0, 1])
+        plane = float(parent.gb_plane_x)
+        if not np.isfinite(plane) or not box_xlo < plane < box_xhi:
+            raise GBManipulatorValueError(
+                "gb_plane_x must lie strictly inside the x box bounds."
+            )
+
+        left_bounds = np.asarray(
+            getattr(parent, "left_grain_x_bounds", None), dtype=float
+        )
+        right_bounds = np.asarray(
+            getattr(parent, "right_grain_x_bounds", None), dtype=float
+        )
+        for name, bounds in (
+            ("left_grain_x_bounds", left_bounds),
+            ("right_grain_x_bounds", right_bounds),
+        ):
+            if bounds.shape != (2,) or not np.all(np.isfinite(bounds)):
+                raise GBManipulatorValueError(
+                    f"{name} must contain two finite values."
+                )
+            if bounds[0] >= bounds[1]:
+                raise GBManipulatorValueError(
+                    f"{name} must be strictly ordered."
+                )
+
+        if (
+            left_bounds[0] < box_xlo - tolerance
+            or right_bounds[1] > box_xhi + tolerance
+            or left_bounds[1] > plane + tolerance
+            or right_bounds[0] < plane - tolerance
+        ):
+            raise GBManipulatorValueError(
+                "Slab physical grain bounds must lie inside the box and on their "
+                "respective sides of gb_plane_x."
+            )
+        if not np.isclose(
+            left_bounds[1], plane, atol=tolerance, rtol=0.0
+        ) or not np.isclose(
+            right_bounds[0], plane, atol=tolerance, rtol=0.0
+        ):
+            raise GBManipulatorValueError(
+                "Slab termination cycling initially requires contiguous physical "
+                "grain bounds at gb_plane_x."
+            )
+
+        left_vacuum = float(left_bounds[0] - box_xlo)
+        right_vacuum = float(box_xhi - right_bounds[1])
+        if left_vacuum < -tolerance or right_vacuum < -tolerance:
+            raise GBManipulatorValueError(
+                "Slab vacuum widths must be nonnegative."
+            )
+        if left_vacuum <= tolerance and right_vacuum <= tolerance:
+            raise GBManipulatorValueError(
+                "Slab termination cycling requires at least one free-surface/vacuum "
+                "interval."
+            )
+
+        left_x = np.asarray(parent.left_grain["x"], dtype=float)
+        right_x = np.asarray(parent.right_grain["x"], dtype=float)
+        if not np.all(np.isfinite(left_x)) or not np.all(np.isfinite(right_x)):
+            raise GBManipulatorValueError(
+                "Slab termination cycling requires finite grain x coordinates."
+            )
+        if (
+            np.any(left_x < left_bounds[0] - tolerance)
+            or np.any(left_x > left_bounds[1] + tolerance)
+        ):
+            raise GBManipulatorValueError(
+                "Left-grain atoms do not lie inside left_grain_x_bounds."
+            )
+        if (
+            np.any(right_x < right_bounds[0] - tolerance)
+            or np.any(right_x > right_bounds[1] + tolerance)
+        ):
+            raise GBManipulatorValueError(
+                "Right-grain atoms do not lie inside right_grain_x_bounds."
+            )
+
+        updated_left_grain = np.copy(parent.left_grain)
+        updated_right_grain = np.copy(parent.right_grain)
+        updated_left_grain["x"] = _cycle_half_open(
+            updated_left_grain["x"],
+            lower=float(left_bounds[0]),
+            upper=float(left_bounds[1]),
+            shift=left_phase_shift,
+            tolerance=tolerance,
+        )
+        updated_right_grain["x"] = _cycle_half_open(
+            updated_right_grain["x"],
+            lower=float(right_bounds[0]),
+            upper=float(right_bounds[1]),
+            shift=right_phase_shift,
+            tolerance=tolerance,
+        )
+        if right_dy != 0.0 or right_dz != 0.0:
+            updated_right_grain = _translate_inplane(
+                updated_right_grain,
+                dy=right_dy,
+                dz=right_dz,
+                box_dims=box_dims,
+                inplane_periodic=parent.inplane_periodic,
+                tolerance=tolerance,
+            )
+
+        if (
+            np.any(updated_left_grain["x"] < left_bounds[0])
+            or np.any(updated_left_grain["x"] >= left_bounds[1])
+            or np.any(updated_right_grain["x"] < right_bounds[0])
+            or np.any(updated_right_grain["x"] >= right_bounds[1])
+        ):
+            raise GBManipulatorValueError(
+                "Grain-local cycling produced atoms outside the physical grain bounds."
             )
 
         candidate = np.hstack((updated_left_grain, updated_right_grain))
