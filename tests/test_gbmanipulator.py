@@ -953,10 +953,59 @@ def _translation_only_manipulator(*, periodic=(True, True)):
         box_dims=np.array([[-2.0, 8.0], [10.0, 20.0], [-5.0, 5.0]]),
         gb_plane_x=3.0,
         inplane_periodic=periodic,
+        coordinate_tolerance=1.0e-10,
+        right_grain_x_bounds=np.array([3.0, 8.0]),
+        periodic_outer_x_interface=True,
+        grain_labels=None,
     )
     manipulator = object.__new__(GBManipulator)
     manipulator._GBManipulator__one_parent = True
     manipulator._GBManipulator__parents = [parent, None]
+    return manipulator, parent
+
+
+def _termination_only_manipulator(*, periodic=(True, True), tolerance=1.0e-10):
+    """Return a deterministic periodic bicrystal with extra structured fields."""
+    dtype = np.dtype(
+        [
+            ("name", "U2"),
+            ("x", float),
+            ("y", float),
+            ("z", float),
+            ("site_id", np.int64),
+        ]
+    )
+    left = np.array(
+        [
+            ("U", -2.0, 12.0, -4.0, 10),
+            ("O", 2.5, 15.0, 0.0, 11),
+        ],
+        dtype=dtype,
+    )
+    right = np.array(
+        [
+            ("O", 3.0, 19.0, 4.0, 20),
+            ("U", 7.5, 11.0, -4.0, 21),
+        ],
+        dtype=dtype,
+    )
+    parent = SimpleNamespace(
+        left_grain=left,
+        right_grain=right,
+        whole_system=np.hstack((left, right)),
+        box_dims=np.array([[-2.0, 8.0], [10.0, 20.0], [-5.0, 5.0]]),
+        gb_plane_x=3.0,
+        inplane_periodic=periodic,
+        coordinate_tolerance=tolerance,
+        right_grain_x_bounds=np.array([3.0, 8.0]),
+        periodic_outer_x_interface=True,
+        grain_labels=None,
+    )
+    manipulator = object.__new__(GBManipulator)
+    manipulator._GBManipulator__one_parent = True
+    manipulator._GBManipulator__parents = [parent, None]
+    manipulator._GBManipulator__rng = np.random.default_rng(7)
+    manipulator._GBManipulator__candidate_grain_labels = None
     return manipulator, parent
 
 
@@ -1072,6 +1121,283 @@ def test_translate_right_grain_rejects_crossing_vacuum_side_of_grain_slab():
 
     with pytest.raises(GBManipulatorValueError, match=r"\[3.0, 7.0\)"):
         manipulator.translate_right_grain(0.0, 0.0, dx=1.0)
+
+
+def test_cycle_grain_terminations_zero_operation_is_exact_and_nonmutating():
+    manipulator, parent = _termination_only_manipulator()
+    left_before = parent.left_grain.copy()
+    right_before = parent.right_grain.copy()
+    whole_before = parent.whole_system.copy()
+    box_before = parent.box_dims.copy()
+    rng_before = copy.deepcopy(manipulator.rng.bit_generator.state)
+
+    cycled = manipulator.cycle_grain_terminations()
+
+    assert np.array_equal(cycled, whole_before)
+    assert np.array_equal(parent.left_grain, left_before)
+    assert np.array_equal(parent.right_grain, right_before)
+    assert np.array_equal(parent.whole_system, whole_before)
+    assert np.array_equal(parent.box_dims, box_before)
+    assert parent.gb_plane_x == 3.0
+    assert manipulator.rng.bit_generator.state == rng_before
+
+
+def test_cycle_grain_terminations_applies_independent_grain_phase_shifts():
+    manipulator, parent = _termination_only_manipulator()
+
+    cycled = manipulator.cycle_grain_terminations(
+        left_phase_shift=0.5,
+        right_phase_shift=1.5,
+    )
+    left = cycled[:len(parent.left_grain)]
+    right = cycled[len(parent.left_grain):]
+
+    assert np.allclose(left["x"], [-1.5, -2.0])
+    assert np.allclose(right["x"], [4.5, 4.0])
+    assert np.array_equal(left["y"], parent.left_grain["y"])
+    assert np.array_equal(right["y"], parent.right_grain["y"])
+    assert np.array_equal(cycled["site_id"], parent.whole_system["site_id"])
+    assert np.array_equal(cycled["name"], parent.whole_system["name"])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "changed_grain"),
+    [
+        ({"left_phase_shift": 0.5}, "left"),
+        ({"right_phase_shift": 0.5}, "right"),
+    ],
+)
+def test_cycle_grain_terminations_can_shift_only_one_grain(kwargs, changed_grain):
+    manipulator, parent = _termination_only_manipulator()
+
+    cycled = manipulator.cycle_grain_terminations(**kwargs)
+    left = cycled[:len(parent.left_grain)]
+    right = cycled[len(parent.left_grain):]
+
+    if changed_grain == "left":
+        assert not np.array_equal(left["x"], parent.left_grain["x"])
+        assert np.array_equal(right, parent.right_grain)
+    else:
+        assert np.array_equal(left, parent.left_grain)
+        assert not np.array_equal(right["x"], parent.right_grain["x"])
+
+
+def test_cycle_grain_terminations_near_zero_phase_preserves_x_exactly():
+    manipulator, parent = _termination_only_manipulator(tolerance=1.0e-6)
+
+    cycled = manipulator.cycle_grain_terminations(
+        left_phase_shift=5.0 + 0.5e-6,
+        right_phase_shift=-0.5e-6,
+    )
+
+    assert np.array_equal(cycled, parent.whole_system)
+
+
+@pytest.mark.parametrize(
+    ("left_shift", "right_shift"),
+    [
+        (0.5, 1.5),
+        (5.5, 6.5),
+        (-4.5, -3.5),
+    ],
+)
+def test_cycle_grain_terminations_is_deterministic_modulo_each_slab_width(
+    left_shift,
+    right_shift,
+):
+    manipulator, _ = _termination_only_manipulator()
+    expected = manipulator.cycle_grain_terminations(
+        left_phase_shift=0.5,
+        right_phase_shift=1.5,
+    )
+
+    actual = manipulator.cycle_grain_terminations(
+        left_phase_shift=left_shift,
+        right_phase_shift=right_shift,
+    )
+
+    assert np.array_equal(actual, expected)
+
+
+def test_cycle_grain_terminations_wraps_upper_faces_to_lower_faces():
+    manipulator, parent = _termination_only_manipulator()
+
+    cycled = manipulator.cycle_grain_terminations(
+        left_phase_shift=0.5,
+        right_phase_shift=0.5,
+    )
+    left = cycled[:len(parent.left_grain)]
+    right = cycled[len(parent.left_grain):]
+
+    assert left[1]["x"] == pytest.approx(-2.0)
+    assert right[1]["x"] == pytest.approx(3.0)
+    assert np.all((left["x"] >= -2.0) & (left["x"] < 3.0))
+    assert np.all((right["x"] >= 3.0) & (right["x"] < 8.0))
+
+
+def test_cycle_grain_terminations_combines_right_inplane_registry_shift():
+    manipulator, parent = _termination_only_manipulator()
+
+    cycled = manipulator.cycle_grain_terminations(
+        right_phase_shift=0.5,
+        right_dy=3.0,
+        right_dz=2.0,
+    )
+    right = cycled[len(parent.left_grain):]
+
+    assert np.array_equal(
+        cycled[:len(parent.left_grain)],
+        parent.left_grain,
+    )
+    assert np.allclose(right["x"], [3.5, 3.0])
+    assert np.allclose(right["y"], [12.0, 14.0])
+    assert np.allclose(right["z"], [-4.0, -2.0])
+
+
+@pytest.mark.parametrize(
+    ("argument", "value"),
+    [
+        ("left_phase_shift", np.nan),
+        ("right_phase_shift", np.inf),
+        ("right_dy", True),
+        ("right_dz", "1.0"),
+    ],
+)
+def test_cycle_grain_terminations_rejects_nonfinite_or_nonreal_values(
+    argument,
+    value,
+):
+    manipulator, _ = _termination_only_manipulator()
+
+    with pytest.raises(GBManipulatorValueError, match="finite real"):
+        manipulator.cycle_grain_terminations(**{argument: value})
+
+
+def test_cycle_grain_terminations_rejects_two_parent_manipulator():
+    manipulator, parent = _termination_only_manipulator()
+    manipulator._GBManipulator__one_parent = False
+    manipulator._GBManipulator__parents = [parent, copy.deepcopy(parent)]
+
+    with pytest.raises(GBManipulatorValueError, match="exactly one parent"):
+        manipulator.cycle_grain_terminations()
+
+
+def test_cycle_grain_terminations_rejects_unsupported_outer_x_topology():
+    manipulator, parent = _termination_only_manipulator()
+    parent.periodic_outer_x_interface = False
+
+    with pytest.raises(GBManipulatorValueError, match="periodic outer x"):
+        manipulator.cycle_grain_terminations()
+
+
+@pytest.mark.parametrize("plane", [-2.0, 8.0, 9.0])
+def test_cycle_grain_terminations_rejects_invalid_gb_plane(plane):
+    manipulator, parent = _termination_only_manipulator()
+    parent.gb_plane_x = plane
+
+    with pytest.raises(GBManipulatorValueError, match="strictly inside"):
+        manipulator.cycle_grain_terminations()
+
+
+def test_cycle_grain_terminations_rejects_inconsistent_right_bounds():
+    manipulator, parent = _termination_only_manipulator()
+    parent.right_grain_x_bounds = np.array([3.0, 7.5])
+
+    with pytest.raises(GBManipulatorValueError, match="right_grain_x_bounds"):
+        manipulator.cycle_grain_terminations()
+
+
+@pytest.mark.parametrize("grain", ["left", "right"])
+def test_cycle_grain_terminations_rejects_noncontiguous_grain_geometry(grain):
+    manipulator, parent = _termination_only_manipulator()
+    if grain == "left":
+        parent.left_grain[0]["x"] = 3.5
+        message = "Left-grain atoms"
+    else:
+        parent.right_grain[0]["x"] = 2.5
+        message = "Right-grain atoms"
+
+    with pytest.raises(GBManipulatorValueError, match=message):
+        manipulator.cycle_grain_terminations()
+
+
+def test_cycle_grain_terminations_accepts_geometric_tolerance_envelope():
+    manipulator, parent = _termination_only_manipulator(tolerance=0.1)
+    parent.left_grain[-1]["x"] = 3.05
+    parent.right_grain[0]["x"] = 2.95
+
+    cycled = manipulator.cycle_grain_terminations(
+        left_phase_shift=0.25,
+        right_phase_shift=0.25,
+    )
+    left = cycled[:len(parent.left_grain)]
+    right = cycled[len(parent.left_grain):]
+
+    assert np.all((left["x"] >= -2.0) & (left["x"] < 3.0))
+    assert np.all((right["x"] >= 3.0) & (right["x"] < 8.0))
+
+
+def test_cycle_grain_terminations_preserves_nonperiodic_inplane_rejection():
+    manipulator, _ = _termination_only_manipulator(periodic=(False, True))
+
+    valid = manipulator.cycle_grain_terminations(right_dy=0.5)
+    assert np.allclose(valid[-2:]["y"], [19.5, 11.5])
+
+    with pytest.raises(GBManipulatorValueError, match="nonperiodic half-open y"):
+        manipulator.cycle_grain_terminations(right_dy=2.0)
+
+
+def test_cycle_grain_terminations_rejects_nonfinite_parent_x_coordinates():
+    manipulator, parent = _termination_only_manipulator()
+    parent.right_grain[0]["x"] = np.nan
+
+    with pytest.raises(GBManipulatorValueError, match="finite grain x"):
+        manipulator.cycle_grain_terminations()
+
+
+def test_cycle_grain_terminations_gbmaker_periodic_integration():
+    theta = math.radians(36.869898)
+    gb = GBMaker(
+        a0=1.0,
+        structure="fcc",
+        gb_thickness=2.0,
+        misorientation=[theta, 0.0, 0.0, 0.0, 0.0],
+        atom_types="Cu",
+        repeat_factor=2,
+        interaction_distance=1.0,
+        vacuum=0.0,
+        x_dim_min=10.0,
+    )
+    manipulator = GBManipulator(gb, seed=17)
+    box_before = gb.box_dims.copy()
+    plane_before = gb.gb_plane_x
+    left_count = len(gb.left_grain)
+    right_count = len(gb.right_grain)
+    species_before = np.unique(gb.whole_system["name"], return_counts=True)
+
+    kwargs = dict(
+        left_phase_shift=0.125,
+        right_phase_shift=0.375,
+        right_dy=0.25,
+        right_dz=0.5,
+    )
+    first = manipulator.cycle_grain_terminations(**kwargs)
+    second = manipulator.cycle_grain_terminations(**kwargs)
+    left = first[:left_count]
+    right = first[left_count:]
+
+    assert np.array_equal(first, second)
+    assert len(left) == left_count
+    assert len(right) == right_count
+    assert np.array_equal(np.unique(first["name"], return_counts=True), species_before)
+    assert np.array_equal(gb.box_dims, box_before)
+    assert gb.gb_plane_x == plane_before
+    assert np.all(left["x"] >= gb.box_dims[0, 0])
+    assert np.all(left["x"] < gb.gb_plane_x)
+    assert np.all(right["x"] >= gb.gb_plane_x)
+    assert np.all(right["x"] < gb.box_dims[0, 1])
+    assert not np.array_equal(left["x"], gb.left_grain["x"])
+    assert not np.array_equal(right["x"], gb.right_grain["x"])
 
 
 
@@ -1319,6 +1645,49 @@ def test_explicit_translation_propagates_labels_without_x_reclassification(tmp_p
     assert np.count_nonzero(manipulator.candidate_grain_labels == 1) == 4
     # Left-owned atoms deliberately lie on both sides of the plane.
     assert np.any(translated["x"][expected == 0] > 5.0)
+
+
+def test_explicit_ownership_termination_cycle_preserves_contiguous_labels(tmp_path):
+    coordinates = [
+        ("Ni", 1.0, 1.0, 1.0),
+        ("Ni", 2.0, 2.0, 2.0),
+        ("Ni", 3.0, 3.0, 3.0),
+        ("Ni", 4.5, 4.0, 4.0),
+        ("Ni", 5.0, 5.0, 5.0),
+        ("Ni", 6.0, 6.0, 6.0),
+        ("Ni", 7.0, 7.0, 7.0),
+        ("Ni", 9.5, 8.0, 8.0),
+    ]
+    manipulator, atoms, labels, box = _owned_single_species_manipulator(
+        tmp_path,
+        suffix="termination",
+        coordinates=coordinates,
+    )
+
+    cycled = manipulator.cycle_grain_terminations(
+        left_phase_shift=0.75,
+        right_phase_shift=0.5,
+        right_dy=0.25,
+        right_dz=0.5,
+    )
+    expected_labels = np.hstack((labels[labels == 0], labels[labels == 1]))
+    left = cycled[:4]
+    right = cycled[4:]
+
+    assert len(cycled) == len(atoms)
+    assert np.array_equal(manipulator.candidate_grain_labels, expected_labels)
+    assert np.array_equal(cycled["name"], atoms["name"])
+    assert np.all((left["x"] >= box[0, 0]) & (left["x"] < 5.0))
+    assert np.all((right["x"] >= 5.0) & (right["x"] < box[0, 1]))
+
+
+def test_explicit_noncontiguous_parent_loads_but_termination_cycle_rejects(tmp_path):
+    manipulator, atoms, labels, _box = _owned_single_species_manipulator(tmp_path)
+
+    assert len(manipulator.parents[0].whole_system) == len(atoms)
+    assert np.array_equal(manipulator.parents[0].grain_labels, labels)
+    with pytest.raises(GBManipulatorValueError, match="Left-grain atoms"):
+        manipulator.cycle_grain_terminations()
 
 
 def test_explicit_removal_deletes_labels_at_exact_selected_indices(tmp_path):
