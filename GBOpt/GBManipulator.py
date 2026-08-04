@@ -43,6 +43,86 @@ class GBManipulatorValueError(GBManipulatorError):
     pass
 
 
+def _validate_finite_real(name: str, value: object) -> float:
+    """Return ``value`` as a finite float or raise a manipulator value error."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise GBManipulatorValueError(f"{name} must be a finite real value.")
+    normalized = float(value)
+    if not np.isfinite(normalized):
+        raise GBManipulatorValueError(f"{name} must be a finite real value.")
+    return normalized
+
+
+def _translate_inplane(
+    atoms: np.ndarray,
+    *,
+    dy: float,
+    dz: float,
+    box_dims: np.ndarray,
+    inplane_periodic: tuple[bool, bool],
+    tolerance: float,
+) -> np.ndarray:
+    """Return a copy of ``atoms`` translated under the established y/z rules."""
+    updated = np.copy(atoms)
+    for axis_name, displacement, is_periodic in zip(
+        ("y", "z"),
+        (dy, dz),
+        inplane_periodic,
+    ):
+        axis_index = 1 if axis_name == "y" else 2
+        lower = float(box_dims[axis_index, 0])
+        upper = float(box_dims[axis_index, 1])
+        period = upper - lower
+        if not np.isfinite(lower) or not np.isfinite(upper) or period <= 0.0:
+            raise GBManipulatorValueError(
+                f"The {axis_name} box interval must be finite and have positive width."
+            )
+
+        translated = updated[axis_name] + displacement
+        if is_periodic:
+            updated[axis_name] = np.mod(translated - lower, period) + lower
+            continue
+
+        if (
+            np.any(translated < lower - tolerance)
+            or np.any(translated >= upper)
+        ):
+            raise GBManipulatorValueError(
+                f"d{axis_name} moves one or more right-grain atoms outside "
+                f"the nonperiodic half-open {axis_name} interval "
+                f"[{lower}, {upper})."
+            )
+        updated[axis_name] = translated
+    return updated
+
+
+def _cycle_half_open(
+    values: np.ndarray,
+    *,
+    lower: float,
+    upper: float,
+    shift: float,
+    tolerance: float,
+) -> np.ndarray:
+    """Cycle coordinates through ``[lower, upper)`` without changing population."""
+    width = upper - lower
+    if not np.isfinite(lower) or not np.isfinite(upper) or width <= 0.0:
+        raise GBManipulatorValueError(
+            "A termination-cycling slab must be finite and have positive width."
+        )
+
+    canonical_shift = float(np.mod(shift, width))
+    if (
+        np.isclose(canonical_shift, 0.0, atol=tolerance, rtol=0.0)
+        or np.isclose(canonical_shift, width, atol=tolerance, rtol=0.0)
+    ):
+        return np.copy(values)
+
+    wrapped = lower + np.mod(values + canonical_shift - lower, width)
+    wrapped[np.isclose(wrapped, upper, atol=tolerance, rtol=0.0)] = lower
+    return wrapped
+
+
 class ParentError(Exception):
     """Base class for exceptions in the Parent class."""
     pass
@@ -1231,20 +1311,9 @@ class GBManipulator:
             or would move a right-grain atom outside a supported axis interval.
         :return: Atom positions after translation of the right grain.
         """
-        displacements = {"dx": dx, "dy": dy, "dz": dz}
-        for name, value in displacements.items():
-            if isinstance(value, bool) or not isinstance(value, Real):
-                raise GBManipulatorValueError(
-                    f"{name} must be a finite real value."
-                )
-            if not np.isfinite(value):
-                raise GBManipulatorValueError(
-                    f"{name} must be a finite real value."
-                )
-
-        dx = float(dx)
-        dy = float(dy)
-        dz = float(dz)
+        dx = _validate_finite_real("dx", dx)
+        dy = _validate_finite_real("dy", dy)
+        dz = _validate_finite_real("dz", dz)
 
         if not self.__one_parent:
             warnings.warn("Grain translation only occurring based on parent 1.")
@@ -1273,34 +1342,168 @@ class GBManipulator:
             )
         updated_right_grain["x"] = translated_x
 
-        for axis_name, displacement, is_periodic in zip(
-            ("y", "z"),
-            (dy, dz),
-            parent.inplane_periodic,
-        ):
-            axis_index = 1 if axis_name == "y" else 2
-            lower = float(parent.box_dims[axis_index, 0])
-            upper = float(parent.box_dims[axis_index, 1])
-            period = upper - lower
-            translated = updated_right_grain[axis_name] + displacement
-
-            if is_periodic:
-                updated_right_grain[axis_name] = (
-                    np.mod(translated - lower, period) + lower
-                )
-            else:
-                if (
-                    np.any(translated < lower - tolerance)
-                    or np.any(translated >= upper)
-                ):
-                    raise GBManipulatorValueError(
-                        f"d{axis_name} moves one or more right-grain atoms outside "
-                        f"the nonperiodic half-open {axis_name} interval "
-                        f"[{lower}, {upper})."
-                    )
-                updated_right_grain[axis_name] = translated
+        updated_right_grain = _translate_inplane(
+            updated_right_grain,
+            dy=dy,
+            dz=dz,
+            box_dims=parent.box_dims,
+            inplane_periodic=parent.inplane_periodic,
+            tolerance=tolerance,
+        )
 
         candidate = np.hstack((self.__parents[0].left_grain, updated_right_grain))
+        labels = getattr(parent, "grain_labels", None)
+        if labels is not None:
+            candidate_labels = np.hstack((
+                labels[labels == LEFT_GRAIN_LABEL],
+                labels[labels == RIGHT_GRAIN_LABEL],
+            ))
+        else:
+            candidate_labels = None
+        self.__set_candidate_labels(candidate_labels, len(candidate))
+        return candidate
+
+    def cycle_grain_terminations(
+        self,
+        *,
+        left_phase_shift: float = 0.0,
+        right_phase_shift: float = 0.0,
+        right_dy: float = 0.0,
+        right_dz: float = 0.0,
+    ) -> np.ndarray:
+        """Cycle grain-local x phases in a vacuum-free periodic bicrystal.
+
+        Each grain is wrapped independently through its own half-open x slab:
+        ``[box_xlo, gb_plane_x)`` for the left grain and
+        ``[gb_plane_x, box_xhi)`` for the right grain. This changes both x-facing
+        terminations of each periodic grain while preserving every atom, species,
+        structured-array field, box bound, and the grain-boundary plane. It is not a
+        physical normal separation or gap adjustment.
+
+        The optional right-grain y/z displacement follows exactly the same periodic
+        wrapping and nonperiodic rejection rules as :meth:`translate_right_grain`.
+        The operation is intentionally unsupported for free-surface/vacuum parents,
+        legacy parents with unknown outer-x topology, noncontiguous grain geometry,
+        and two-parent manipulators.
+
+        :param left_phase_shift: Cyclic left-grain x phase shift in angstroms.
+        :param right_phase_shift: Cyclic right-grain x phase shift in angstroms.
+        :param right_dy: Right-grain y displacement in angstroms.
+        :param right_dz: Right-grain z displacement in angstroms.
+        :raises GBManipulatorValueError: If topology, geometry, metadata, or any
+            displacement is unsupported or invalid.
+        :return: Left-grain rows followed by right-grain rows after cycling.
+        """
+        left_phase_shift = _validate_finite_real(
+            "left_phase_shift", left_phase_shift
+        )
+        right_phase_shift = _validate_finite_real(
+            "right_phase_shift", right_phase_shift
+        )
+        right_dy = _validate_finite_real("right_dy", right_dy)
+        right_dz = _validate_finite_real("right_dz", right_dz)
+
+        if not self.__one_parent:
+            raise GBManipulatorValueError(
+                "Termination cycling requires exactly one parent."
+            )
+
+        parent = self.__parents[0]
+        if not bool(getattr(parent, "periodic_outer_x_interface", False)):
+            raise GBManipulatorValueError(
+                "Termination cycling requires a vacuum-free periodic outer x "
+                "interface."
+            )
+
+        tolerance = float(getattr(parent, "coordinate_tolerance", 1.0e-10))
+        if not np.isfinite(tolerance) or tolerance < 0.0:
+            raise GBManipulatorValueError(
+                "The parent coordinate tolerance must be finite and nonnegative."
+            )
+
+        box_dims = np.asarray(parent.box_dims, dtype=float)
+        if box_dims.shape != (3, 2) or not np.all(np.isfinite(box_dims)):
+            raise GBManipulatorValueError(
+                "Termination cycling requires finite 3-by-2 box bounds."
+            )
+        box_xlo = float(box_dims[0, 0])
+        box_xhi = float(box_dims[0, 1])
+        plane = float(parent.gb_plane_x)
+        if not np.isfinite(plane) or not box_xlo < plane < box_xhi:
+            raise GBManipulatorValueError(
+                "gb_plane_x must lie strictly inside the x box bounds."
+            )
+
+        right_bounds = np.asarray(
+            getattr(parent, "right_grain_x_bounds", None),
+            dtype=float,
+        )
+        if right_bounds.shape != (2,) or not np.all(np.isfinite(right_bounds)):
+            raise GBManipulatorValueError(
+                "right_grain_x_bounds must contain two finite values."
+            )
+        expected_right_bounds = np.array([plane, box_xhi], dtype=float)
+        if not np.allclose(
+            right_bounds,
+            expected_right_bounds,
+            atol=tolerance,
+            rtol=0.0,
+        ):
+            raise GBManipulatorValueError(
+                "Periodic termination cycling requires right_grain_x_bounds to "
+                "match [gb_plane_x, box_xhi]."
+            )
+
+        left_x = np.asarray(parent.left_grain["x"], dtype=float)
+        right_x = np.asarray(parent.right_grain["x"], dtype=float)
+        if not np.all(np.isfinite(left_x)) or not np.all(np.isfinite(right_x)):
+            raise GBManipulatorValueError(
+                "Termination cycling requires finite grain x coordinates."
+            )
+        if (
+            np.any(left_x < box_xlo - tolerance)
+            or np.any(left_x > plane + tolerance)
+        ):
+            raise GBManipulatorValueError(
+                "Left-grain atoms do not form the contiguous geometric slab "
+                "required for termination cycling."
+            )
+        if (
+            np.any(right_x < plane - tolerance)
+            or np.any(right_x > box_xhi + tolerance)
+        ):
+            raise GBManipulatorValueError(
+                "Right-grain atoms do not form the contiguous geometric slab "
+                "required for termination cycling."
+            )
+
+        updated_left_grain = np.copy(parent.left_grain)
+        updated_right_grain = np.copy(parent.right_grain)
+        updated_left_grain["x"] = _cycle_half_open(
+            updated_left_grain["x"],
+            lower=box_xlo,
+            upper=plane,
+            shift=left_phase_shift,
+            tolerance=tolerance,
+        )
+        updated_right_grain["x"] = _cycle_half_open(
+            updated_right_grain["x"],
+            lower=plane,
+            upper=box_xhi,
+            shift=right_phase_shift,
+            tolerance=tolerance,
+        )
+        if right_dy != 0.0 or right_dz != 0.0:
+            updated_right_grain = _translate_inplane(
+                updated_right_grain,
+                dy=right_dy,
+                dz=right_dz,
+                box_dims=box_dims,
+                inplane_periodic=parent.inplane_periodic,
+                tolerance=tolerance,
+            )
+
+        candidate = np.hstack((updated_left_grain, updated_right_grain))
         labels = getattr(parent, "grain_labels", None)
         if labels is not None:
             candidate_labels = np.hstack((
