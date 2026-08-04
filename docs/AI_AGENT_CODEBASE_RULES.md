@@ -22,6 +22,21 @@ When two rules appear to conflict, preserve the following priorities in order:
 
 Do not optimize code by weakening an invariant, silently changing a construction mode, deleting required atoms, or replacing exact arithmetic with floating-point approximations.
 
+
+### 1.1 Controlling documentation
+
+Before modifying the repository, agents MUST apply the active documentation in this order:
+
+1. `MASTER_PLAN.md` controls PR scope, prerequisites, branch ancestry, merge order, file-ownership windows, and integration gates.
+2. `architecture.md` and accepted ADRs control system boundaries and cross-cutting domain contracts.
+3. This document controls implementation and review discipline.
+4. `testing.md` controls test-writing conventions and execution policy.
+5. `design/*.md` provides component rationale and detailed acceptance criteria.
+
+Documents under `history/` and `superseded/` are non-authoritative. They MAY be consulted for rationale or prior diagnostics, but MUST NOT be used to override the active roadmap or architecture.
+
+An agent MUST NOT begin work outside the named roadmap PR, silently bypass a prerequisite, or edit a file during another track's exclusive ownership window.
+
 ---
 
 ## 2. Understand the owning layer before editing
@@ -99,6 +114,69 @@ Generation code MUST NOT:
 - Hide a poor starting structure by silently performing an optimization-like repair.
 
 The output of generation should be a physically credible, auditable starting point with a clear path to downstream optimization.
+
+
+### 2.7 Interface-domain layer
+
+The interface-domain layer owns persistent grain and topology state shared by I/O, manipulation, evaluation, and checkpointing.
+
+It SHOULD define narrow immutable contracts such as `GrainOwnership` and `InterfaceCandidate`.
+
+It MUST NOT:
+
+- parse external file syntax;
+- execute calculators;
+- choose optimizer penalties;
+- depend on live minimizer implementations;
+- infer persistent ownership from relaxed coordinates when explicit labels exist.
+
+### 2.8 Structure I/O layer
+
+`GBOpt.io` owns external structure syntax, format-specific options, capability declarations, and transient serialization mappings.
+
+The I/O layer MUST:
+
+- convert external representations to or from neutral structure records;
+- treat external atom IDs as serialization-local identifiers;
+- return explicit write and artifact metadata;
+- validate format contracts deterministically.
+
+It MUST NOT:
+
+- own persistent grain identity;
+- perform optimization or manipulation;
+- submit calculator jobs;
+- infer ownership after an explicit ownership load fails.
+
+### 2.9 Manipulation layer
+
+Individual manipulation operations are the extension point. `GBManipulator` is a compatibility facade and coordinator.
+
+New internal operations MUST:
+
+- declare parent arity;
+- consume complete validated candidate state;
+- return complete candidate children through a uniform result contract;
+- use only the supplied `numpy.random.Generator`;
+- preserve or explicitly update ownership and topology;
+- perform no file I/O or objective evaluation.
+
+### 2.10 Evaluation and optimizer-policy layers
+
+Evaluator adapters own calculator invocation, result normalization, artifact validation, and candidate reconstruction. They return typed evaluation results with retained failure context.
+
+Monte Carlo and genetic algorithms own acceptance, selection, reseeding, convergence, and penalty policy. A penalty MUST NOT be the sole representation of an evaluator failure.
+
+### 2.11 Observability and checkpoint layers
+
+Logging, events, journals, and checkpoints are separate mechanisms.
+
+- typed results and optimizer state are authoritative;
+- events report state transitions;
+- journals retain optional provenance;
+- checkpoints retain restartable state at documented safe boundaries.
+
+A journal MUST NOT be treated as a checkpoint. Checkpoint persistence MUST NOT serialize callbacks, sinks, loggers, open files, scheduler clients, or live calculator processes.
 
 ---
 
@@ -471,7 +549,7 @@ At minimum, an agent SHOULD run:
 3. The non-slow suite when the environment permits:
 
 ```bash
-pytest -m "not slow" tests/*
+pytest -m "not slow"
 ```
 
 An agent MUST report exactly which tests were run and MUST NOT claim tests passed if they were not executed.
@@ -550,13 +628,17 @@ Before editing, an agent MUST inspect:
 
 Do not implement a helper until confirming that an equivalent helper does not already exist.
 
-### 15.2 Make the smallest coherent change
+### 15.2 Follow the roadmap PR boundary
+
+Every implementation change MUST identify its roadmap PR and declared prerequisite. Do not combine work from separate tracks merely because the same file is open. Integration PRs are the only normal exception to the single-layer rule, and their multiple prerequisites must be explicit in `MASTER_PLAN.md`.
+
+### 15.3 Make the smallest coherent change
 
 A change should be large enough to maintain architectural integrity but small enough to review.
 
 Do not combine unrelated cleanup, formatting, renaming, and behavior changes in one patch.
 
-### 15.3 Update all affected surfaces together
+### 15.4 Update all affected surfaces together
 
 A behavior change may require coordinated updates to:
 
@@ -571,11 +653,11 @@ A behavior change may require coordinated updates to:
 
 Do not leave the repository in a state where one layer documents a contract that another layer no longer follows.
 
-### 15.4 Do not duplicate repository code in generated patches
+### 15.5 Do not duplicate repository code in generated patches
 
 When contributing to an existing repository, patch the relevant files. Do not recreate large modules, copy entire subsystems into new files, or introduce parallel implementations.
 
-### 15.5 Keep commits and reports factual
+### 15.6 Keep commits and reports factual
 
 A change summary SHOULD state:
 
@@ -675,6 +757,8 @@ Before declaring a code change complete, verify all applicable items.
 
 ### Architecture
 
+- [ ] The change belongs to the named roadmap PR and its prerequisite has merged or is explicitly stacked.
+- [ ] The change respects the current file-ownership window.
 - [ ] The change is in the owning layer.
 - [ ] No existing helper or subsystem was duplicated.
 - [ ] Clean generation remains separate from optimization.

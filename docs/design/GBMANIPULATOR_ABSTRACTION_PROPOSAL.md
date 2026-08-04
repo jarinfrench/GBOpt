@@ -1,14 +1,23 @@
 # Proposal: GBManipulator Abstraction Layer
 
+## Status and roadmap alignment
+
+**Status:** Active component design.  
+**Implementation authority:** `../MASTER_PLAN.md`.  
+**Prerequisites:** `F2` and `IO4`.  
+**Roadmap mapping:** `MAN1` through `MAN5`.
+
+This document supplies architectural rationale and detailed acceptance criteria. It does not authorize manipulation work before the shared interface-domain state and `Parent.from_structure()` seam have merged.
+
 ## Executive decision
 
 Adopt an **operator-level Strategy abstraction**:
 
 1. Introduce a small abstract base class, `Manipulation`, representing one structural operation.
-2. Keep `GBManipulator` concrete and convert it into a **coordination and compatibility facade** that owns normalized parent views, an RNG context, and a registry of available operations.
+2. Keep `GBManipulator` concrete and convert it into a **coordination and compatibility facade** that owns normalized interface candidates, an RNG context, and a registry of available operations.
 3. Represent each built-in operation as a separate concrete `Manipulation` implementation.
 4. Replace the optimizer's hard-coded string dispatch with configurable operation specifications that can construct and parameterize any registered manipulation.
-5. Place a narrow `StructureView` protocol or adapter between manipulation code and the current `Parent` representation, so this work does not freeze the known interface defects into the new public abstraction.
+5. Use the shared `InterfaceCandidate` contract as the operation state seam, with compatibility adapters at the facade boundary, so file parsing and coordinate-derived ownership do not enter the manipulation API.
 
 This is preferable to making the current `GBManipulator` class itself abstract. The existing class is not one operation; it is simultaneously a parent loader, state holder, random-number owner, geometry-algorithm container, and public facade. Turning that entire object into an ABC would formalize the current coupling rather than remove it.
 
@@ -106,13 +115,13 @@ class ManipulationContext:
 
 @dataclass(frozen=True)
 class ManipulationResult:
-    children: tuple[np.ndarray, ...]
+    children: tuple["InterfaceCandidate", ...]
     operation: str
     parameters: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
-    def child(self) -> np.ndarray:
+    def child(self) -> "InterfaceCandidate":
         if len(self.children) != 1:
             raise ValueError("Result does not contain exactly one child")
         return self.children[0]
@@ -125,11 +134,11 @@ class Manipulation(ABC):
     @abstractmethod
     def apply(
         self,
-        parents: Sequence["StructureView"],
+        parents: Sequence["InterfaceCandidate"],
         *,
         context: ManipulationContext,
     ) -> ManipulationResult:
-        """Return new child structures without mutating the parents."""
+        """Return complete child candidates without mutating the parents."""
 ```
 
 Concrete operations should normally be frozen dataclasses, so their parameters are explicit and serializable:
@@ -150,46 +159,30 @@ class TranslateRightGrain(Manipulation):
 
 This object is both an executable operation and a complete description of what was requested. That makes lineage and reproducibility substantially cleaner than parsing strings such as `shift0.123dy0.456dz`.
 
-### 2. `StructureView`: a narrow state seam
+### 2. `InterfaceCandidate`: the operation state seam
 
-The ABC should not accept `GBMaker` or file paths. It should accept normalized structure views.
+The operation contract must not accept `GBMaker` objects, filenames, or raw atom arrays. It consumes normalized `InterfaceCandidate` objects extracted into the shared interface-domain layer by `F2`.
 
-The first implementation should define a protocol around generic capabilities:
+`InterfaceCandidate` carries the state that raw arrays cannot preserve reliably:
 
-```python
-class StructureView(Protocol):
-    @property
-    def atoms(self) -> np.ndarray: ...
+- atoms and cell or box information;
+- persistent row-aligned grain labels;
+- authoritative interface-plane location;
+- physical grain bounds;
+- in-plane periodicity;
+- boundary-normal topology;
+- coordinate tolerance;
+- accumulated interface-state metadata.
 
-    @property
-    def box(self) -> np.ndarray: ...
+`Parent` remains a compatibility and domain-interpretation object. After `IO4`, the facade may adapt a supported `Parent` into an `InterfaceCandidate`, but individual operations must not parse files or reconstruct ownership from current coordinates.
 
-    @property
-    def periodicity(self) -> tuple[bool, bool, bool]: ...
-
-    @property
-    def unit_cell(self) -> UnitCell: ...
-
-    def region_indices(self, name: str) -> np.ndarray: ...
-
-    def metadata(self, key: str, default: Any = None) -> Any: ...
-```
-
-Recommended initial named regions are:
-
-- `"grain:left"`;
-- `"grain:right"`;
-- `"interface:core"`.
-
-The current `Parent` can be exposed through a `CurrentParentView` adapter. When the interface-fix project produces a stronger state object with explicit grain identity and boundary metadata, that object can implement `StructureView` directly or receive its own adapter.
-
-The protocol should deliberately avoid requiring `gb_plane_x` or an x-contiguous grain partition. Operations that still need those assumptions during migration may request them as temporary metadata and raise a clear capability error when unavailable.
+Operations that require a capability such as a right-grain region, a periodic in-plane axis, or a free outer surface must validate that capability explicitly and raise a typed error when it is unavailable.
 
 ### 3. `GBManipulator`: concrete facade and coordinator
 
 `GBManipulator` remains the public entry point in the first compatibility period. Its responsibilities become:
 
-- normalize input sources into structure views through a source adapter/factory;
+- normalize supported input sources into complete interface candidates through a compatibility adapter;
 - hold an immutable tuple of parents;
 - hold a `ManipulationContext`;
 - validate operation arity;
@@ -256,7 +249,7 @@ class OperationSpec:
     name: str
     weight: float
     parameter_sampler: Callable[
-        [Sequence[StructureView], np.random.Generator],
+        [Sequence[InterfaceCandidate], np.random.Generator],
         Mapping[str, Any],
     ]
 ```
@@ -282,7 +275,7 @@ GBOpt/
 └── manipulation/
     ├── __init__.py
     ├── base.py                   # Manipulation, context, result, errors
-    ├── state.py                  # StructureView and current adapters
+    ├── state.py                  # InterfaceCandidate adapters and capability queries
     ├── registry.py
     ├── specs.py                  # OperationSpec and parameter samplers
     ├── translation.py
@@ -321,124 +314,93 @@ Every concrete operation must satisfy:
 7. **Capability validation.** Missing regions or metadata produce typed errors, not silent fallback guesses.
 8. **Serializable provenance.** Operation name, parameters, and important choices are available in the result metadata.
 9. **Independent children.** Every returned child owns its array storage and does not alias a parent's writable data.
+10. **Complete interface state.** Every child preserves or explicitly updates ownership, topology, interface-plane, physical-bound, and periodicity metadata.
 
 ## Mapping the existing operations
 
-| Existing method | New concrete operation | Arity | Result notes |
+| Existing behavior | New concrete operation | Arity | Result notes |
 |---|---|---:|---|
-| `translate_right_grain` | `TranslateRightGrain` | 1 | One child; requires right-grain region and cell/periodicity information |
-| `slice_and_merge` | `SliceAndMerge` | 2 | One child; validates parent cell, species, and region compatibility |
-| `remove_atoms` | `RemoveAtoms` | 1 | One child; removed atoms go in result metadata rather than changing return type |
-| `insert_atoms` | `InsertAtoms` | 1 | One child; inserted atoms go in result metadata |
-| `displace_along_soft_modes` | `DisplaceAlongSoftModes` | 1 | One or more children using the same result contract |
-| `apply_group_symmetry` | Do not register until implemented | 1 | Avoid advertising an operation whose implementation always raises |
+| `translate_right_grain` | `TranslateRightGrain` | 1 | Complete child; validates right-grain and periodicity capabilities |
+| grain-local termination cycling | grain-local cycling operation | 1 | Preserves persistent ownership while cycling one grain's termination |
+| slab termination cycling | slab cycling operation | 1 | Valid only for supported free-surface topology |
+| interface separation | interface separation operation | 1 | Updates coordinates, physical bounds, and accumulated separation metadata |
+| `remove_atoms` | `RemoveAtoms` | 1 | Complete child; removed rows and ownership changes recorded in metadata |
+| `insert_atoms` | `InsertAtoms` | 1 | Complete child; inserted-atom ownership policy is explicit |
+| `displace_along_soft_modes` | `DisplaceAlongSoftModes` | 1 | One or more complete candidate children |
+| `slice_and_merge` | `SliceAndMerge` | 2 | Complete child with parent compatibility validation and lineage |
+| `apply_group_symmetry` | Do not register until implemented | 1 | An operation that always raises must not be advertised |
 
 Site generation for insertion should be extracted into separate collaborators, for example `DelaunaySiteGenerator` and `GridSiteGenerator`, rather than represented by a string branch inside `InsertAtoms`. This is a second-level strategy seam and permits future user-supplied site-generation algorithms without subclassing the entire insertion operation.
 
-## Interaction with the ongoing interface-fix work
+## Prerequisites and ownership boundary
 
-This project should proceed now, but with a strict boundary:
+This track begins only after the shared interface-domain model and the `Parent` source-adaptation seam exist:
 
-### Safe to implement before interface fixes land
+```text
+F2 -> IO4 -> MAN1
+```
 
-- `Manipulation`, `ManipulationContext`, and `ManipulationResult`;
-- operation arity and registry;
-- RNG centralization;
-- optimizer operation specifications;
-- extraction of algorithms into concrete operation classes;
-- compatibility wrappers in `GBManipulator`;
-- `StructureView` protocol and a temporary adapter over the current `Parent`;
-- tests against current behavior.
+This ordering is mandatory because `GBManipulator.py` is a high-conflict file. The manipulation track must not stabilize file parsing, coordinate-derived grain identity, or temporary ownership adapters as part of the public operation contract.
 
-### Do not stabilize yet
+The operation protocol, registry, result contract, and optimizer specifications may be designed in advance, but production extraction begins under `MAN1` after `IO4` merges.
 
-- x-coordinate reconstruction of grain identity as part of the public ABC;
-- `gb_plane_x` as a required generic interface property;
-- LAMMPS-specific file semantics in manipulation contracts;
-- current assumptions that the interface is centered or that the GB region is a symmetric x window;
-- a permanent serialized representation for manipulation state.
+## Roadmap implementation plan
 
-When the interface-fix state model is available, only the adapter and built-in capability queries should need revision. The operation ABC, result contract, registry, and optimizer integration should remain stable.
+### MAN1 — Core manipulation protocol, registry, and facade seam
 
-## Incremental implementation plan
+- Add `Manipulation`, `ManipulationContext`, `ManipulationResult`, and typed errors.
+- Define children as complete `InterfaceCandidate` objects.
+- Add an explicit registry without import-time global side effects.
+- Add `GBManipulator.apply()` and `apply_named()`.
+- Centralize RNG handling and preserve `seed=0`.
+- Keep all current public methods and return shapes as compatibility wrappers.
+- Prove extensibility with a test-defined operation outside GBOpt source.
 
-### Phase 0 — Characterize and freeze current public behavior
+**Exit criterion:** a custom operation can execute through the facade without modifying GBOpt, while legacy behavior remains unchanged.
 
-- Inventory current constructors, methods, exceptions, warnings, return shapes, and import paths.
-- Add focused characterization tests for every legacy wrapper.
-- Add explicit tests for parent immutability and RNG replay.
-- Decide which existing accidental behaviors are compatibility obligations and which are bugs to correct.
-- Record that `seed=0` must be a valid deterministic seed.
+### MAN2 — Interface translation, termination, and separation
 
-**Exit criterion:** behavior is captured well enough that delegation can be introduced without silently changing existing users.
+Extract the current composable interface transformations:
 
-### Phase 1 — Add the core abstraction without moving algorithms
+- right-grain translation;
+- grain-local termination cycling;
+- slab termination cycling;
+- interface separation.
 
-- Add `manipulation/base.py` with the ABC, context, result, and errors.
-- Add `StructureView` and `CurrentParentView`.
-- Add the registry.
-- Add `GBManipulator.apply` while leaving existing methods untouched.
-- Use an immutable parent tuple internally; retain the existing parent proxy only as a deprecated compatibility layer if tests or users require it.
+Each operation must preserve persistent labels, validate topology, return complete state, and expose structured parameters.
 
-**Exit criterion:** a tiny test-only custom operation can be applied through `GBManipulator` without modifying GBOpt source.
+**Exit criterion:** the current interface methodology is exercised through operation objects and legacy wrappers remain compatible.
 
-### Phase 2 — Extract right-grain translation as the vertical slice
-
-Translation is the best first operation because it is relatively self-contained and already has detailed boundary-condition tests.
-
-- Move the implementation to `TranslateRightGrain.apply`.
-- Make the legacy method a thin wrapper.
-- Confirm all existing translation tests pass unchanged.
-- Add tests through the generic `apply` path and through registry lookup.
-
-**Exit criterion:** one built-in operation uses the entire new path in production code.
-
-### Phase 3 — Extract remaining unary operations
+### MAN3 — Density operations and soft-mode displacement
 
 - Extract insertion and removal.
-- Separate insertion-site generators from atom-selection logic.
-- Move all stochastic calls to `context.rng`.
-- Extract reusable local-order, neighbor, stoichiometry, and soft-mode helpers into focused private modules.
+- Define ownership policy for inserted atoms.
+- Preserve labels for surviving rows after removal.
+- Extract Delaunay and grid site-generation collaborators.
+- Move every stochastic path to `ManipulationContext.rng`.
 - Extract soft-mode displacement and normalize multiple-child results.
-- Remove dead code and unreachable branches only after characterization tests are in place.
 
-**Exit criterion:** all unary operations are concrete `Manipulation` implementations; legacy calls remain compatible.
+**Exit criterion:** all unary built-ins use the common result contract and no global NumPy RNG remains.
 
-### Phase 4 — Extract binary crossover and compatibility validation
+### MAN4 — Binary slice-and-merge
 
-- Implement `SliceAndMerge` with `parent_count = 2`.
-- Validate box, species/type mapping, unit-cell assumptions, and region compatibility before creating a child.
-- Preserve the current x-slice algorithm initially; changing the crossover geometry is a separate scientific enhancement.
+- Implement explicit two-parent arity.
+- Validate cell, species, unit-cell, topology, and region compatibility.
+- Preserve the current scientific crossover algorithm.
+- Return complete child state and structured lineage.
 
-**Exit criterion:** no operation depends on `GBManipulator.__one_parent` or silently ignores an extra parent.
+**Exit criterion:** unary and binary operations share one contract and no operation silently ignores an extra parent.
 
-### Phase 5 — Refactor minimizer dispatch
+### MAN5 — Optimizer `OperationSpec` integration
 
-- Replace `Mutator`'s method-name dictionary and `match` statement with `OperationSpec` objects.
-- Convert legacy `choices: list[str]` into built-in default specs.
-- Let parent arity drive parent selection.
-- Preserve current default GA proportions and mutation parameter distributions as compatibility policy.
-- Store lineage from `ManipulationResult` rather than constructing ad hoc strings.
+- Add immutable operation specifications with weights and parameter samplers.
+- Translate legacy string choices into compatibility specifications.
+- Let operation-declared arity drive parent selection.
+- Remove hard-coded mutation dispatch and the separate GA crossover path.
+- Define multi-child optimizer policy explicitly.
+- Consume structured lineage from `ManipulationResult`.
 
-**Exit criterion:** a custom registered operation can participate in MC and GA without edits to `GBMinimizer.py`.
-
-### Phase 6 — Consolidate source adaptation
-
-- Move `GBMaker`/path normalization behind a `StructureSourceAdapter`.
-- Keep LAMMPS parsing behavior available, but do not expand I/O scope in this project.
-- Add an adapter for the interface-fixed state representation when that work lands.
-- Deprecate direct assumptions that all non-`GBMaker` inputs are file paths.
-
-**Exit criterion:** manipulation code is independent of how the structure entered GBOpt.
-
-### Phase 7 — Public extension documentation and stabilization
-
-- Document a minimal third-party manipulation example.
-- Document arity, result, RNG, immutability, capability, and exception rules.
-- Add API-reference exports from `GBOpt.manipulation`.
-- Establish a deprecation timeline for mutable parent assignment and inconsistent legacy return options.
-
-**Exit criterion:** an external user can implement, register, test, and use a custom operation from both direct and optimizer workflows.
+**Exit criterion:** a third-party operation can participate in MC and GA without edits to optimizer source, while current defaults remain behaviorally equivalent.
 
 ## Testing strategy
 
@@ -449,7 +411,7 @@ Create a reusable test suite that every operation can satisfy where applicable:
 - rejects incorrect parent count;
 - does not mutate parent atoms or metadata;
 - returns `ManipulationResult`;
-- returns correctly typed child arrays;
+- returns complete, validated `InterfaceCandidate` children;
 - provides stable operation name and parameters;
 - reproduces results with the same RNG state;
 - does not use global NumPy RNG;
@@ -499,11 +461,11 @@ This is the most important proof that the abstraction works.
 
 ## Disadvantages and costs
 
-1. **More concepts and files.** The design introduces operation objects, contexts, results, views, specs, and a registry.
+1. **More concepts and files.** The design introduces operation objects, contexts, complete-candidate results, capability queries, specs, and a registry.
 2. **Temporary dual API.** Legacy methods and the generic operation API must coexist until a later deprecation cycle.
 3. **Migration effort.** The current 1,800-line module has intertwined helper functions and tests; extraction must be incremental.
-4. **Result-wrapper friction.** Internal optimizer code and new users must adapt from raw arrays to `ManipulationResult`.
-5. **Capability design requires discipline.** An overly broad `StructureView` would simply recreate `Parent`; an overly narrow one would force repeated type checks and metadata escape hatches.
+4. **Result-wrapper friction.** Internal optimizer code and new users must adapt from raw arrays to complete-candidate `ManipulationResult` objects.
+5. **Capability design requires discipline.** `InterfaceCandidate` must remain a validated domain object rather than becoming an unstructured container for every operation-specific field.
 6. **Plugin discovery is intentionally deferred.** Users can register external operations programmatically, but package-level automatic discovery would be a later feature.
 
 These costs are acceptable because the alternative—adding more methods and more `match` cases—continues to increase coupling and makes the promised extension point ineffective.
@@ -598,7 +560,7 @@ The central design judgment is that **the abstract entity is a manipulation oper
 
 ## Proposed acceptance criteria
 
-The abstraction-layer project is complete when all of the following are true:
+The manipulation track is complete when all of the following are true:
 
 1. A third-party manipulation can be implemented outside the GBOpt package by subclassing `Manipulation`.
 2. It can be applied directly through `GBManipulator.apply` without modifying GBOpt source.
@@ -613,12 +575,12 @@ The abstraction-layer project is complete when all of the following are true:
 
 ## Recommended first implementation slice
 
-Begin with Phases 0 through 2 only:
+Begin with `MAN1` only after `F2` and `IO4` have merged:
 
-- add the core abstraction types and state adapter;
-- add `GBManipulator.apply`;
-- extract `TranslateRightGrain`;
-- preserve the legacy translation method as a wrapper;
+- add the core abstraction types, complete-candidate adapter, registry, and typed errors;
+- add `GBManipulator.apply` and `apply_named`;
+- preserve every existing manipulation method unchanged;
+- centralize RNG construction and verify `seed=0`;
 - add a test-only custom manipulation proving external extensibility.
 
-That slice is small enough to review rigorously, establishes the end-to-end architecture, and avoids entangling the first change with the more complex insertion/removal and soft-mode algorithms.
+Translation extraction begins in `MAN2`, not in `MAN1`. This keeps the first PR focused on the extension seam and compatibility behavior.

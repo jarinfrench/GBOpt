@@ -2,6 +2,13 @@
 
 ## Status and scope
 
+**Status:** Active component design.  
+**Implementation authority:** `../MASTER_PLAN.md`.  
+**Core roadmap mapping:** `F2`, `IO1`, `IO2`, `IO3`, `IO4`, and `IO5`.  
+**Deferred follow-ons:** `OPT-IO1`, `OPT-IO2`, and `OPT-PLUGIN1`.
+
+This document supplies architectural rationale and detailed acceptance criteria. It does not override roadmap prerequisites, merge order, or file-ownership windows.
+
 This document proposes an abstraction layer for **structure input and output** in GBOpt. It is based on:
 
 - the modular architecture and planned file-reader/file-writer extension points described in *GBOpt: Grain boundary structure optimization using Monte Carlo and evolutionary algorithms*;
@@ -23,7 +30,7 @@ This preserves the most important invariant established by the current interface
 
 > LAMMPS atom IDs are transient serialization identifiers used to align a particular file round trip; they are not persistent optimizer-wide atom identities.
 
-The first implementation should extract the existing LAMMPS data and dump handling into the new abstraction without changing externally visible behavior. Once that migration is complete, formats such as XYZ, CIF, VASP, GULP, and Quantum ESPRESSO can be added as adapters rather than by modifying `Parent`, `GBMaker`, or the minimizers.
+The first implementation should extract the existing LAMMPS data and dump handling into the new abstraction without changing externally visible behavior. After the core I/O roadmap is complete, formats such as XYZ and CIF may be added through deferred adapter PRs rather than by modifying `Parent`, `GBMaker`, or the minimizers. Calculator-specific formats and execution workflows require separately approved scope.
 
 ---
 
@@ -613,9 +620,23 @@ This allows GBOpt to benefit from ASE's format coverage without making ASE's obj
 
 ---
 
-## 10. Incremental implementation plan
+## 10. Roadmap implementation map
 
-## Phase 0 — Freeze contracts and invariants
+| Roadmap item | Primary deliverable |
+|---|---|
+| `F2` | extract shared interface-domain state before I/O depends on it |
+| `IO1` | `StructureData`, base reader/writer contracts, capabilities, and LAMMPS data reader |
+| `IO2` | LAMMPS dump reader and explicit frame/coordinate semantics |
+| `IO3` | LAMMPS writer extraction and `WriteResult` |
+| `IO4` | `Parent.from_structure()` and delegated legacy source adaptation |
+| `IO5` | central ownership-aware candidate loader |
+| `OPT-IO1` | sidecars and explicit lossy-write policy, only after core contracts stabilize |
+| `OPT-IO2` | XYZ and CIF adapters |
+| `OPT-PLUGIN1` | third-party entry-point discovery |
+
+`IO2` and `IO3` may proceed from `IO1` according to the dependency graph in `MASTER_PLAN.md`; the numerical phase labels from the original proposal are not an independent implementation sequence.
+
+## Roadmap prerequisite — F2 and contract freeze
 
 Create:
 
@@ -634,7 +655,7 @@ Document the following invariants before moving code:
 
 No existing public behavior should change in this phase.
 
-## Phase 1 — Extract LAMMPS data reading
+## IO1 — Canonical structure model and LAMMPS data reader
 
 - Move or wrap `read_lammps_data_file()` as `LammpsDataReader`.
 - Return `StructureData` while retaining access to the parsed IDs.
@@ -642,14 +663,14 @@ No existing public behavior should change in this phase.
 - Add adapter-level tests independent of `Parent`.
 - Keep the existing function as a compatibility facade during migration.
 
-## Phase 2 — Extract LAMMPS data writing
+## IO3 — LAMMPS data writer and `WriteResult`
 
 - Move the serialization logic from `GBMaker.write_lammps()` into `LammpsDataWriter`.
 - Return a `WriteResult` containing the emitted transient ID mapping.
 - Preserve existing formatting and output behavior unless a change is separately approved.
 - Make `GBMaker.write_lammps()` delegate to the writer.
 
-## Phase 3 — Extract LAMMPS dump reading
+## IO2 — LAMMPS dump reader and frame semantics
 
 Define explicitly:
 
@@ -662,7 +683,7 @@ Define explicitly:
 
 The current strict reader deliberately selects the first frame. That behavior should remain stable during extraction, then be generalized through explicit options rather than changed accidentally.
 
-## Phase 4 — Refactor `Parent`
+## IO4 — `Parent.from_structure()` and legacy source adaptation
 
 - Add `Parent.from_structure()`.
 - Move generic structure validation into that constructor.
@@ -670,7 +691,7 @@ The current strict reader deliberately selects the first frame. That behavior sh
 - Route legacy filename construction through the registry.
 - Remove format-specific parser implementation from `Parent` once compatibility tests pass.
 
-## Phase 5 — Centralize candidate reloads
+## IO5 — Central candidate loader and ownership-aware round trip
 
 - Promote `reload_explicit_manipulator()` into a general candidate-loader service.
 - Make every ownership-aware optimizer reload use it.
@@ -678,7 +699,7 @@ The current strict reader deliberately selects the first frame. That behavior sh
 - Remove direct ownership-aware reconstruction from evaluator-return filenames.
 - Cover serial and batch evaluators with the same contract tests.
 
-## Phase 6 — Formalize metadata persistence
+## Deferred OPT-IO1 — Versioned ownership sidecars and explicit lossy writes
 
 - Define a versioned sidecar schema.
 - Bind metadata to exact structure content.
@@ -686,7 +707,7 @@ The current strict reader deliberately selects the first frame. That behavior sh
 - Validate both before constructing a `Parent`.
 - Make loss policy explicit in writer options.
 
-## Phase 7 — Add common interchange formats
+## Deferred OPT-IO2 — XYZ and CIF adapters
 
 Add XYZ first because its limited metadata capacity exercises the loss policy clearly.
 
@@ -694,7 +715,7 @@ Add CIF after cell and periodicity semantics are stable.
 
 Additional adapters for VASP, GULP, and Quantum ESPRESSO should initially focus on structure representation. Calculator setup, execution, and result extraction should remain separate interfaces.
 
-## Phase 8 — Third-party plugin support
+## Deferred OPT-PLUGIN1 — Third-party entry-point discovery
 
 After the built-in interfaces have stabilized:
 

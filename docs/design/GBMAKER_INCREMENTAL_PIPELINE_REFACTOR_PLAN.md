@@ -2,6 +2,13 @@
 
 ## Document status
 
+**Status:** Active component design.  
+**Implementation authority:** `../MASTER_PLAN.md`.  
+**Roadmap mapping:** `GM1` through `GM8`, with `F0` as the characterization prerequisite.  
+**Cross-track dependency:** `IO3` exclusively owns LAMMPS writer and restricted-triclinic extraction.
+
+This document supplies architectural rationale and detailed acceptance criteria. Its original numerical phases have been mapped to roadmap PR identifiers below and do not define an independent branch sequence.
+
 This document defines an incremental, behavior-preserving refactor of the current
 `GBOpt/GBMaker.py` monolith into a staged construction pipeline. It is a planning
 document only; it does not authorize scientific or behavioral changes unless a phase
@@ -22,7 +29,7 @@ coordinate filtering, bicrystal assembly, mutable object state, and LAMMPS outpu
 When implementation begins, the work must start from the latest accepted project
 baseline, not automatically from this analysis archive. If later exact-path integration
 or gap-equalization-removal changes have been accepted, those changes must be present
-before Phase 0 is repeated.
+before `F0` is repeated.
 
 ---
 
@@ -451,7 +458,7 @@ Each phase should normally be implemented in a separate branch or chat. A phase 
 split further, but later phases should not be pulled forward unless the dependency is
 explicitly understood.
 
-### Phase 0 - Characterization and compatibility freeze
+### Roadmap prerequisite F0 - Characterization and compatibility freeze
 
 #### Objective
 
@@ -501,7 +508,7 @@ manifest.
 
 ---
 
-### Phase 1 - Internal package foundation and shared types
+### GM1 - Internal package foundation and shared construction types
 
 #### Objective
 
@@ -540,7 +547,7 @@ flow.
 
 ---
 
-### Phase 2 - Input normalization and material resolution
+### GM2 - Input normalization and material resolution
 
 #### Objective
 
@@ -577,7 +584,7 @@ Separate public input adaptation from scientific construction.
 
 ---
 
-### Phase 3 - Orientation and periodicity stage
+### GM3 - Orientation and periodicity extraction
 
 #### Objective
 
@@ -626,7 +633,7 @@ Replace the most consequential hidden state mutation with an explicit
 
 ---
 
-### Phase 4 - Commensurability and dimension planning stage
+### GM4 - Commensurability and dimension planning
 
 #### Objective
 
@@ -673,7 +680,7 @@ one explicit `DimensionPlan`.
 
 ---
 
-### Phase 5 - Shared geometry kernels
+### GM5 - Shared geometry kernels
 
 #### Objective
 
@@ -720,7 +727,7 @@ hidden state.
 
 ---
 
-### Phase 6 - Exact and approximate grain builders
+### GM6 - Exact and approximate grain builders
 
 #### Objective
 
@@ -752,11 +759,11 @@ Separate the two construction algorithms behind a common strategy boundary.
 #### Gap-equalization prerequisite
 
 If gap equalization still exists in the implementation baseline, one of the following
-must happen before Phase 6 closes:
+must happen before `GM6` closes:
 
 - integrate the separately approved removal first; or
 - leave a temporary facade-level compatibility call clearly outside the builders and
-  remove it in Phase 7.
+  remove it in `GM7`.
 
 A permanent `gap_equalization.py` module must not be created.
 
@@ -778,7 +785,7 @@ A permanent `gap_equalization.py` module must not be created.
 
 ---
 
-### Phase 7 - Bicrystal assembly and pure pipeline
+### GM7 - Bicrystal assembly and pure end-to-end pipeline
 
 #### Objective
 
@@ -821,7 +828,7 @@ mutable `GBMaker` object.
 
 #### Tests
 
-- End-to-end equality with every Phase 0 characterization case.
+- End-to-end equality with every `F0` characterization case.
 - Stage-result consistency checks.
 - Exact and approximate pipeline integration.
 - GB region and GB plane position.
@@ -839,7 +846,7 @@ mutable `GBMaker` object.
 
 ---
 
-### Phase 8 - Facade state migration and setter reconciliation
+### GM8 - Facade state migration and GBMaker cleanup
 
 #### Objective
 
@@ -888,65 +895,22 @@ ownership, and compatibility behavior.
 
 ---
 
-### Phase 9 - External IO boundary and final cleanup
+### Cross-track dependency: IO3 - LAMMPS writer extraction
 
-#### Objective
+LAMMPS serialization is not a ninth GBMaker PR. `IO3` owns this seam exclusively and should merge before deep facade migration creates avoidable conflicts.
 
-Complete the separation among calculator-neutral construction, mutable compatibility
-behavior, and external serialization without designing the full future IO framework.
+`IO3` must:
 
-#### Work
+1. move LAMMPS restricted-triclinic conversion into `GBOpt.io`;
+2. move LAMMPS serialization into a standalone writer that accepts neutral structure data rather than a `GBMaker` instance;
+3. return `WriteResult` with deterministic transient ID mappings;
+4. preserve atom order, type labels, charges, precision, and supported output formatting;
+5. leave `GBMaker.write_lammps()` as a thin compatibility wrapper;
+6. enforce that `GBOpt.io` does not import the GBMaker facade.
 
-1. Move LAMMPS restricted-triclinic conversion to `GBOpt/io/lammps.py`.
-2. Move LAMMPS serialization to a standalone function accepting explicit neutral data,
-   such as atoms, cell vectors or legacy box dimensions, periodic-boundary metadata,
-   type mapping, charges, and formatting options. It must not accept a `GBMaker`
-   instance.
-3. Keep `GBMaker.write_lammps()` as a thin compatibility method that extracts the
-   required neutral fields and delegates to `GBOpt.io.lammps`.
-4. Ensure `GBOpt.gbmaker` contains no LAMMPS-specific coordinate transformation,
-   bounds, tilt-factor, atom-style, charge-formatting, or file-writing logic.
-5. Keep `GBOpt.io` intentionally minimal: `__init__.py`, the existing LAMMPS backend,
-   and only the smallest shared protocol or type needed to avoid importing the
-   `GBMaker` facade. Do not add placeholder writers for unsupported calculators.
-6. Remove dead private methods, duplicate validators, and transitional mirrored state.
-7. Add architecture tests enforcing dependency direction:
-   - `GBOpt.gbmaker` must not import `GBOpt.io`;
-   - `GBOpt.io` must not import `GBOpt.GBMaker`;
-   - the facade may depend on both;
-   - calculator-specific transformations remain inside their backend module.
-8. Decide whether the `GBOpt/gbmaker_supercell.py` compatibility shim remains for a
-   deprecation period or is removed in a major-version change.
-9. Document the internal construction pipeline, the neutral result contract, and the
-   separate IO boundary.
-10. Update changelog and developer documentation.
+After `IO3`, `GM8` may remove remaining dead construction state and verify that no LAMMPS-specific implementation has returned to `GBOpt.gbmaker`. Final cross-track dependency tests belong to `INT1`.
 
-#### Tests
-
-- Existing golden LAMMPS files.
-- Orthogonal and triclinic output.
-- Type labels, integer types, charges, atom ordering, and precision.
-- Standalone writer and facade writer equivalence.
-- A test proving the standalone writer operates without constructing or importing
-  `GBMaker`.
-- Import-boundary and no-cycle tests.
-- Full baseline characterization.
-
-#### Acceptance criteria
-
-- `GBMaker.py` is a comprehensible facade, preferably no more than roughly 400-700
-  lines including docstrings and compatibility properties.
-- `GBOpt.gbmaker` is calculator-neutral and imports no IO backend.
-- LAMMPS-specific triclinic conversion and serialization live only in
-  `GBOpt.io.lammps`.
-- `GBMaker.write_lammps()` is only a compatibility adapter.
-- No generic plugin registry or unimplemented calculator backend has been introduced.
-- No duplicate implementation remains in compatibility modules.
-- Focused, non-slow, and approved slow tests pass.
-
----
-
-### Optional Phase 10 - Public immutable API
+### Deferred OPT-API1 - Public immutable construction API
 
 This phase is outside the compatibility-preserving refactor and requires separate API
 approval.
@@ -960,7 +924,7 @@ Possible work:
 - remove legacy constructor and compatibility re-exports after their deprecation
   windows.
 
-None of this is required for Phases 0-9.
+None of this is required for `GM1` through `GM8`.
 
 ---
 
@@ -982,12 +946,12 @@ The final suite should have four distinct layers:
 ### 9.2 Private-test migration rule
 
 When a private method moves, all tests of that private method must move in the same
-phase. New tests must not add more `_GBMaker__...` references. Temporary private access
+roadmap PR. New tests must not add more `_GBMaker__...` references. Temporary private access
 may remain only for functionality scheduled for a later phase.
 
 The end-state target is zero tests coupled to name-mangled scientific internals.
 
-### 9.3 Minimum commands per phase
+### 9.3 Minimum commands per roadmap PR
 
 Focused tests should be selected for the changed modules. The standard broad gates are:
 
@@ -1008,8 +972,7 @@ pytest -m "not slow"
 Any project-specific static analysis, formatting, or type-checking commands required by
 the controlling codebase rules must also pass.
 
-Slow tests should be run at designated integration gates, at minimum after Phases 6, 7,
-8, and 9, or according to the project's existing long-test policy.
+Slow tests should be run at designated integration gates, at minimum after `GM6`, `GM7`, `GM8`, and `IO3`, or according to the project's existing long-test policy.
 
 ### 9.4 Characterization comparisons
 
@@ -1030,7 +993,7 @@ intentionally.
 
 ## 10. Phase execution and handoff procedure
 
-Each phase should use the same repeatable workflow:
+Each roadmap PR should use the same repeatable workflow:
 
 1. Verify the incoming archive against its SHA-256 record.
 2. Extract into a clean working directory or apply it to a clean Git worktree.
@@ -1049,7 +1012,7 @@ Each phase should use the same repeatable workflow:
 13. Write a concise closeout/handoff note describing completed scope, deferred scope,
     compatibility shims, and known risks.
 
-No phase should depend on uncommitted files from a previous chat or an informal
+No roadmap PR should depend on uncommitted files from a previous chat or an informal
 statement that a test passed.
 
 ---
@@ -1069,7 +1032,7 @@ statement that a test passed.
 | Exact/approximate leakage | One path accidentally depends on the other | Common contracts, independent builders, path-specific tests |
 | Formalizing gap equalization | Obsolete behavior becomes harder to remove | Do not create a permanent gap module; remove before pipeline closeout |
 | Overlarge phase | Unreviewable behavior changes | One pipeline boundary per phase and complete test gate per handoff |
-| Stale implementation baseline | Refactor omits accepted exact-path fixes | Start Phase 0 from latest accepted archive and verify SHA |
+| Stale implementation baseline | Refactor omits accepted exact-path fixes | Start `F0` from the latest accepted archive and verify SHA |
 
 ---
 
@@ -1097,7 +1060,7 @@ statement that a test passed.
 
 ## 13. Definition of done
 
-The refactor is complete when all of the following are true:
+The GBMaker track is complete when all of the following are true:
 
 - `GBMaker` is a public compatibility facade rather than the location of construction
   algorithms.
@@ -1122,25 +1085,23 @@ The refactor is complete when all of the following are true:
 
 ---
 
-## 14. Recommended phase/chat names
+## 14. Recommended PR and implementation-session names
 
-For separate implementation conversations, use narrow names that describe the actual
-boundary being introduced:
+Use the roadmap identifiers so branches, prompts, closeout notes, and reviews remain unambiguous:
 
-1. `GBMaker Refactor Phase 0 - Characterization Baseline`
-2. `GBMaker Refactor Phase 1 - Internal Package and Types`
-3. `GBMaker Refactor Phase 2 - Input and Material Resolution`
-4. `GBMaker Refactor Phase 3 - Orientation State Extraction`
-5. `GBMaker Refactor Phase 4 - Dimension Planning Extraction`
-6. `GBMaker Refactor Phase 5 - Geometry Kernel Extraction`
-7. `GBMaker Refactor Phase 6 - Exact and Approximate Builders`
-8. `GBMaker Refactor Phase 7 - Assembly and Pure Pipeline`
-9. `GBMaker Refactor Phase 8 - Facade State Migration`
-10. `GBMaker Refactor Phase 9 - External IO Boundary and Final Cleanup`
+1. `F0 - Characterization Baseline and Architecture Decisions`
+2. `GM1 - Internal Package and Construction Types`
+3. `GM2 - Input and Material Resolution`
+4. `GM3 - Orientation and Periodicity Extraction`
+5. `GM4 - Dimension Planning Extraction`
+6. `GM5 - Geometry Kernel Extraction`
+7. `GM6 - Exact and Approximate Builders`
+8. `GM7 - Assembly and Pure Pipeline`
+9. `GM8 - Facade State Migration and Cleanup`
 
-Each new chat should receive the controlling project documents, the immediately prior
-source archive and SHA-256, the characterization manifest, and a prompt that prohibits
-work outside the named phase.
+`IO3 - LAMMPS Writer Extraction and WriteResult` is a separate I/O-track PR and must not be implemented as a GBMaker phase.
+
+Each implementation session should receive the controlling documents, the latest accepted source archive and SHA-256, the characterization manifest, and a prompt that prohibits work outside the named roadmap PR.
 
 ---
 
@@ -1155,8 +1116,7 @@ architecture:
 - extract orientation, dimensions, geometry, builders, and assembly in that order;
 - create the end-to-end pure pipeline only after its component stages exist;
 - migrate mutable facade state after the pipeline is proven equivalent;
-- establish a top-level `GBOpt.io` stub early, but move LAMMPS serialization and
-  restricted-triclinic conversion into it only after the construction facade is stable;
+- coordinate with `IO3` so LAMMPS serialization and restricted-triclinic conversion move out of `GBMaker` before deep facade migration;
 - keep the multi-calculator IO framework itself outside this refactor;
 - remove compatibility scaffolding last;
 - never convert the current monolith into a collection of mixins or mutually dependent

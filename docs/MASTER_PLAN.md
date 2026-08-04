@@ -1,5 +1,89 @@
 # GBOpt Refactoring and Checkpointing Pull-Request Roadmap
 
+## Document authority
+
+This document controls:
+
+- implementation sequencing;
+- PR prerequisites;
+- branch ancestry;
+- merge waves;
+- file-ownership windows;
+- integration gates.
+
+The following documents are subordinate:
+
+1. `architecture.md` — accepted architectural boundaries and domain contracts.
+2. `AI_AGENT_CODEBASE_RULES.md` — implementation and review discipline.
+3. `testing.md` — test-writing and execution policy.
+4. `design/*.md` — component rationale and detailed acceptance criteria.
+
+Documents under `superseded/` and `history/` are non-authoritative.
+
+## Current PR Status
+
+### Core roadmap
+
+| Track                        | PR    | Title                                                                 | Status      |
+| ---------------------------- | ----- | --------------------------------------------------------------------- | ----------- |
+| Foundation                   | F0    | Characterization baseline and architecture decisions                  | Not started |
+| Foundation                   | F1    | Mechanical minimizer decomposition                                    | Not started |
+| Foundation                   | F2    | Shared interface-state domain extraction                              | Not started |
+| GBMaker                      | GM1   | Internal package foundation and shared construction types             | Not started |
+| GBMaker                      | GM2   | Input normalization and material resolution                           | Not started |
+| GBMaker                      | GM3   | Orientation and periodicity extraction                                | Not started |
+| GBMaker                      | GM4   | Commensurability and dimension planning                               | Not started |
+| GBMaker                      | GM5   | Shared geometry kernels                                               | Not started |
+| GBMaker                      | GM6   | Exact and approximate grain builders                                  | Not started |
+| GBMaker                      | GM7   | Bicrystal assembly and pure end-to-end pipeline                       | Not started |
+| GBMaker                      | GM8   | Facade state migration and GBMaker cleanup                            | Not started |
+| I/O                          | IO1   | Canonical structure model, I/O base contracts, and LAMMPS data reader | Not started |
+| I/O                          | IO2   | LAMMPS dump reader and frame semantics                                | Not started |
+| I/O                          | IO3   | LAMMPS writer extraction and `WriteResult`                            | Not started |
+| I/O                          | IO4   | `Parent.from_structure()` and legacy source adaptation                | Not started |
+| I/O                          | IO5   | Central candidate loader and ownership-aware round trip               | Not started |
+| Manipulation                 | MAN1  | Core manipulation protocol, registry, and facade seam                 | Not started |
+| Manipulation                 | MAN2  | Interface translation, termination, and separation operations         | Not started |
+| Manipulation                 | MAN3  | Density operations and soft-mode displacement                         | Not started |
+| Manipulation                 | MAN4  | Binary slice-and-merge operation                                      | Not started |
+| Manipulation                 | MAN5  | Optimizer `OperationSpec` integration                                 | Not started |
+| Evaluation and observability | OBS1  | Narrow correctness and standard-library logging cleanup               | Not started |
+| Evaluation and observability | EVAL1 | Algorithm-neutral evaluation and artifact contracts                   | Not started |
+| Evaluation and observability | EVAL2 | Normalize MC and GA evaluation flows                                  | Not started |
+| Evaluation and observability | OBS2  | Run context and typed event protocol                                  | Not started |
+| Evaluation and observability | OBS3  | Durable JSONL journal and run manifest                                | Not started |
+| Checkpointing                | CP0   | Legacy checkpoint behavior audit and characterization                 | Not started |
+| Checkpointing                | CP1   | Versioned checkpoint store and JSON codec                             | Not started |
+| Checkpointing                | CP2   | Typed MC, GA, population, and candidate-evaluation snapshots          | Not started |
+| Checkpointing                | CP3   | Monte Carlo checkpoint and resume integration                         | Not started |
+| Checkpointing                | CP4   | GA generation-boundary checkpoint and resume                          | Not started |
+| Checkpointing                | CP5   | GA intra-generation candidate recovery                                | Not started |
+| Integration                  | INT1  | Cross-track architecture hardening, documentation, and release gate   | Not started |
+
+### Deferred and optional follow-on PRs
+
+These PRs are not required for completion of the core roadmap. Their initial status is also recorded as **Not started**, while their scheduling remains deferred until a concrete requirement exists.
+
+| Track                  | PR          | Title                                                  | Status      |
+| ---------------------- | ----------- | ------------------------------------------------------ | ----------- |
+| Optional I/O           | OPT-IO1     | Versioned ownership sidecars and explicit lossy writes | Not started |
+| Optional I/O           | OPT-IO2     | XYZ and CIF adapters                                   | Not started |
+| Optional extensibility | OPT-PLUGIN1 | Third-party entry-point discovery                      | Not started |
+| Optional checkpointing | OPT-CP1     | Legacy checkpoint migration reader                     | Not started |
+| Optional observability | OPT-OBS1    | Checkpoint lifecycle events                            | Not started |
+| Optional API           | OPT-API1    | Public immutable construction API                      | Not started |
+
+### Allowed status values
+
+Each PR must use exactly one of the following status values:
+
+* **Not started**
+* **In progress**
+* **Merged**
+* **Superseded**
+* **Deferred**
+
+
 ## Document status
 
 **Recommended master implementation plan.**

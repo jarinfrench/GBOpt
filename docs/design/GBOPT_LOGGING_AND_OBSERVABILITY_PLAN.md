@@ -4,6 +4,11 @@
 
 **Recommended long-term architecture, revised against the current GBOpt source.**
 
+
+**Implementation authority:** `../MASTER_PLAN.md`  
+**Roadmap mapping:** `OBS1`, `EVAL1`, `EVAL2`, `OBS2`, and `OBS3`  
+**Role of this document:** architectural rationale and component-level acceptance criteria; it does not override roadmap sequencing or prerequisites.
+
 This document supersedes the earlier logging-only implementation plan. It retains the useful parts of that plan—standard-library logging, preserved warning semantics, structured fields, and no import-time configuration—but broadens the design to match the direction of the GBOpt codebase.
 
 The central recommendation is:
@@ -889,7 +894,19 @@ Reject.
 
 ---
 
-## 13. Phased Implementation Plan
+## 13. Roadmap alignment and phased implementation
+
+The roadmap owns the actual PR boundaries:
+
+| Roadmap PR | Scope represented in this document |
+|---|---|
+| `OBS1` | narrow correctness, seed/run-ID fixes, and standard-library logging cleanup |
+| `EVAL1` | algorithm-neutral evaluation and artifact contracts |
+| `EVAL2` | normalized MC and GA evaluation flows |
+| `OBS2` | run context and typed event protocol |
+| `OBS3` | durable JSONL journal and run manifest |
+
+The phases below preserve the design reasoning. Implementation must use the roadmap PR identifiers above rather than creating a separate logging-plan branch sequence.
 
 ### Phase 0 — Policy and terminology
 
