@@ -48,23 +48,35 @@ def _write_named_lammps_data(
     *,
     ids: np.ndarray | None = None,
     declared_types: int | None = None,
+    type_map: dict[str, int] | None = None,
 ) -> None:
     atom_ids = (
         np.arange(1, len(atoms) + 1, dtype=np.int64)
         if ids is None
         else np.asarray(ids)
     )
+    species = tuple(dict.fromkeys(str(name) for name in atoms["name"]))
+    if type_map is None:
+        type_map = {name: index for index, name in enumerate(species, start=1)}
+    if set(species) - set(type_map):
+        raise AssertionError("type_map must define every emitted species")
     if declared_types is None:
-        declared_types = len({str(name) for name in atoms["name"]})
+        declared_types = len(type_map)
 
     with path.open("w", encoding="utf-8", newline="\n") as stream:
         stream.write("Owned candidate\n\n")
         stream.write(f"{len(atoms)} atoms\n")
         stream.write(f"{declared_types} atom types\n")
-        for axis, (lower, upper) in zip("xyz", box_dims):
+        for axis, (lower, upper) in zip("xyz", box_dims, strict=True):
             stream.write(f"{lower:.12f} {upper:.12f} {axis}lo {axis}hi\n")
+
+        stream.write("\nAtom Type Labels\n\n")
+        for name, type_id in sorted(type_map.items(), key=lambda item: item[1]):
+            if name in species:
+                stream.write(f"{type_id} {name}\n")
+
         stream.write("\nAtoms\n\n")
-        for atom_id, atom in zip(atom_ids, atoms):
+        for atom_id, atom in zip(atom_ids, atoms, strict=True):
             stream.write(
                 f"{int(atom_id)} {atom['name']} "
                 f"{atom['x']:.12f} {atom['y']:.12f} {atom['z']:.12f}\n"
@@ -507,10 +519,46 @@ def test_candidate_mapping_reloads_reordered_rows_by_transient_id(
     assert np.array_equal(reloaded.parents[0].initial_atom_ids, mapping.atom_ids)
 
 
-@pytest.mark.parametrize("defect", ["missing", "duplicate", "renumber", "species", "box"])
+@pytest.mark.parametrize(
+    ("defect", "expected_error", "message"),
+    [
+        pytest.param(
+            "missing",
+            GrainOwnershipError,
+            "atom count does not match",
+            id="missing-atom",
+        ),
+        pytest.param(
+            "duplicate",
+            LammpsDataError,
+            "atom IDs must be unique",
+            id="duplicate-id",
+        ),
+        pytest.param(
+            "renumber",
+            GrainOwnershipError,
+            "atom IDs do not match",
+            id="renumbered-id",
+        ),
+        pytest.param(
+            "species",
+            GrainOwnershipError,
+            "changed species/type",
+            id="changed-species",
+        ),
+        pytest.param(
+            "box",
+            GrainOwnershipError,
+            "changed box bounds",
+            id="changed-box",
+        ),
+    ],
+)
 def test_candidate_reload_rejects_contract_violations(
     tmp_path: Path,
     defect: str,
+    expected_error: type[Exception],
+    message: str,
 ) -> None:
     atoms, labels, box_dims, unit_cell = _owned_candidate()
     mapping = _candidate_mapping(atoms, labels, box_dims)
@@ -539,9 +587,10 @@ def test_candidate_reload_rejects_contract_violations(
         output_box,
         ids=output_ids,
         declared_types=declared_types,
+        type_map={"Ni": 1, "Cu": 2},
     )
 
-    with pytest.raises((GrainOwnershipError, ValueError)):
+    with pytest.raises(expected_error, match=message):
         reload_explicit_manipulator(
             returned,
             candidate_mapping=mapping,
@@ -581,7 +630,7 @@ def test_malformed_selected_dump_frame_fails_even_when_later_frame_is_valid(
     dump = tmp_path / "bad_first.dump"
     _write_two_frame_dump(dump, atoms, box_dims, first_header="typelabel x y z")
 
-    with pytest.raises(ValueError, match="missing atom attribute 'id'"):
+    with pytest.raises(LammpsDataError, match="missing atom attribute 'id'"):
         read_lammps_dump_file(dump)
 
 
@@ -610,7 +659,7 @@ def test_dump_reader_rejects_extra_rows_in_selected_frame(tmp_path: Path) -> Non
     extra = f"999 Ni 1.0 1.0 1.0\n{marker}"
     dump.write_text(text.replace(marker, extra, 1), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="unexpected content"):
+    with pytest.raises(LammpsDataError, match="unexpected content"):
         read_lammps_dump_file(dump)
 
 
@@ -635,7 +684,13 @@ def test_candidate_reload_rejects_per_id_species_swap_with_same_aggregate_counts
     swapped = atoms.copy()
     swapped[0]["name"], swapped[1]["name"] = "Cl", "Na"
     output = tmp_path / "species_swap.data"
-    _write_named_lammps_data(output, swapped, box_dims, declared_types=2)
+    _write_named_lammps_data(
+        output,
+        swapped,
+        box_dims,
+        declared_types=2,
+        type_map={"Na": 1, "Cl": 2},
+    )
     assert sorted(swapped["name"].tolist()) == sorted(atoms["name"].tolist())
 
     with pytest.raises(GrainOwnershipError, match="changed species"):
@@ -718,6 +773,15 @@ def test_interface_candidate_geometry_survives_write_and_explicit_reload(
     assert np.array_equal(parent.left_grain_x_bounds, candidate.left_grain_x_bounds)
     assert np.array_equal(parent.right_grain_x_bounds, candidate.right_grain_x_bounds)
     assert np.array_equal(parent.grain_labels, candidate.grain_labels)
+    np.testing.assert_array_equal(parent.whole_system, candidate.atoms)
+    np.testing.assert_array_equal(
+        parent.left_grain,
+        candidate.atoms[candidate.grain_labels == LEFT_GRAIN_LABEL],
+    )
+    np.testing.assert_array_equal(
+        parent.right_grain,
+        candidate.atoms[candidate.grain_labels == RIGHT_GRAIN_LABEL],
+    )
 
 
 def test_candidate_mapping_assigns_fresh_sequential_ids_for_current_rows() -> None:

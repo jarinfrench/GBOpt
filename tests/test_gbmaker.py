@@ -17,6 +17,7 @@ from scipy.spatial import KDTree
 
 from GBOpt.Atom import Atom, AtomValueError
 from GBOpt.BoundarySpec import CSLApproxSpec, CSLExactSpec, PQSpec
+from GBOpt.BoundaryTopology import BoundaryNormalTopology
 from GBOpt.crystallography import (
     pq_spec_to_embedding,
     recover_exact_row_rotation_from_paired_pq,
@@ -949,6 +950,24 @@ class TestGBMaker(unittest.TestCase):
         # Sigma5 [001] 36.87 deg boundary is a fully coherent CSL; both in-plane
         # directions must be periodic.
         self.assertEqual(self.gbm.inplane_periodic, (True, True))
+
+    def test_normal_topology_tracks_vacuum_policy(self):
+        self.assertIs(
+            self.gbm.normal_topology,
+            BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
+        )
+
+        self.gbm.vacuum_thickness = 0.0
+        self.assertIs(
+            self.gbm.normal_topology,
+            BoundaryNormalTopology.PERIODIC_BICRYSTAL,
+        )
+
+        self.gbm.vacuum_thickness = 2.0
+        self.assertIs(
+            self.gbm.normal_topology,
+            BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
+        )
 
     def test_box_dimensions(self):
         box_dims = self.gbm.box_dims

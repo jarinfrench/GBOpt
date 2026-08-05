@@ -1,25 +1,29 @@
 from __future__ import annotations
 
-import math
-from copy import copy
-from types import SimpleNamespace
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 
 from GBOpt.Atom import Atom
+from GBOpt.BoundarySpec import CSLExactSpec
 from GBOpt.BoundaryTopology import BoundaryNormalTopology
+from GBOpt.FileGrainOwnership import (
+    LEFT_GRAIN_LABEL,
+    RIGHT_GRAIN_LABEL,
+    GrainOwnership,
+)
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import (
     GBManipulator,
     GBManipulatorValueError,
     InterfaceCandidate,
     Parent,
+    ParentValueError,
 )
 from GBOpt.UnitCell import UnitCell
-
-LEFT_GRAIN_LABEL = 0
-RIGHT_GRAIN_LABEL = 1
 
 
 DTYPE = np.dtype(
@@ -33,20 +37,22 @@ DTYPE = np.dtype(
 )
 
 
-def _synthetic_manipulator(
+def _gbmaker_stub(
     topology: BoundaryNormalTopology,
     *,
-    box_x=(2.0, 12.0),
-    plane=7.0,
-    left_bounds=None,
-    right_bounds=None,
-    two_parents=False,
-):
+    box_x: tuple[float, float] = (2.0, 12.0),
+    plane: float = 7.0,
+    left_bounds: tuple[float, float] | None = None,
+    right_bounds: tuple[float, float] | None = None,
+    inplane_periodic: tuple[bool, bool] = (True, True),
+) -> GBMaker:
+    """Return a specced GBMaker stub consumed through the public constructors."""
     xlo, xhi = box_x
     if left_bounds is None:
         left_bounds = (xlo, plane)
     if right_bounds is None:
         right_bounds = (plane, xhi)
+
     left = np.array(
         [
             ("U", left_bounds[0] + 0.25, 0.0, 1.0, 10),
@@ -61,39 +67,184 @@ def _synthetic_manipulator(
         ],
         dtype=DTYPE,
     )
-    labels = np.array([0, 0, 1, 1], dtype=np.int8)
-    parent = SimpleNamespace(
-        left_grain=left,
-        right_grain=right,
-        whole_system=np.hstack((left, right)),
-        box_dims=np.array([[xlo, xhi], [-1.0, 9.0], [0.0, 10.0]]),
-        gb_plane_x=plane,
-        inplane_periodic=(True, True),
-        coordinate_tolerance=1.0e-10,
-        left_grain_x_bounds=np.asarray(left_bounds, dtype=float),
-        right_grain_x_bounds=np.asarray(right_bounds, dtype=float),
-        normal_topology=topology,
-        periodic_outer_x_interface=(
-            topology is BoundaryNormalTopology.PERIODIC_BICRYSTAL
-        ),
-        grain_labels=labels,
+    vacuum = float(left_bounds[0] - xlo)
+
+    system = Mock(spec=GBMaker)
+    system.vacuum_thickness = vacuum
+    system.normal_topology = topology
+    system.right_grain = right
+    system.left_grain = left
+    system.whole_system = np.hstack((left, right))
+    system.y_dim = 10.0
+    system.z_dim = 10.0
+    system.gb_thickness = 2.0
+    system.unit_cell = UnitCell()
+    system.radius = 1.0
+    system.box_dims = np.array([[xlo, xhi], [-1.0, 9.0], [0.0, 10.0]])
+    system.inplane_periodic = inplane_periodic
+    system.epsilon = 1.0e-10
+    system.gb_plane_x = plane
+    return system
+
+
+def _file_backed_synthetic_manipulator(
+    topology: BoundaryNormalTopology,
+    *,
+    box_x: tuple[float, float],
+    plane: float,
+    left_bounds: tuple[float, float],
+    right_bounds: tuple[float, float],
+    inplane_periodic: tuple[bool, bool],
+) -> tuple[GBManipulator, Parent]:
+    """Construct asymmetric or unknown synthetic geometry through public file I/O."""
+    xlo, xhi = box_x
+    atoms = np.array(
+        [
+            ("U", left_bounds[0] + 0.25, 0.0, 1.0),
+            ("O", left_bounds[1] - 0.25, 2.0, 3.0),
+            ("O", right_bounds[0] + 0.25, 4.0, 5.0),
+            ("U", right_bounds[1] - 0.25, 6.0, 7.0),
+        ],
+        dtype=Atom.atom_dtype,
     )
-    manipulator = object.__new__(GBManipulator)
-    manipulator._GBManipulator__one_parent = not two_parents
-    manipulator._GBManipulator__parents = [
-        parent, copy(parent) if two_parents else None]
-    manipulator._GBManipulator__rng = np.random.default_rng(7)
-    manipulator._GBManipulator__candidate_grain_labels = labels.copy()
-    return manipulator, parent
+    labels = np.array(
+        [LEFT_GRAIN_LABEL, LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL, RIGHT_GRAIN_LABEL],
+        dtype=np.int8,
+    )
+    ownership = GrainOwnership(
+        atom_ids=np.arange(1, 5, dtype=np.int64),
+        labels=labels,
+        gb_plane_x=plane,
+        inplane_periodic=inplane_periodic,
+        left_grain_x_bounds=left_bounds,
+        right_grain_x_bounds=right_bounds,
+        coordinate_tolerance=1.0e-10,
+        normal_topology=topology,
+    )
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("fluorite", 5.454, ("U", "O"))
+
+    temporary_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            suffix=".data",
+            delete=False,
+            encoding="utf-8",
+            newline="\n",
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write("Synthetic interface candidate\n\n")
+            stream.write("4 atoms\n")
+            stream.write("2 atom types\n")
+            stream.write(f"{xlo:.12f} {xhi:.12f} xlo xhi\n")
+            stream.write("-1.000000000000 9.000000000000 ylo yhi\n")
+            stream.write("0.000000000000 10.000000000000 zlo zhi\n")
+            stream.write("\nAtom Type Labels\n\n")
+            stream.write("1 U\n")
+            stream.write("2 O\n")
+            stream.write("\nAtoms\n\n")
+            for atom_id, atom in enumerate(atoms, start=1):
+                stream.write(
+                    f"{atom_id} {atom['name']} {atom['x']:.12f} "
+                    f"{atom['y']:.12f} {atom['z']:.12f}\n"
+                )
+
+        manipulator = GBManipulator(
+            str(temporary_path),
+            unit_cell=unit_cell,
+            gb_thickness=2.0,
+            type_dict={"U": 1, "O": 2},
+            grain_ownership=ownership,
+            seed=7,
+        )
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+    return manipulator, manipulator.parents[0]
 
 
-def _slab_manipulator(*, left_bounds=(4.0, 8.0), right_bounds=(8.0, 14.0)):
+def _synthetic_manipulator(
+    topology: BoundaryNormalTopology,
+    *,
+    box_x: tuple[float, float] = (2.0, 12.0),
+    plane: float = 7.0,
+    left_bounds: tuple[float, float] | None = None,
+    right_bounds: tuple[float, float] | None = None,
+    inplane_periodic: tuple[bool, bool] = (True, True),
+    two_parents: bool = False,
+) -> tuple[GBManipulator, Parent]:
+    xlo, xhi = box_x
+    if left_bounds is None:
+        left_bounds = (xlo, plane)
+    if right_bounds is None:
+        right_bounds = (plane, xhi)
+
+    left_vacuum = float(left_bounds[0] - xlo)
+    right_vacuum = float(xhi - right_bounds[1])
+    inferred_topology = (
+        BoundaryNormalTopology.PERIODIC_BICRYSTAL
+        if np.isclose(left_vacuum, 0.0, atol=1.0e-12, rtol=0.0)
+        and np.isclose(right_vacuum, 0.0, atol=1.0e-12, rtol=0.0)
+        else BoundaryNormalTopology.SINGLE_INTERFACE_SLAB
+    )
+    if (
+        topology is not inferred_topology
+        or not np.isclose(left_vacuum, right_vacuum, atol=1.0e-12, rtol=0.0)
+        or not np.isclose(left_bounds[1], plane, atol=1.0e-12, rtol=0.0)
+        or not np.isclose(right_bounds[0], plane, atol=1.0e-12, rtol=0.0)
+    ):
+        if two_parents:
+            raise AssertionError(
+                "The file-backed synthetic helper supports one parent only."
+            )
+        return _file_backed_synthetic_manipulator(
+            topology,
+            box_x=box_x,
+            plane=plane,
+            left_bounds=left_bounds,
+            right_bounds=right_bounds,
+            inplane_periodic=inplane_periodic,
+        )
+
+    system = _gbmaker_stub(
+        topology,
+        box_x=box_x,
+        plane=plane,
+        left_bounds=left_bounds,
+        right_bounds=right_bounds,
+        inplane_periodic=inplane_periodic,
+    )
+    second = (
+        _gbmaker_stub(
+            topology,
+            box_x=box_x,
+            plane=plane,
+            left_bounds=left_bounds,
+            right_bounds=right_bounds,
+            inplane_periodic=inplane_periodic,
+        )
+        if two_parents
+        else None
+    )
+    manipulator = GBManipulator(system, second, seed=7)
+    return manipulator, manipulator.parents[0]
+
+
+def _slab_manipulator(
+    *,
+    left_bounds: tuple[float, float] = (4.0, 8.0),
+    right_bounds: tuple[float, float] = (8.0, 14.0),
+    inplane_periodic: tuple[bool, bool] = (True, True),
+) -> tuple[GBManipulator, Parent]:
     return _synthetic_manipulator(
         BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
         box_x=(2.0, 16.0),
         plane=8.0,
         left_bounds=left_bounds,
         right_bounds=right_bounds,
+        inplane_periodic=inplane_periodic,
     )
 
 
@@ -120,7 +271,85 @@ def test_parent_candidate_is_geometry_bearing_defensive_and_read_only():
     assert np.array_equal(parent.whole_system, parent_before)
 
 
-def test_geometry_companions_match_existing_fixed_cell_apis():
+@pytest.mark.parametrize(
+    "labels",
+    [
+        np.array([False, False, True, True]),
+        np.array([0.0, 0.0, 1.0, 1.0]),
+    ],
+)
+def test_interface_candidate_rejects_coercive_grain_labels(labels):
+    manipulator, _ = _synthetic_manipulator(
+        BoundaryNormalTopology.PERIODIC_BICRYSTAL
+    )
+    base = manipulator.make_parent_candidate()
+
+    with pytest.raises(GBManipulatorValueError, match="integer left/right"):
+        InterfaceCandidate(
+            atoms=base.atoms,
+            box_dims=base.box_dims,
+            gb_plane_x=base.gb_plane_x,
+            left_grain_x_bounds=base.left_grain_x_bounds,
+            right_grain_x_bounds=base.right_grain_x_bounds,
+            grain_labels=labels,
+            inplane_periodic=base.inplane_periodic,
+            normal_topology=base.normal_topology,
+            coordinate_tolerance=base.coordinate_tolerance,
+        )
+
+
+@pytest.mark.parametrize(
+    "periodic",
+    [
+        pytest.param((1, 0), id="integer-flags"),
+        pytest.param(("False", "True"), id="string-flags"),
+    ],
+)
+def test_interface_candidate_rejects_coercive_periodicity(periodic):
+    manipulator, _ = _synthetic_manipulator(
+        BoundaryNormalTopology.PERIODIC_BICRYSTAL
+    )
+    base = manipulator.make_parent_candidate()
+
+    with pytest.raises(GBManipulatorValueError, match="periodic"):
+        InterfaceCandidate(
+            atoms=base.atoms,
+            box_dims=base.box_dims,
+            gb_plane_x=base.gb_plane_x,
+            left_grain_x_bounds=base.left_grain_x_bounds,
+            right_grain_x_bounds=base.right_grain_x_bounds,
+            grain_labels=base.grain_labels,
+            inplane_periodic=periodic,
+            normal_topology=base.normal_topology,
+            coordinate_tolerance=base.coordinate_tolerance,
+        )
+
+
+def test_interface_candidate_normalizes_boolean_array_periodicity():
+    manipulator, _ = _synthetic_manipulator(
+        BoundaryNormalTopology.PERIODIC_BICRYSTAL
+    )
+    base = manipulator.make_parent_candidate()
+    periodic = np.asarray([True, False], dtype=np.bool_)
+
+    candidate = InterfaceCandidate(
+        atoms=base.atoms,
+        box_dims=base.box_dims,
+        gb_plane_x=base.gb_plane_x,
+        left_grain_x_bounds=base.left_grain_x_bounds,
+        right_grain_x_bounds=base.right_grain_x_bounds,
+        grain_labels=base.grain_labels,
+        inplane_periodic=periodic,
+        normal_topology=base.normal_topology,
+        coordinate_tolerance=base.coordinate_tolerance,
+    )
+
+    assert candidate.inplane_periodic == (True, False)
+    periodic[0] = False
+    assert candidate.inplane_periodic == (True, False)
+
+
+def test_fixed_cell_operations_return_complete_candidates():
     manipulator, _ = _synthetic_manipulator(
         BoundaryNormalTopology.PERIODIC_BICRYSTAL
     )
@@ -142,6 +371,7 @@ def test_geometry_companions_match_existing_fixed_cell_apis():
     assert np.array_equal(cycled.atoms, cycled_atoms)
     assert np.array_equal(cycled.box_dims, translated.box_dims)
     assert cycled.gb_plane_x == translated.gb_plane_x
+    assert np.array_equal(cycled.grain_labels, np.array([0, 0, 1, 1]))
 
 
 def test_slab_termination_companion_is_grain_local_and_geometry_preserving():
@@ -172,7 +402,13 @@ def test_slab_termination_companion_is_grain_local_and_geometry_preserving():
     assert np.array_equal(candidate.atoms["z"], parent.whole_system["z"])
     assert np.array_equal(candidate.atoms["site_id"], parent.whole_system["site_id"])
     assert np.array_equal(candidate.atoms["name"], parent.whole_system["name"])
-    assert np.array_equal(candidate.grain_labels, parent.grain_labels)
+    assert np.array_equal(
+        candidate.grain_labels,
+        np.array(
+            [LEFT_GRAIN_LABEL, LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL, RIGHT_GRAIN_LABEL],
+            dtype=np.int8,
+        ),
+    )
     assert np.array_equal(parent.whole_system, parent_before)
 
 
@@ -217,8 +453,7 @@ def test_slab_termination_combines_right_inplane_registry_shift():
 
 
 def test_slab_termination_preserves_nonperiodic_inplane_rejection():
-    manipulator, parent = _slab_manipulator()
-    parent.inplane_periodic = (False, True)
+    manipulator, parent = _slab_manipulator(inplane_periodic=(False, True))
 
     valid = manipulator.make_slab_termination_candidate(right_dy=0.5)
     np.testing.assert_allclose(valid.atoms["y"][2:], parent.right_grain["y"] + 0.5)
@@ -337,19 +572,23 @@ def test_slab_termination_rejects_nonfinite_or_nonreal_values(argument, value):
 
 
 def test_slab_termination_gbmaker_integration_preserves_vacuum_geometry():
-    theta = math.radians(36.869898)
-    with pytest.warns(DeprecationWarning):
-        gb = GBMaker(
-            a0=3.0,
-            structure="rocksalt",
-            gb_thickness=5.0,
-            misorientation=[theta, 0.0, 0.0, 0.0, -theta / 2.0],
-            atom_types=("Na", "Cl"),
-            repeat_factor=(2, 3),
-            x_dim_min=10.0,
-            vacuum=2.0,
-            interaction_distance=4.0,
-        )
+    boundary = CSLExactSpec(
+        axis=[0, 0, 1],
+        plane=[1, 0, 0],
+        quat=[3, 0, 0, 1],
+    )
+    gb = GBMaker.from_boundary_spec(
+        3.0,
+        "rocksalt",
+        ("Na", "Cl"),
+        boundary,
+        mode="exact",
+        gb_thickness=5.0,
+        repeat_factor=(2, 3),
+        x_dim_min=10.0,
+        vacuum=2.0,
+        interaction_distance=4.0,
+    )
     manipulator = GBManipulator(gb, seed=17)
     base = manipulator.make_parent_candidate()
 
@@ -449,13 +688,12 @@ def test_slab_separation_preserves_asymmetric_outer_vacuum_widths():
 
 
 def test_separation_uses_labels_and_preserves_interleaved_row_order_and_fields():
-    manipulator, _ = _synthetic_manipulator(
+    manipulator, parent = _synthetic_manipulator(
         BoundaryNormalTopology.PERIODIC_BICRYSTAL
     )
-    parent = manipulator._GBManipulator__parents[0]
     order = np.array([0, 2, 1, 3])
     atoms = parent.whole_system[order]
-    labels = parent.grain_labels[order]
+    labels = manipulator.make_parent_candidate().grain_labels[order]
     base = InterfaceCandidate(
         atoms=atoms,
         box_dims=parent.box_dims,
@@ -526,36 +764,59 @@ def test_slab_requires_a_vacuum_interval():
         )
 
 
-def test_parent_infers_known_topology_from_gbmaker_vacuum_with_tolerance():
+def _parent_gbmaker_stub(
+    *,
+    vacuum: float,
+    topology: BoundaryNormalTopology,
+) -> GBMaker:
     atoms = np.array(
         [("U", 1.0, 1.0, 1.0), ("O", 6.0, 1.0, 1.0)],
         dtype=Atom.atom_dtype,
     )
+    system = Mock(spec=GBMaker)
+    system.vacuum_thickness = vacuum
+    system.normal_topology = topology
+    system.right_grain = atoms[1:]
+    system.left_grain = atoms[:1]
+    system.whole_system = atoms
+    system.y_dim = 10.0
+    system.z_dim = 10.0
+    system.gb_thickness = 2.0
+    system.unit_cell = UnitCell()
+    system.radius = 1.0
+    system.box_dims = np.array([[0.0, 10.0], [0.0, 10.0], [0.0, 10.0]])
+    system.inplane_periodic = (True, True)
+    system.epsilon = 1.0e-8
+    system.gb_plane_x = 5.0
+    return system
 
-    def fake(vacuum):
-        return SimpleNamespace(
-            vacuum_thickness=vacuum,
-            right_grain=atoms[1:],
-            left_grain=atoms[:1],
-            whole_system=atoms,
-            y_dim=10.0,
-            z_dim=10.0,
-            gb_thickness=2.0,
-            unit_cell=UnitCell(),
-            radius=1.0,
-            box_dims=np.array([[0.0, 10.0], [0.0, 10.0], [0.0, 10.0]]),
-            inplane_periodic=(True, True),
-            epsilon=1.0e-8,
-            gb_plane_x=5.0,
+
+def test_parent_consumes_explicit_gbmaker_topology():
+    periodic = Parent(
+        _parent_gbmaker_stub(
+            vacuum=0.0,
+            topology=BoundaryNormalTopology.PERIODIC_BICRYSTAL,
         )
-
-    periodic = Parent.__new__(Parent)
-    periodic._Parent__init_by_gbmaker(fake(1.0e-10))
+    )
     assert periodic.normal_topology is BoundaryNormalTopology.PERIODIC_BICRYSTAL
     assert np.array_equal(periodic.left_grain_x_bounds, [0.0, 5.0])
 
-    slab = Parent.__new__(Parent)
-    slab._Parent__init_by_gbmaker(fake(1.5))
+    slab = Parent(
+        _parent_gbmaker_stub(
+            vacuum=1.5,
+            topology=BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
+        )
+    )
     assert slab.normal_topology is BoundaryNormalTopology.SINGLE_INTERFACE_SLAB
     assert np.array_equal(slab.left_grain_x_bounds, [1.5, 5.0])
     assert np.array_equal(slab.right_grain_x_bounds, [5.0, 8.5])
+
+
+def test_parent_rejects_gbmaker_topology_vacuum_conflict():
+    system = _parent_gbmaker_stub(
+        vacuum=1.0,
+        topology=BoundaryNormalTopology.PERIODIC_BICRYSTAL,
+    )
+
+    with pytest.raises(ParentValueError, match="zero vacuum"):
+        Parent(system)

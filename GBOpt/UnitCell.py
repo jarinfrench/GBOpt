@@ -3,12 +3,17 @@
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from numbers import Integral
 
 import numpy as np
 from scipy.spatial import KDTree
 
 from GBOpt import Atom
+from GBOpt.Utils.integer_linalg import (
+    ExactIntegerShapeError,
+    ExactIntegerTypeError,
+    ExactIntegerValueError,
+    as_int_array,
+)
 
 
 class UnitCellError(Exception):
@@ -27,6 +32,25 @@ class UnitCellRuntimeError(UnitCellError):
     """Exceptions raised when there is an error during runtime in the UnitCell class."""
 
 
+def _as_unitcell_int_array(
+        values: object, shape: tuple[int, ...], name: str) -> np.ndarray:
+    """Return exact Python integers using the shared integer validator.
+
+    :param values: Candidate integer-valued array.
+    :param shape: Required array shape.
+    :param name: Input name used in validation messages.
+    :return: Object-dtype array containing exact Python integers.
+    :raises UnitCellTypeError: If values cannot be interpreted as exact integers.
+    :raises UnitCellValueError: If values have an invalid shape or value.
+    """
+    try:
+        return as_int_array(values, shape, name)
+    except ExactIntegerTypeError as exc:
+        raise UnitCellTypeError(str(exc)) from exc
+    except (ExactIntegerShapeError, ExactIntegerValueError) as exc:
+        raise UnitCellValueError(str(exc)) from exc
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class RationalBasis:
     """Immutable exact fractional basis for a conventional unit cell.
@@ -35,6 +59,13 @@ class RationalBasis:
     ``names``. Dividing the integer rows by ``denominator`` gives conventional-cell
     fractional coordinates in the canonical half-open interval ``[0, 1)``. Row order
     is preserved so built-in metadata follows the established structured-basis order.
+
+    :param names: Ordered species name for every basis site.
+    :param numerators: Exact coordinate numerators with shape ``(basis_size, 3)``.
+    :param denominator: Positive common coordinate denominator.
+    :raises UnitCellTypeError: If names or exact coordinates have invalid types.
+    :raises UnitCellValueError: If the basis is empty, malformed, noncanonical, or
+        contains duplicate coordinates.
     """
 
     names: tuple[str, ...]
@@ -44,20 +75,25 @@ class RationalBasis:
     def __init__(
             self, names: Sequence[str], numerators: np.ndarray,
             denominator: int) -> None:
-        if isinstance(denominator, bool) or not isinstance(denominator, Integral):
-            raise UnitCellTypeError("The rational-basis denominator must be an int.")
-
-        denominator = int(denominator)
+        denominator_array = _as_unitcell_int_array(
+            (denominator,), (1,), "rational-basis denominator"
+        )
+        denominator = int(denominator_array[0])
         if denominator <= 0:
             raise UnitCellValueError(
                 "The rational-basis denominator must be greater than zero."
             )
 
-        if isinstance(names, str):
+        if isinstance(names, (str, bytes)):
             raise UnitCellTypeError(
                 "Rational-basis names must be a sequence of strings."
             )
-        names = tuple(names)
+        try:
+            names = tuple(names)
+        except TypeError as exc:
+            raise UnitCellTypeError(
+                "Rational-basis names must be a sequence of strings."
+            ) from exc
         if any(not isinstance(name, str) for name in names):
             raise UnitCellTypeError("Every rational-basis name must be a string.")
         if not names:
@@ -65,7 +101,7 @@ class RationalBasis:
 
         try:
             numerator_array = np.asarray(numerators, dtype=object)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise UnitCellValueError(
                 "Rational-basis numerators must have shape (basis_size, 3)."
             ) from exc
@@ -78,14 +114,15 @@ class RationalBasis:
                 "Rational-basis names and numerator rows must have equal lengths."
             )
 
+        exact_numerators = _as_unitcell_int_array(
+            numerator_array,
+            numerator_array.shape,
+            "rational-basis numerators",
+        )
         normalized_rows = []
-        for row in numerator_array:
+        for row in exact_numerators:
             normalized_row = []
             for value in row:
-                if isinstance(value, bool) or not isinstance(value, Integral):
-                    raise UnitCellTypeError(
-                        "Every rational-basis numerator must be an int."
-                    )
                 integer = int(value)
                 if integer < 0 or integer >= denominator:
                     raise UnitCellValueError(
@@ -108,7 +145,11 @@ class RationalBasis:
 
     @property
     def numerators(self) -> np.ndarray:
-        """Return a read-only copy of the exact coordinate numerators."""
+        """Return a read-only copy of the exact coordinate numerators.
+
+        :return: Object-dtype array containing exact Python integers with shape
+            ``(basis_size, 3)``.
+        """
         stored_copy = np.array(self._numerator_rows, dtype=object)
         stored_copy.setflags(write=False)
         readonly_view = stored_copy.view()
@@ -228,7 +269,7 @@ class UnitCell:
         self.__rational_basis = None
 
     def init_by_structure(
-            self, structure: str, a0: float, atoms: str | tuple[str, ...],
+            self, structure: str, a0: float, atoms: str | Sequence[str],
             type_map: dict[str, int] | dict[int, str] = None) -> None:
         """
         Initialize the UnitCell by crystal structure.
@@ -237,20 +278,67 @@ class UnitCell:
             bcc, sc, diamond, fluorite, rocksalt, and zincblende. Other structures can
             be added upon request.
         :param a0: The lattice parameter in Angstroms.
-        :param atoms: The types of atoms in the system. A single string assigns the same
-            atom type to each atom in the unit cell. A tuple is required for the
-            "fluorite", "rocksalt", and "zincblende" structures.
+        :param atoms: Ordered atom types required by the selected structure. A single
+            string is required for monoatomic structures; a two-item sequence is
+            required for fluorite, rocksalt, and zincblende.
         :param type_map: Optional. Sets the type mapping for the atoms in the unit cell.
             Note that the mapping requires sequential values starting from 1. Optional,
             defaults to setting the atom types based on the order of their appearance in
             "atoms."
+        :return: None.
+        :raises UnitCellTypeError: If structure or atoms have invalid types.
+        :raises UnitCellValueError: If the number of atom types does not match the
+            selected structure.
+        :raises AtomValueError: If an atom type is not a recognized element symbol.
         :raises NotImplementedError: Exception raised if the specified structure has not
             been implemented.
         """
-        self.__a0 = a0
+        if not isinstance(structure, str):
+            raise UnitCellTypeError("The crystal structure must be specified as a string.")
 
-        if not isinstance(atoms, tuple) and not isinstance(atoms, list):
+        try:
+            denominator, basis_spec = _RATIONAL_BASIS_SPECS[structure]
+        except KeyError as exc:
+            raise NotImplementedError(
+                f"Lattice structure {structure} not recognized/implemented"
+            ) from exc
+
+        if isinstance(atoms, str):
             atoms = (atoms,)
+        elif isinstance(atoms, Sequence) and not isinstance(atoms, bytes):
+            atoms = tuple(atoms)
+        else:
+            raise UnitCellTypeError(
+                "atoms must be a species string or an ordered sequence of strings."
+            )
+        if any(not isinstance(atom, str) for atom in atoms):
+            raise UnitCellTypeError("Every atom type must be specified as a string.")
+
+        required_atom_count = max(entry[0] for entry in basis_spec) + 1
+        if len(atoms) != required_atom_count:
+            suffix = "s" if required_atom_count != 1 else ""
+            raise UnitCellValueError(
+                f"The {structure!r} crystal structure requires exactly "
+                f"{required_atom_count} atom type{suffix}."
+            )
+
+        rational_basis = RationalBasis(
+            names=tuple(atoms[entry[0]] for entry in basis_spec),
+            numerators=np.array([entry[1:] for entry in basis_spec], dtype=object),
+            denominator=denominator,
+        )
+        unit_cell = [
+            Atom(
+                name,
+                *(float(value) / denominator for value in row),
+            )
+            for name, row in zip(
+                rational_basis.names,
+                rational_basis.numerators,
+            )
+        ]
+
+        self.__a0 = a0
         if type_map is None:
             unique_atoms = []
             seen = set()
@@ -270,35 +358,6 @@ class UnitCell:
                 [0.0, 0.0, 1.0]
             ]
         )
-
-        try:
-            denominator, basis_spec = _RATIONAL_BASIS_SPECS[structure]
-        except KeyError as exc:
-            raise NotImplementedError(
-                f"Lattice structure {structure} not recognized/implemented"
-            ) from exc
-
-        required_atom_count = max(entry[0] for entry in basis_spec) + 1
-        if required_atom_count == 2 and len(atoms) != 2:
-            raise UnitCellValueError(
-                "The specified crystal structure requires 2 atom types."
-            )
-
-        self.__rational_basis = RationalBasis(
-            names=tuple(atoms[entry[0]] for entry in basis_spec),
-            numerators=np.array([entry[1:] for entry in basis_spec], dtype=object),
-            denominator=denominator,
-        )
-        unit_cell = [
-            Atom(
-                name,
-                *(float(value) / denominator for value in row),
-            )
-            for name, row in zip(
-                self.__rational_basis.names,
-                self.__rational_basis.numerators,
-            )
-        ]
         self.__ratio = {1: 1}
 
         if structure == "fcc":
@@ -378,7 +437,7 @@ class UnitCell:
                 (2, 2): unit_cell[4].position.distance(unit_cell[5].position)
             }
             self.__ratio = {1: 1, 2: 1}
-        else:  # zincblende
+        elif structure == "zincblende":
             self.__radius = math.sqrt(3) * 0.125
             self.__primitive = np.array(
                 [
@@ -393,9 +452,13 @@ class UnitCell:
                 (2, 2): unit_cell[4].position.distance(unit_cell[6].position)
             }
             self.__ratio = {1: 1, 2: 1}
+        else:
+            raise UnitCellRuntimeError(
+                "The validated rational-basis specification has no matching "
+                f"structure initialization branch: {structure!r}."
+            )
         for i in range(len(unit_cell)):
             unit_cell[i]["position"] *= a0
-        self.__unit_cell = unit_cell
         self.__radius *= self.__a0
         self.__primitive *= self.__a0 / 2.0
         self.__conventional *= self.__a0
@@ -413,6 +476,8 @@ class UnitCell:
         self.__ideal_bond_lengths = {
             key: value * self.__a0 for key, value in self.__ideal_bond_lengths.items()
         }
+        self.__unit_cell = unit_cell
+        self.__rational_basis = rational_basis
 
     def init_by_custom(self, unit_cell: np.ndarray,
                        unit_cell_types: str | Sequence[str], a0: float,
@@ -586,6 +651,9 @@ class UnitCell:
         Built-in structures provide exact rational metadata. Custom and
         uninitialized cells return ``None`` because arbitrary floating-point
         coordinates are not rationalized approximately.
+
+        :return: Immutable exact basis metadata for a built-in structure, or ``None``
+            for a custom or uninitialized cell.
         """
         return self.__rational_basis
 

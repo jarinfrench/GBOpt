@@ -3,6 +3,7 @@
 """Integration tests for GBMaker's exact integer grain-construction path."""
 
 import importlib
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,7 +12,7 @@ from scipy.spatial import KDTree
 from GBOpt.Atom import Atom
 from GBOpt.BoundarySpec import CSLExactSpec, PQSpec
 from GBOpt.crystallography import pq_spec_to_embedding
-from GBOpt.GBMaker import GBMaker
+from GBOpt.GBMaker import GBMaker, GBMakerValueError
 from GBOpt.UnitCell import UnitCell
 from tests.data.zhang_2022_uo2_ceo2_gb_energies import BOUNDARIES
 
@@ -174,6 +175,21 @@ def build_gb():
 def _positions(atoms):
     """Return structured atom coordinates as an ``(N, 3)`` float array."""
     return np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
+
+
+def _fake_fcc_supercell_sites(coordinate_numerators, *, denominator):
+    """Return the minimal exact-site result needed by ``__generate_grain_exact``."""
+    return SimpleNamespace(
+        supercell_index=1,
+        site_count=4,
+        basis_indices=np.arange(4, dtype=np.intp),
+        coordinate_numerators=np.asarray(
+            coordinate_numerators,
+            dtype=object,
+        ),
+        supercell_matrix=np.eye(3, dtype=object),
+        coordinate_denominator=denominator,
+    )
 
 
 def _assert_fluorite_stoichiometry(atoms, *, label):
@@ -374,6 +390,83 @@ def test_exact_builder_returns_complete_small_fcc_grains(build_gb):
         )
 
 
+def test_exact_builder_translates_unrepresentable_integer_coordinates(
+    build_gb,
+    monkeypatch,
+):
+    gb = build_gb()
+    sites = _fake_fcc_supercell_sites(
+        [
+            [10**400, 0, 0],
+            [0, 0, 1],
+            [1, 0, 0],
+            [1, 1, 0],
+        ],
+        denominator=2,
+    )
+
+    monkeypatch.setattr(
+        GBMaker,
+        "_GBMaker__exact_grain_repeats",
+        lambda _self, _P_or_Q, _x_length, _grain_side: (1, 1, 1),
+    )
+    monkeypatch.setattr(
+        importlib.import_module("GBOpt.GBMaker"),
+        "enumerate_supercell_sites",
+        lambda *_args, **_kwargs: sites,
+    )
+
+    with pytest.raises(
+        GBMakerValueError,
+        match=r"cannot be represented as finite Cartesian values",
+    ):
+        gb._GBMaker__generate_grain_exact(
+            np.eye(3),
+            np.eye(3, dtype=object),
+            gb.a0,
+            0.0,
+            "left",
+        )
+
+
+def test_exact_builder_canonicalizes_upper_x_face_into_half_open_slab(
+    build_gb,
+    monkeypatch,
+):
+    gb = build_gb()
+    sites = _fake_fcc_supercell_sites(
+        [
+            [2, 0, 0],
+            [0, 0, 1],
+            [1, 0, 0],
+            [1, 1, 0],
+        ],
+        denominator=2,
+    )
+
+    monkeypatch.setattr(
+        GBMaker,
+        "_GBMaker__exact_grain_repeats",
+        lambda _self, _P_or_Q, _x_length, _grain_side: (1, 1, 1),
+    )
+    monkeypatch.setattr(
+        importlib.import_module("GBOpt.GBMaker"),
+        "enumerate_supercell_sites",
+        lambda *_args, **_kwargs: sites,
+    )
+
+    atoms = gb._GBMaker__generate_grain_exact(
+        np.eye(3),
+        np.eye(3, dtype=object),
+        gb.a0,
+        0.0,
+        "left",
+    )
+
+    assert np.max(atoms["x"]) < gb.a0
+    assert np.max(atoms["x"]) == np.nextafter(gb.a0, 0.0)
+
+
 @pytest.mark.filterwarnings(
     r"ignore:Commensurate repeat pair in [yz] multiplied by \d+ to satisfy the "
     r"minimum in-plane dimension cutoff of .* A\.:UserWarning"
@@ -559,6 +652,46 @@ def test_vacuum_zero_exact_atoms_are_within_x_box(
 # --------------------------------------------------------------------------------------
 # Vacuum-zero periodic-interface regressions
 # --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("central_gap", "periodic_gap"),
+    [
+        pytest.param(-1e-3, 0.25, id="central-overlap"),
+        pytest.param(0.25, -1e-3, id="periodic-overlap"),
+    ],
+)
+def test_exact_gap_handling_rejects_negative_gap_without_layer_deletion(
+    build_gb,
+    monkeypatch,
+    central_gap,
+    periodic_gap,
+):
+    gb = build_gb(vacuum=0.0)
+
+    monkeypatch.setattr(
+        GBMaker,
+        "_GBMaker__current_gap_metrics",
+        lambda _self, _left_bounds, _right_bounds: (
+            central_gap,
+            periodic_gap,
+            0.0,
+            gb.x_dim,
+        ),
+    )
+
+    with pytest.raises(
+        GBMakerValueError,
+        match=r"invalid x-boundary overlap",
+    ):
+        gb._GBMaker__equalize_periodic_gap(
+            left_bounds=np.array([0.0, gb.gb_plane_x]),
+            right_effective_bounds=np.array([gb.gb_plane_x, gb.x_dim]),
+            use_exact=True,
+            right_float_result=None,
+            vacuum0_trim_applied=False,
+            x_period_right=None,
+        )
 
 
 def test_vacuum_zero_exact_gap_metrics_are_diagnostic_only(build_gb):

@@ -42,7 +42,7 @@ def _positive_integer(value: object, *, name: str) -> int:
     exact integer coercion, and error wording remain centralized.
 
     :param value: Candidate Python or NumPy integer scalar.
-    :param name: Parameter name used in validation messages.
+    :param name: Keyword argument naming the value in validation messages.
     :return: Validated value as a Python ``int``.
     :raises ValueError: If ``value`` is not an exact positive integer.
     """
@@ -76,7 +76,7 @@ def _exact_integer_rows(values: object, *, name: str) -> tuple[tuple[int, ...], 
     """Return rectangular two-dimensional rows of exact Python integers.
 
     :param values: Candidate rectangular two-dimensional array-like object.
-    :param name: Input name used in validation messages.
+    :param name: Keyword argument naming the input in validation messages.
     :return: Immutable rectangular rows containing Python ``int`` values.
     :raises ValueError: If ``values`` cannot be represented as a rectangular
         two-dimensional exact-integer array.
@@ -163,14 +163,18 @@ class SupercellSites:
     ) -> None:
         """Initialize validated immutable exact decorated-site state.
 
-        :param coordinate_numerators: Exact canonical supercell-coordinate numerators
-            with shape ``(site_count, 3)``.
-        :param basis_denominator: Positive denominator of the rational conventional
-            basis.
-        :param basis_indices: Rational-basis row index for every coordinate row.
-        :param supercell_matrix: Nonsingular exact 3 by 3 supercell matrix.
-        :param repeats: Three positive supercell repeat counts.
-        :param basis_size: Number of rows in the rational decorated basis.
+        :param coordinate_numerators: Keyword argument containing exact canonical
+            supercell-coordinate numerators with shape ``(site_count, 3)``.
+        :param basis_denominator: Keyword argument containing the positive denominator
+            of the rational conventional basis.
+        :param basis_indices: Keyword argument containing the rational-basis row index
+            for every coordinate row.
+        :param supercell_matrix: Keyword argument containing the nonsingular exact 3 by
+            3 supercell matrix.
+        :param repeats: Keyword argument containing three positive supercell repeat
+            counts.
+        :param basis_size: Keyword argument containing the number of rows in the
+            rational decorated basis.
         :raises ValueError: If an input is malformed or any exact population,
             coordinate-bound, or uniqueness invariant fails.
         """
@@ -311,27 +315,42 @@ class SupercellSites:
 
     @property
     def coordinate_denominator(self) -> int:
-        """Return the positive common denominator of exact supercell coordinates."""
+        """Return the positive common denominator of exact supercell coordinates.
+
+        :return: Positive common denominator of the exact supercell coordinates.
+        """
         return self.basis_denominator * self.supercell_index
 
     @property
     def coordinate_numerators(self) -> np.ndarray:
-        """Return a defensive read-only copy of exact supercell-coordinate numerators."""
+        """Return a defensive read-only copy of exact supercell-coordinate numerators.
+
+        :return: Read-only object array of exact supercell-coordinate numerators.
+        """
         return _readonly_object_array(self._coordinate_rows)
 
     @property
     def basis_indices(self) -> np.ndarray:
-        """Return a defensive read-only copy of decorated basis-row indices."""
+        """Return a defensive read-only copy of decorated basis-row indices.
+
+        :return: Read-only integer array of decorated rational-basis row indices.
+        """
         return _readonly_integer_array(self._basis_index_values)
 
     @property
     def supercell_matrix(self) -> np.ndarray:
-        """Return a defensive read-only copy of the integer supercell matrix."""
+        """Return a defensive read-only copy of the integer supercell matrix.
+
+        :return: Read-only object array containing the exact supercell matrix.
+        """
         return _readonly_object_array(self._supercell_rows)
 
     @property
     def site_count(self) -> int:
-        """Return the number of exact decorated representatives."""
+        """Return the number of exact decorated representatives.
+
+        :return: Number of exact decorated representatives.
+        """
         return len(self._coordinate_rows)
 
 
@@ -343,8 +362,7 @@ def _integer_membership(
     repeat_y: int,
     repeat_z: int,
 ) -> bool:
-    """Return whether an integer conventional-cell origin lies inside a repeated
-    supercell.
+    """Return whether an integer origin lies inside a repeated supercell.
 
     Computes fractional supercell coordinates as integer numerators via ``origin @
     adj(S)``. If ``det(S)`` is negative, the numerators are sign-flipped before checking
@@ -685,8 +703,8 @@ def enumerate_supercell_sites(
     :param repeat_x: Positive repeat count along ``S[0]``.
     :param repeat_y: Positive repeat count along ``S[1]``.
     :param repeat_z: Positive repeat count along ``S[2]``.
-    :param rational_basis: Validated exact basis metadata from
-        ``UnitCell.rational_basis``.
+    :param rational_basis: Keyword argument containing validated exact basis metadata
+        from ``UnitCell.rational_basis``.
     :return: Immutable exact supercell representatives and corresponding rational-basis
         row indices.
     :raises ValueError: If an input is malformed, ``S`` is singular, rational metadata
@@ -821,7 +839,8 @@ def supercell_axis_numerators(
 
     :param supercell: 3 by 3 integer supercell matrix ``S``.
     :param origins: Integer conventional-cell origins with shape ``(N, 3)``.
-    :param axis: Supercell coordinate axis to return. Must be 0, 1, or 2.
+    :param axis: Optional keyword argument selecting supercell coordinate axis 0, 1,
+        or 2; defaults to ``0``.
     :return: Integer numerator coordinates parallel to ``origins``.
     :raises ValueError: If inputs cannot be converted to exact integer arrays, if
         ``axis`` is invalid, or if ``supercell`` is singular.

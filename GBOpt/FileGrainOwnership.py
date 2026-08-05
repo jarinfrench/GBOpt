@@ -41,6 +41,12 @@ class LammpsDataError(ValueError):
 
 
 def _readonly_copy(values: np.ndarray, *, dtype: np.dtype | type | None = None) -> np.ndarray:
+    """Return an independent read-only NumPy array.
+
+    :param values: Source array whose values will be copied.
+    :param dtype: Keyword argument, optional. Requested result dtype; defaults to ``None``.
+    :return: A copied array with mutation disabled.
+    """
     result = np.array(values, dtype=dtype, copy=True)
     result.setflags(write=False)
     return result
@@ -344,15 +350,23 @@ class GrainOwnership:
     ) -> None:
         """Construct immutable explicit grain ownership metadata.
 
-        :param atom_ids: Positive, unique serialization-local atom IDs.
-        :param labels: Left/right grain labels aligned with ``atom_ids``.
-        :param gb_plane_x: Nominal central interface plane in angstroms.
-        :param inplane_periodic: Explicit y/z periodicity flags.
-        :param right_grain_x_bounds: Physical right-grain x bounds in angstroms.
-        :param coordinate_tolerance: Positive coordinate tolerance in angstroms.
-        :param periodic_outer_x_interface: Legacy topology compatibility flag.
-        :param left_grain_x_bounds: Optional physical left-grain x bounds.
-        :param normal_topology: Explicit boundary-normal topology.
+        :param atom_ids: Keyword argument. Positive, unique serialization-local atom
+            IDs.
+        :param labels: Keyword argument. Left/right grain labels aligned with
+            ``atom_ids``.
+        :param gb_plane_x: Keyword argument. Nominal central interface plane in
+            angstroms.
+        :param inplane_periodic: Keyword argument. Explicit y/z periodicity flags.
+        :param right_grain_x_bounds: Keyword argument. Physical right-grain x bounds
+            in angstroms.
+        :param coordinate_tolerance: Keyword argument. Positive coordinate tolerance
+            in angstroms.
+        :param periodic_outer_x_interface: Keyword argument, optional. Legacy topology
+            compatibility flag; defaults to ``None``.
+        :param left_grain_x_bounds: Keyword argument, optional. Physical left-grain x
+            bounds; defaults to ``None``.
+        :param normal_topology: Keyword argument, optional. Explicit boundary-normal
+            topology; defaults to ``None``.
         :raises GrainOwnershipError: If any input or ownership invariant is invalid.
         """
         raw_ids = np.asarray(atom_ids, dtype=object)
@@ -471,7 +485,17 @@ class GrainOwnership:
         *,
         atom_ids: np.ndarray | None = None,
     ) -> GrainOwnership:
-        """Build explicit ownership from an InterfaceCandidate-like value object."""
+        """Build explicit ownership from an interface-candidate value object.
+
+        :param candidate: Interface-candidate-like object providing atoms, labels,
+            geometry, periodicity, and topology.
+        :param atom_ids: Keyword argument, optional. Serialization-local atom IDs;
+            defaults to ``None``, which assigns consecutive IDs in candidate row order.
+        :return: Immutable ownership metadata aligned with the supplied or generated
+            atom IDs.
+        :raises GrainOwnershipError: If the candidate metadata or supplied atom IDs
+            violate an ownership invariant.
+        """
         atoms = np.asarray(candidate.atoms)
         if atom_ids is None:
             atom_ids = np.arange(1, atoms.size + 1, dtype=np.int64)
@@ -488,34 +512,63 @@ class GrainOwnership:
 
     @property
     def atom_ids(self) -> np.ndarray:
-        """Return a read-only defensive copy of initial serialization IDs."""
+        """Return a defensive copy of the serialization-local atom IDs.
+
+        :return: A read-only copy of the atom IDs in ownership row order.
+        """
         return _readonly_copy(self._atom_ids)
 
     @property
     def labels(self) -> np.ndarray:
-        """Return a read-only defensive copy of persistent grain labels."""
+        """Return a defensive copy of the persistent grain labels.
+
+        :return: A read-only copy of the left/right labels in ownership row order.
+        """
         return _readonly_copy(self._labels)
 
     @property
     def left_grain_x_bounds(self) -> np.ndarray | None:
+        """Return the optional physical left-grain x bounds.
+
+        :return: A read-only copy of the bounds, or ``None`` when unavailable.
+        """
         if self._left_grain_x_bounds is None:
             return None
         return _readonly_copy(self._left_grain_x_bounds)
 
     @property
     def right_grain_x_bounds(self) -> np.ndarray:
+        """Return the physical right-grain x bounds.
+
+        :return: A read-only copy of the right-grain bounds.
+        """
         return _readonly_copy(self._right_grain_x_bounds)
 
     @property
     def normal_topology(self) -> BoundaryNormalTopology:
+        """Return the explicit boundary-normal topology.
+
+        :return: The normalized boundary-normal topology value object.
+        """
         return self._normal_topology
 
     @property
     def periodic_outer_x_interface(self) -> bool:
+        """Report whether the outer x boundary represents a periodic interface.
+
+        :return: ``True`` when the normalized topology has a periodic outer x
+            interface; otherwise ``False``.
+        """
         return self._normal_topology.periodic_outer_x_interface
 
     def aligned_to(self, atom_ids: np.ndarray) -> GrainOwnership:
-        """Return ownership reordered to the supplied file-row atom IDs."""
+        """Return ownership reordered to supplied file-row atom IDs.
+
+        :param atom_ids: Atom IDs in the row order of a loaded structure file.
+        :return: New immutable ownership metadata aligned to the supplied row order.
+        :raises GrainOwnershipError: If the loaded IDs are malformed, duplicated,
+            nonpositive, out of range, or do not exactly match the ownership ID set.
+        """
         requested = np.asarray(atom_ids)
         if requested.ndim != 1:
             raise GrainOwnershipError("loaded atom IDs must be one-dimensional")
@@ -546,6 +599,16 @@ class GrainOwnership:
         )
 
     def __copy__(self) -> GrainOwnership:
+        """Return an independent immutable ownership copy.
+
+        :return: A new ownership object containing copied arrays and identical
+            geometry and topology metadata.
+        """
+        # doccheck: ignore=DOC115[GrainOwnershipError]
+        #   GrainOwnership validates and defensively copies all state during
+        #   construction. Its frozen, read-only representation cannot become invalid
+        #   through the supported API, so constructor failure here would indicate
+        #   unsupported internal corruption rather than a caller-visible copy error.
         return GrainOwnership(
             atom_ids=self._atom_ids,
             labels=self._labels,
@@ -558,6 +621,12 @@ class GrainOwnership:
         )
 
     def __deepcopy__(self, memo: dict[int, object]) -> GrainOwnership:
+        """Return an independent immutable ownership deep copy.
+
+        :param memo: Standard deep-copy memo used to retain object identity mappings.
+        :return: A new ownership object containing copied arrays and identical
+            geometry and topology metadata.
+        """
         copied = self.__copy__()
         memo[id(self)] = copied
         return copied
@@ -582,6 +651,17 @@ class LammpsAtomData:
         boundary_periodic: tuple[bool, bool, bool] | None = None,
         selected_frame: int | None = None,
     ) -> None:
+        """Construct one immutable parsed LAMMPS atom snapshot.
+
+        :param atom_ids: Serialization-local atom IDs in file-row order.
+        :param atoms: Structured atom rows containing species and Cartesian
+            coordinates.
+        :param box_dims: Orthogonal lower and upper bounds for x, y, and z.
+        :param boundary_periodic: Keyword argument, optional. Per-axis periodicity
+            decoded from a dump header; defaults to ``None``.
+        :param selected_frame: Keyword argument, optional. Selected zero-based dump
+            frame index; defaults to ``None`` for data files.
+        """
         object.__setattr__(self, "_atom_ids", _readonly_copy(atom_ids, dtype=np.int64))
         object.__setattr__(self, "_atoms", _readonly_copy(atoms, dtype=Atom.atom_dtype))
         object.__setattr__(self, "_box_dims", _readonly_copy(box_dims, dtype=float))
@@ -590,24 +670,44 @@ class LammpsAtomData:
 
     @property
     def atom_ids(self) -> np.ndarray:
+        """Return the parsed atom IDs in file-row order.
+
+        :return: A read-only defensive copy of the atom IDs.
+        """
         return _readonly_copy(self._atom_ids)
 
     @property
     def atoms(self) -> np.ndarray:
+        """Return the parsed structured atom rows.
+
+        :return: A read-only defensive copy of the atom array.
+        """
         return _readonly_copy(self._atoms)
 
     @property
     def box_dims(self) -> np.ndarray:
+        """Return the parsed orthogonal box bounds.
+
+        :return: A read-only defensive copy with shape ``(3, 2)``.
+        """
         return _readonly_copy(self._box_dims)
 
 
 def read_lammps_data_file(
     path: str | Path, *, type_dict: Mapping[object, object] | None = None
 ) -> LammpsAtomData:
-    """Read the orthogonal LAMMPS data format emitted by ``GBMaker.write_lammps``.
+    """Read the orthogonal LAMMPS data format emitted by ``GBMaker``.
 
     Both the five-column atomic form and the six-column charge form are supported.
-    File row order is preserved; callers may align or canonicalize by atom ID.
+    File row order is preserved so callers can align ownership by atom ID.
+
+    :param path: Path to the LAMMPS data file.
+    :param type_dict: Keyword argument, optional. Mapping in ``species -> type ID``
+        or ``type ID -> species`` form; defaults to ``None``.
+    :return: Immutable parsed atom IDs, atom rows, and box bounds.
+    :raises FileNotFoundError: If ``path`` does not identify an existing file.
+    :raises LammpsDataError: If the file or type mapping is malformed, ambiguous,
+        unsupported, or inconsistent with its declared counts and bounds.
     """
     file_path = Path(path)
     if not file_path.is_file():
@@ -808,21 +908,29 @@ class CandidateFileMapping:
     ) -> None:
         """Construct one deterministic candidate/file round-trip mapping.
 
-        Candidate IDs are serialization-local identifiers assigned in candidate
-        row order and must therefore be exactly ``1..N``.
+        Candidate IDs are serialization-local identifiers assigned in candidate row
+        order and must therefore be exactly ``1..N``.
 
-        :param atom_ids: Candidate-local IDs in row order.
-        :param labels: Persistent grain labels aligned with candidate rows.
-        :param species: Expected element symbols aligned with candidate rows.
-        :param box_dims: Expected orthogonal box bounds.
-        :param gb_plane_x: Nominal central interface plane in angstroms.
-        :param inplane_periodic: Explicit y/z periodicity flags.
-        :param right_grain_x_bounds: Physical right-grain x bounds.
-        :param coordinate_tolerance: Positive geometry tolerance in angstroms.
-        :param periodic_outer_x_interface: Legacy topology compatibility flag.
-        :param left_grain_x_bounds: Optional physical left-grain x bounds.
-        :param normal_topology: Explicit boundary-normal topology.
-        :raises GrainOwnershipError: If the mapping or geometry is invalid.
+        :param atom_ids: Keyword argument. Candidate-local IDs in row order.
+        :param labels: Keyword argument. Persistent grain labels aligned with
+            candidate rows.
+        :param species: Keyword argument. Expected element symbols aligned with
+            candidate rows.
+        :param box_dims: Keyword argument. Expected orthogonal box bounds.
+        :param gb_plane_x: Keyword argument. Nominal central interface plane in
+            angstroms.
+        :param inplane_periodic: Keyword argument. Explicit y/z periodicity flags.
+        :param right_grain_x_bounds: Keyword argument. Physical right-grain x bounds.
+        :param coordinate_tolerance: Keyword argument. Positive geometry tolerance in
+            angstroms.
+        :param periodic_outer_x_interface: Keyword argument, optional. Legacy topology
+            compatibility flag; defaults to ``None``.
+        :param left_grain_x_bounds: Keyword argument, optional. Physical left-grain x
+            bounds; defaults to ``None``.
+        :param normal_topology: Keyword argument, optional. Explicit boundary-normal
+            topology; defaults to ``None``.
+        :raises GrainOwnershipError: If the mapping, species, geometry, IDs, or
+            topology are invalid.
         """
         bounds = _strict_box_dims(box_dims)
         plane = _strict_finite_real("candidate gb_plane_x", gb_plane_x)
@@ -954,6 +1062,28 @@ class CandidateFileMapping:
         left_grain_x_bounds: np.ndarray | tuple[float, float] | None = None,
         normal_topology: BoundaryNormalTopology | str | None = None,
     ) -> CandidateFileMapping:
+        """Construct a mapping from candidate atom and ownership arrays.
+
+        :param atoms: One-dimensional structured candidate atom array containing a
+            ``name`` field.
+        :param labels: Persistent grain labels aligned with candidate rows.
+        :param box_dims: Keyword argument. Expected orthogonal box bounds.
+        :param gb_plane_x: Keyword argument. Nominal central interface plane in
+            angstroms.
+        :param inplane_periodic: Keyword argument. Explicit y/z periodicity flags.
+        :param right_grain_x_bounds: Keyword argument. Physical right-grain x bounds.
+        :param coordinate_tolerance: Keyword argument. Positive geometry tolerance in
+            angstroms.
+        :param periodic_outer_x_interface: Keyword argument, optional. Legacy topology
+            compatibility flag; defaults to ``None``.
+        :param left_grain_x_bounds: Keyword argument, optional. Physical left-grain x
+            bounds; defaults to ``None``.
+        :param normal_topology: Keyword argument, optional. Explicit boundary-normal
+            topology; defaults to ``None``.
+        :return: Deterministic candidate-to-file mapping with consecutive atom IDs.
+        :raises GrainOwnershipError: If candidate arrays or mapping metadata are
+            malformed or inconsistent.
+        """
         structured = np.asarray(atoms)
         if (
             structured.ndim != 1
@@ -984,7 +1114,13 @@ class CandidateFileMapping:
 
     @classmethod
     def from_interface_candidate(cls, candidate: Any) -> CandidateFileMapping:
-        """Construct a mapping from an InterfaceCandidate-like value object."""
+        """Construct a mapping from an interface-candidate value object.
+
+        :param candidate: Interface-candidate-like object providing atoms, ownership,
+            geometry, periodicity, and topology.
+        :return: Deterministic candidate-to-file mapping with consecutive atom IDs.
+        :raises GrainOwnershipError: If candidate data violate a mapping invariant.
+        """
         return cls.from_candidate(
             candidate.atoms,
             candidate.grain_labels,
@@ -999,41 +1135,85 @@ class CandidateFileMapping:
 
     @property
     def atom_ids(self) -> np.ndarray:
+        """Return the candidate-local serialization IDs.
+
+        :return: A read-only defensive copy of the IDs.
+        """
         return _readonly_copy(self._atom_ids)
 
     @property
     def labels(self) -> np.ndarray:
+        """Return the persistent candidate grain labels.
+
+        :return: A read-only defensive copy of the labels.
+        """
         return _readonly_copy(self._labels)
 
     @property
     def species(self) -> np.ndarray:
+        """Return the expected species for each candidate atom ID.
+
+        :return: A read-only defensive copy of the species array.
+        """
         return _readonly_copy(self._species)
 
     @property
     def box_dims(self) -> np.ndarray:
+        """Return the expected orthogonal candidate box bounds.
+
+        :return: A read-only defensive copy with shape ``(3, 2)``.
+        """
         return _readonly_copy(self._box_dims)
 
     @property
     def left_grain_x_bounds(self) -> np.ndarray:
+        """Return the expected physical left-grain x bounds.
+
+        :return: A read-only defensive copy of the left-grain bounds.
+        """
         return _readonly_copy(self._left_grain_x_bounds)
 
     @property
     def right_grain_x_bounds(self) -> np.ndarray:
+        """Return the expected physical right-grain x bounds.
+
+        :return: A read-only defensive copy of the right-grain bounds.
+        """
         return _readonly_copy(self._right_grain_x_bounds)
 
     @property
     def normal_topology(self) -> BoundaryNormalTopology:
+        """Return the expected boundary-normal topology.
+
+        :return: The normalized boundary-normal topology value object.
+        """
         return self._normal_topology
 
     @property
     def periodic_outer_x_interface(self) -> bool:
+        """Report the expected outer-x periodic-interface state.
+
+        :return: ``True`` when the expected topology has a periodic outer x interface;
+            otherwise ``False``.
+        """
         return self._normal_topology.periodic_outer_x_interface
 
     @property
     def expected_count(self) -> int:
+        """Return the expected number of evaluator-output atoms.
+
+        :return: Candidate atom count as a Python integer.
+        """
         return int(self._atom_ids.size)
 
     def ownership_for_file_ids(self, file_ids: np.ndarray) -> GrainOwnership:
+        """Align mapped ownership to evaluator-output file-row IDs.
+
+        :param file_ids: Evaluator-output atom IDs in file-row order.
+        :return: Immutable ownership metadata aligned to ``file_ids``.
+        :raises GrainOwnershipError: If the IDs are malformed or do not exactly match
+            the candidate mapping.
+        """
         base = GrainOwnership(
             atom_ids=self._atom_ids,
             labels=self._labels,
@@ -1048,6 +1228,12 @@ class CandidateFileMapping:
 
 
 def _dump_boundary_flags(tokens: list[str]) -> tuple[bool, bool, bool] | None:
+    """Decode orthogonal LAMMPS dump boundary flags.
+
+    :param tokens: Tokens following ``ITEM: BOX BOUNDS``.
+    :return: Per-axis periodicity when three valid flags are present; otherwise
+        ``None``.
+    """
     if len(tokens) < 3:
         return None
     flags = tokens[-3:]
@@ -1059,10 +1245,18 @@ def _dump_boundary_flags(tokens: list[str]) -> tuple[bool, bool, bool] | None:
 def read_lammps_dump_file(
     path: str | Path, *, type_dict: Mapping[object, object] | None = None
 ) -> LammpsAtomData:
-    """Read exactly the first LAMMPS dump frame, matching the legacy loader.
+    """Read exactly the first frame of an orthogonal LAMMPS dump.
 
-    Multi-frame dumps are never concatenated. Validation applies only to frame zero;
-    a malformed first frame is an error even if a later frame is valid.
+    Multi-frame dumps are never concatenated. Validation applies only to frame
+    zero; a malformed first frame is an error even if a later frame is valid.
+
+    :param path: Path to the LAMMPS dump file.
+    :param type_dict: Keyword argument, optional. Mapping in ``species -> type ID``
+        or ``type ID -> species`` form; defaults to ``None``.
+    :return: Immutable parsed data for dump frame zero.
+    :raises FileNotFoundError: If ``path`` does not identify an existing file.
+    :raises LammpsDataError: If the type mapping, frame structure, bounds, topology,
+        atom attributes, IDs, species, or coordinates are malformed or ambiguous.
     """
     file_path = Path(path)
     if not file_path.is_file():
@@ -1191,7 +1385,16 @@ def read_lammps_dump_file(
 def read_lammps_structure_file(
     path: str | Path, *, type_dict: Mapping[object, object] | None = None
 ) -> LammpsAtomData:
-    """Read a supported data file or the first frame of a LAMMPS dump."""
+    """Read a supported LAMMPS data file or first dump frame.
+
+    :param path: Path to a LAMMPS data or dump file.
+    :param type_dict: Keyword argument, optional. Mapping in ``species -> type ID``
+        or ``type ID -> species`` form; defaults to ``None``.
+    :return: Immutable parsed atom and box data.
+    :raises FileNotFoundError: If ``path`` does not identify an existing file.
+    :raises LammpsDataError: If the selected reader rejects malformed, unsupported,
+        or ambiguous file content or type metadata.
+    """
     file_path = Path(path)
     if not file_path.is_file():
         raise FileNotFoundError(str(file_path))
@@ -1210,9 +1413,25 @@ def reload_explicit_manipulator(
     gb_thickness: float,
     type_dict: Mapping[object, object] | None = None,
 ) -> GBManipulator:
-    """Validate and reconstruct one evaluator-returned explicit-ownership candidate.
+    """Validate and reconstruct an evaluator-returned owned candidate.
 
     This is the authoritative reload path for explicit-ownership GA execution.
+
+    :param returned_structure: Path to the evaluator-returned LAMMPS structure.
+    :param candidate_mapping: Keyword argument. Expected candidate IDs, species,
+        ownership, geometry, and topology.
+    :param unit_cell: Keyword argument. Unit cell used to initialize the reloaded
+        manipulator parent.
+    :param gb_thickness: Keyword argument. Grain-boundary region thickness in
+        angstroms.
+    :param type_dict: Keyword argument, optional. Mapping in ``species -> type ID``
+        or ``type ID -> species`` form; defaults to ``None``.
+    :return: Manipulator reconstructed with explicit ownership aligned by atom ID.
+    :raises FileNotFoundError: If the returned structure file does not exist.
+    :raises LammpsDataError: If the returned LAMMPS file or type mapping is
+        malformed, unsupported, or ambiguous.
+    :raises GrainOwnershipError: If evaluator output changes candidate atom count,
+        IDs, species, box bounds, topology, or ownership alignment.
     """
     snapshot = read_lammps_structure_file(returned_structure, type_dict=type_dict)
     file_ids = snapshot.atom_ids

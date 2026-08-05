@@ -8,7 +8,7 @@ from dataclasses import FrozenInstanceError
 import numpy as np
 import pytest
 
-from GBOpt.Atom import Atom
+from GBOpt.Atom import Atom, AtomValueError
 from GBOpt.UnitCell import (
     RationalBasis,
     UnitCell,
@@ -912,8 +912,13 @@ INVALID_RATIONAL_BASES = [
     ),
     pytest.param(
         UnitCellTypeError,
-        {"names": ("A",), "numerators": [[0, 0, 0]], "denominator": 2.0},
-        id="noninteger-denominator",
+        {"names": None, "numerators": [[0, 0, 0]], "denominator": 2},
+        id="noniterable-names",
+    ),
+    pytest.param(
+        UnitCellValueError,
+        {"names": ("A",), "numerators": [[0, 0, 0]], "denominator": 2.5},
+        id="nonintegral-denominator",
     ),
     pytest.param(
         UnitCellValueError,
@@ -964,14 +969,27 @@ INVALID_RATIONAL_BASES = [
         id="duplicate-coordinate-different-species",
     ),
     pytest.param(
-        UnitCellTypeError,
-        {"names": ("A",), "numerators": [[0.0, 0, 0]], "denominator": 2},
-        id="noninteger-numerator",
+        UnitCellValueError,
+        {"names": ("A",), "numerators": [[0.5, 0, 0]], "denominator": 2},
+        id="nonintegral-numerator",
     ),
 ]
 
 
 class TestRationalBasis:
+
+    def test_exact_integer_inputs_use_shared_normalization(self):
+        basis = RationalBasis(
+            names=("A", "B"),
+            numerators=[[0.0, 0, 0], [1, 1.0, 1]],
+            denominator=2.0,
+        )
+
+        assert basis.denominator == 2
+        np.testing.assert_array_equal(
+            basis.numerators,
+            np.array([[0, 0, 0], [1, 1, 1]], dtype=object),
+        )
 
     @pytest.mark.parametrize(
         ("structure", "atoms", "denominator", "expected_names", "numerators"),
@@ -1087,6 +1105,67 @@ class TestRationalBasis:
         )
 
         assert cell.rational_basis is None
+
+
+@pytest.mark.parametrize(
+    ("structure", "atoms"),
+    [
+        pytest.param("sc", (), id="sc-empty"),
+        pytest.param("bcc", ("Fe", "Cr"), id="bcc-two-species"),
+        pytest.param("fcc", ("Cu", "Ni"), id="fcc-two-species"),
+        pytest.param("diamond", ("C", "Si"), id="diamond-two-species"),
+        pytest.param("fluorite", ("U",), id="fluorite-one-species"),
+        pytest.param("rocksalt", ("Na", "Cl", "K"), id="rocksalt-three-species"),
+        pytest.param("zincblende", (), id="zincblende-empty"),
+    ],
+)
+def test_builtin_structures_require_exact_species_cardinality(structure, atoms):
+    cell = UnitCell()
+
+    with pytest.raises(UnitCellValueError, match="requires exactly"):
+        cell.init_by_structure(structure, 1.0, atoms)
+
+
+@pytest.mark.parametrize("structure", [None, [], {}])
+def test_init_by_structure_rejects_nonstring_structure(structure):
+    cell = UnitCell()
+
+    with pytest.raises(UnitCellTypeError, match="must be specified as a string"):
+        cell.init_by_structure(structure, 1.0, "H")
+
+
+def test_unsupported_structure_does_not_mutate_existing_cell():
+    cell = UnitCell()
+    cell.init_by_structure("fcc", 3.54, "Cu")
+    expected_array = cell.asarray().copy()
+    expected_basis = cell.rational_basis
+    expected_a0 = cell.a0
+    expected_type_map = cell.type_map.copy()
+
+    with pytest.raises(NotImplementedError):
+        cell.init_by_structure("notimplemented", 2.0, "H")
+
+    np.testing.assert_array_equal(cell.asarray(), expected_array)
+    assert cell.rational_basis is expected_basis
+    assert cell.a0 == expected_a0
+    assert cell.type_map == expected_type_map
+
+
+def test_failed_atom_construction_preserves_existing_exact_metadata():
+    cell = UnitCell()
+    cell.init_by_structure("fcc", 3.54, "Cu")
+    expected_array = cell.asarray().copy()
+    expected_basis = cell.rational_basis
+    expected_a0 = cell.a0
+    expected_type_map = cell.type_map.copy()
+
+    with pytest.raises(AtomValueError, match="Invalid atom type name"):
+        cell.init_by_structure("fluorite", 5.454, ("U", "Invalid"))
+
+    np.testing.assert_array_equal(cell.asarray(), expected_array)
+    assert cell.rational_basis is expected_basis
+    assert cell.a0 == expected_a0
+    assert cell.type_map == expected_type_map
 
 
 if __name__ == '__main__':
