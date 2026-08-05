@@ -16,32 +16,40 @@ from collections import Counter
 from dataclasses import dataclass, field
 from itertools import product
 from math import prod
-from numbers import Integral
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from GBOpt.crystallography.integer import (
     as_int_array,
+    as_positive_int,
     cross_int3,
     integer_adj3,
     integer_det3,
     row_gcd_reduce,
 )
 from GBOpt.crystallography.types import CrystallographyValueError
+from GBOpt.Utils.integer_normal_forms import ExactNormalFormError, smith_normal_form_3x3
 
 if TYPE_CHECKING:
     from GBOpt.UnitCell import RationalBasis
 
 
 def _positive_integer(value: object, *, name: str) -> int:
-    """Return ``value`` as a positive Python integer, excluding booleans."""
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
-        raise ValueError(f"{name} must be a positive integer; got {value!r}.")
-    integer = int(value)
-    if integer <= 0:
-        raise ValueError(f"{name} must be a positive integer; got {value!r}.")
-    return integer
+    """Return ``value`` as a positive Python integer.
+
+    Validation is delegated to the shared exact-integer utility so boolean rejection,
+    exact integer coercion, and error wording remain centralized.
+
+    :param value: Candidate Python or NumPy integer scalar.
+    :param name: Parameter name used in validation messages.
+    :return: Validated value as a Python ``int``.
+    :raises ValueError: If ``value`` is not an exact positive integer.
+    """
+    try:
+        return as_positive_int(value, name)
+    except CrystallographyValueError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _validated_repeats(
@@ -49,7 +57,14 @@ def _validated_repeats(
     repeat_y: object,
     repeat_z: object,
 ) -> tuple[int, int, int]:
-    """Return validated positive repeat counts as Python integers."""
+    """Return validated positive supercell repeat counts.
+
+    :param repeat_x: Repeat count along the first supercell row.
+    :param repeat_y: Repeat count along the second supercell row.
+    :param repeat_z: Repeat count along the third supercell row.
+    :return: ``(repeat_x, repeat_y, repeat_z)`` as Python integers.
+    :raises ValueError: If any repeat count is not an exact positive integer.
+    """
     return (
         _positive_integer(repeat_x, name="repeat_x"),
         _positive_integer(repeat_y, name="repeat_y"),
@@ -58,38 +73,57 @@ def _validated_repeats(
 
 
 def _exact_integer_rows(values: object, *, name: str) -> tuple[tuple[int, ...], ...]:
-    """Return a rectangular two-dimensional tuple of exact Python integer rows."""
-    try:
-        array = np.asarray(values, dtype=object)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a rectangular two-dimensional array.") from exc
-    if array.ndim != 2:
-        raise ValueError(f"{name} must be a two-dimensional array; got {array.shape}.")
+    """Return rectangular two-dimensional rows of exact Python integers.
 
-    rows = []
-    for row in array:
-        exact_row = []
-        for value in row:
-            if isinstance(value, (bool, np.bool_)) or not isinstance(
-                value, (int, np.integer)
-            ):
-                raise ValueError(
-                    f"{name} must contain only integers; got {value!r}."
-                )
-            exact_row.append(int(value))
-        rows.append(tuple(exact_row))
-    return tuple(rows)
+    :param values: Candidate rectangular two-dimensional array-like object.
+    :param name: Input name used in validation messages.
+    :return: Immutable rectangular rows containing Python ``int`` values.
+    :raises ValueError: If ``values`` cannot be represented as a rectangular
+        two-dimensional exact-integer array.
+    """
+    try:
+        raw_array = np.asarray(values, dtype=object)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a rectangular two-dimensional array."
+        ) from exc
+
+    if raw_array.ndim != 2:
+        raise ValueError(
+            f"{name} must be a two-dimensional array; got {raw_array.shape}."
+        )
+
+    try:
+        exact_array = as_int_array(raw_array, raw_array.shape, name)
+    except CrystallographyValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+    return tuple(
+        tuple(int(value) for value in row)
+        for row in exact_array
+    )
 
 
 def _readonly_object_array(rows: tuple[tuple[int, ...], ...]) -> np.ndarray:
-    """Return a defensive read-only object array from exact integer rows."""
+    """Return a defensive read-only object array containing Python integers.
+
+    :param rows: Exact integer rows to copy.
+    :return: Read-only object-dtype array with no writable alias to ``rows``.
+    """
     array = np.array(rows, dtype=object, copy=True)
     array.setflags(write=False)
     return array
 
 
 def _readonly_integer_array(values: tuple[int, ...]) -> np.ndarray:
-    """Return a defensive read-only platform-integer array."""
+    """Return a defensive read-only platform-integer array.
+
+    This helper is appropriate for bounded basis indices, not unbounded crystallographic
+    coordinates.
+
+    :param values: Bounded integer index values to copy.
+    :return: Read-only platform-integer array with no writable alias to ``values``.
+    """
     array = np.array(values, dtype=int, copy=True)
     array.setflags(write=False)
     return array
@@ -99,10 +133,10 @@ def _readonly_integer_array(values: tuple[int, ...]) -> np.ndarray:
 class SupercellSites:
     """Immutable exact decorated sites in a repeated integer supercell.
 
-    ``coordinate_numerators / coordinate_denominator`` are canonical coordinates in
-    the row basis of ``supercell_matrix``. Axis ``i`` lies in the half-open interval
-    ``[0, repeats[i])``. Conventional-cell coordinates can therefore be reconstructed
-    exactly as ``coordinate_numerators @ supercell_matrix / coordinate_denominator``.
+    ``coordinate_numerators / coordinate_denominator`` are canonical coordinates in the
+    row basis of ``supercell_matrix``. Axis ``i`` lies in the half-open interval ``[0,
+    repeats[i])``. Conventional-cell coordinates can therefore be reconstructed exactly
+    as ``coordinate_numerators @ supercell_matrix / coordinate_denominator``.
     ``basis_indices`` maps each row back to the corresponding rational-basis row.
 
     Site order is the existing quotient-lattice origin order, followed by rational
@@ -127,65 +161,110 @@ class SupercellSites:
         repeats: tuple[int, int, int],
         basis_size: int,
     ) -> None:
+        """Initialize validated immutable exact decorated-site state.
+
+        :param coordinate_numerators: Exact canonical supercell-coordinate numerators
+            with shape ``(site_count, 3)``.
+        :param basis_denominator: Positive denominator of the rational conventional
+            basis.
+        :param basis_indices: Rational-basis row index for every coordinate row.
+        :param supercell_matrix: Nonsingular exact 3 by 3 supercell matrix.
+        :param repeats: Three positive supercell repeat counts.
+        :param basis_size: Number of rows in the rational decorated basis.
+        :raises ValueError: If an input is malformed or any exact population,
+            coordinate-bound, or uniqueness invariant fails.
+        """
         denominator = _positive_integer(
             basis_denominator,
             name="basis_denominator",
         )
-        validated_repeats = _validated_repeats(*repeats)
-        validated_basis_size = _positive_integer(basis_size, name="basis_size")
+
+        try:
+            repeat_values = tuple(repeats)
+        except TypeError as exc:
+            raise ValueError(
+                "repeats must be a length-3 sequence of positive integers."
+            ) from exc
+        if len(repeat_values) != 3:
+            raise ValueError(
+                "repeats must be a length-3 sequence of positive integers; got length "
+                f"{len(repeat_values)}."
+            )
+        validated_repeats = _validated_repeats(*repeat_values)
+
+        validated_basis_size = _positive_integer(
+            basis_size,
+            name="basis_size",
+        )
 
         try:
             int_supercell = as_int_array(supercell_matrix, (3, 3), "S")
         except CrystallographyValueError as exc:
             raise ValueError(str(exc)) from exc
+
         determinant = integer_det3(int_supercell)
         if determinant == 0:
             raise ValueError("SupercellSites requires non-singular S.")
+
         supercell_index = abs(determinant)
         supercell_rows = tuple(
-            tuple(int(value) for value in row) for row in int_supercell
+            tuple(int(value) for value in row)
+            for row in int_supercell
         )
 
         coordinate_rows = _exact_integer_rows(
             coordinate_numerators,
             name="coordinate_numerators",
         )
-        if coordinate_rows and len(coordinate_rows[0]) != 3:
-            raise ValueError(
-                "coordinate_numerators must have shape (site_count, 3); "
-                f"got ({len(coordinate_rows)}, {len(coordinate_rows[0])})."
-            )
         if not coordinate_rows:
-            raise ValueError("coordinate_numerators must contain at least one site.")
+            raise ValueError(
+                "coordinate_numerators must contain at least one site."
+            )
         if any(len(row) != 3 for row in coordinate_rows):
-            raise ValueError("coordinate_numerators must have shape (site_count, 3).")
+            raise ValueError(
+                "coordinate_numerators must have shape (site_count, 3)."
+            )
 
-        raw_basis_indices = np.asarray(basis_indices, dtype=object)
-        if raw_basis_indices.ndim != 1 or len(raw_basis_indices) != len(coordinate_rows):
+        try:
+            raw_basis_indices = np.asarray(basis_indices, dtype=object)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "basis_indices must be a one-dimensional exact-integer array."
+            ) from exc
+
+        if (
+            raw_basis_indices.ndim != 1
+            or len(raw_basis_indices) != len(coordinate_rows)
+        ):
             raise ValueError(
                 "basis_indices must have shape (site_count,) parallel to "
                 f"coordinate_numerators; got {raw_basis_indices.shape}."
             )
-        basis_index_values = []
-        for value in raw_basis_indices:
-            if isinstance(value, (bool, np.bool_)) or not isinstance(
-                value, (int, np.integer)
-            ):
-                raise ValueError(
-                    f"basis_indices must contain only integers; got {value!r}."
-                )
-            index = int(value)
+
+        try:
+            exact_basis_indices = as_int_array(
+                raw_basis_indices,
+                raw_basis_indices.shape,
+                "basis_indices",
+            )
+        except CrystallographyValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+        basis_index_tuple = tuple(
+            int(value)
+            for value in exact_basis_indices
+        )
+        for index in basis_index_tuple:
             if index < 0 or index >= validated_basis_size:
                 raise ValueError(
-                    "basis_indices must lie in the half-open interval "
-                    f"[0, basis_size); got {index}."
+                    "basis_indices must lie in the half-open interval [0, "
+                    f"basis_size); got {index}."
                 )
-            basis_index_values.append(index)
-        basis_index_tuple = tuple(basis_index_values)
 
         coordinate_denominator = denominator * supercell_index
         upper_bounds = tuple(
-            repeat * coordinate_denominator for repeat in validated_repeats
+            repeat * coordinate_denominator
+            for repeat in validated_repeats
         )
         for row in coordinate_rows:
             if any(
@@ -204,18 +283,22 @@ class SupercellSites:
                 f"SupercellSites expected {expected_sites} sites but received "
                 f"{len(coordinate_rows)}."
             )
+
         counts = Counter(basis_index_tuple)
-        if any(counts[index] != expected_per_basis for index in range(validated_basis_size)):
+        if any(
+            counts[index] != expected_per_basis
+            for index in range(validated_basis_size)
+        ):
             raise ValueError(
                 "SupercellSites basis-index populations do not match the exact "
                 "quotient-lattice origin count."
             )
 
-        decorated_representatives = tuple(zip(coordinate_rows, basis_index_tuple))
-        if len(decorated_representatives) != len(set(decorated_representatives)):
+        # Basis identity does not make a duplicated physical coordinate valid.
+        if len(coordinate_rows) != len(set(coordinate_rows)):
             raise ValueError(
-                "SupercellSites contains duplicate wrapped exact representatives "
-                "for the same decorated basis identity."
+                "SupercellSites contains duplicate wrapped exact coordinate "
+                "representatives."
             )
 
         object.__setattr__(self, "basis_denominator", denominator)
@@ -279,7 +362,7 @@ def _integer_membership(
     :return: ``True`` if ``origin`` lies inside the repeated supercell.
     """
     abs_det = abs(det_S)
-    # u_num[j] = sum_k origin[k] * adj_S[k][j]   (row-vector @ matrix)
+    # u_num[j] = sum_k origin[k] * adj_S[k][j] (row-vector @ matrix)
     u_num = [sum(int(origin[k]) * adj_S[k][j] for k in range(3)) for j in range(3)]
     if det_S < 0:
         u_num = [-u for u in u_num]
@@ -311,17 +394,17 @@ def build_supercell_matrix(P: np.ndarray) -> np.ndarray:
     det_S = integer_det3(supercell)
     if det_S == 0:
         raise ValueError(
-            f"Supercell matrix S derived from P is singular (det_S=0). "
-            f"P = {supercell_obj.tolist()}. The in-plane rows P[1], P[2] must be "
-            "linearly independent."
+            "Supercell matrix S derived from P is singular (det_S=0). P = "
+            f"{supercell_obj.tolist()}. The in-plane rows P[1], P[2] must be linearly "
+            "independent."
         )
     expected_s0 = row_gcd_reduce(
         np.array(cross_int3(supercell[1], supercell[2]), dtype=object)
     )
     if not np.array_equal(expected_s0.astype(int), supercell[0]):
         raise ValueError(
-            f"P[0]={supercell[0].tolist()} does not equal gcd_reduce(cross(P[1], P[2]))"
-            f"={expected_s0.tolist()}; P must be canonical and right-handed."
+            f"P[0]={supercell[0].tolist()} does not equal gcd_reduce(cross(P[1], "
+            f"P[2]))={expected_s0.tolist()}; P must be canonical and right-handed."
         )
     return supercell
 
@@ -333,47 +416,153 @@ def _enumerate_validated_origins(
     repeat_z: int,
     det_S: int,
 ) -> np.ndarray:
-    """Enumerate origin representatives for a validated nonsingular supercell."""
-    adj_S = integer_adj3(int_supercell)
+    """Enumerate repeated-supercell origin representatives output-proportionally.
 
-    # Bounding box from the 8 parallelepiped corners. Iteration over ``product`` is
-    # lexicographic and intentionally defines the existing deterministic origin order.
-    corners = np.array(
-        [
-            i * repeat_x * int_supercell[0]
-            + j * repeat_y * int_supercell[1]
-            + k * repeat_z * int_supercell[2]
-            for i in (0, 1)
-            for j in (0, 1)
-            for k in (0, 1)
-        ],
+    Smith normal form enumerates exactly the quotient-lattice classes. Each class is
+    then mapped into the original repeated half-open supercell using exact adjugate
+    arithmetic. The final lexicographic sort preserves the established order produced by
+    the former Cartesian bounding-box traversal.
+
+    :param int_supercell: Validated nonsingular 3 by 3 exact integer matrix.
+    :param repeat_x: Positive repeat count along row zero.
+    :param repeat_y: Positive repeat count along row one.
+    :param repeat_z: Positive repeat count along row two.
+    :param det_S: Exact determinant of ``int_supercell``.
+    :return: Object-dtype array containing one Python-integer representative per
+        repeated-supercell quotient-lattice class.
+    :raises ValueError: If ``det_S`` is inconsistent, normal-form construction fails, an
+        exact divisibility invariant fails, or the resulting representatives do not
+        satisfy count, uniqueness, or membership invariants.
+    """
+    actual_det = integer_det3(int_supercell)
+    if actual_det != det_S:
+        raise ValueError(
+            "det_S does not match the validated supercell determinant: expected "
+            f"{actual_det}, got {det_S}."
+        )
+
+    repeated_supercell = np.array(
+        int_supercell,
+        dtype=object,
+        copy=True,
+    )
+    repeated_supercell[0, :] *= repeat_x
+    repeated_supercell[1, :] *= repeat_y
+    repeated_supercell[2, :] *= repeat_z
+
+    repeated_det = integer_det3(repeated_supercell)
+    expected = repeat_x * repeat_y * repeat_z * abs(det_S)
+    if abs(repeated_det) != expected:
+        raise ValueError(
+            "Repeated-supercell determinant does not match the expected quotient "
+            f"index: expected {expected}, got {abs(repeated_det)}."
+        )
+
+    try:
+        decomposition = smith_normal_form_3x3(repeated_supercell)
+    except ExactNormalFormError as exc:
+        raise ValueError(
+            f"Could not enumerate supercell origins by Smith normal form: {exc}"
+        ) from exc
+
+    smith_diagonal = tuple(
+        abs(int(decomposition.D[index, index]))
+        for index in range(3)
+    )
+    if prod(smith_diagonal) != expected:
+        raise ValueError(
+            "Smith normal-form diagonal does not reproduce the repeated supercell "
+            f"index {expected}: got {smith_diagonal}."
+        )
+
+    transform_det = integer_det3(decomposition.V)
+    if abs(transform_det) != 1:
+        raise ValueError(
+            "Smith normal-form right transformation is not unimodular."
+        )
+
+    inverse_transform = np.asarray(
+        integer_adj3(decomposition.V),
         dtype=object,
     )
-    lower_bound = [int(corners[:, d].min()) - 1 for d in range(3)]
-    upper_bound = [int(corners[:, d].max()) + 1 for d in range(3)]
-    ranges = [range(lower_bound[d], upper_bound[d] + 1) for d in range(3)]
+    if transform_det < 0:
+        inverse_transform = -inverse_transform
 
-    accepted = [
-        tuple(row)
-        for row in product(*ranges)
-        if _integer_membership(
+    repeated_adjugate = np.asarray(
+        integer_adj3(repeated_supercell),
+        dtype=object,
+    )
+    repeated_index = abs(repeated_det)
+
+    representatives: list[tuple[int, int, int]] = []
+    for residue in product(
+        *(range(diagonal) for diagonal in smith_diagonal)
+    ):
+        quotient_representative = (
+            np.asarray(residue, dtype=object) @ inverse_transform
+        )
+
+        coordinate_numerators = (
+            quotient_representative @ repeated_adjugate
+        )
+        if repeated_det < 0:
+            coordinate_numerators = -coordinate_numerators
+
+        wrapped_numerators = np.asarray(
+            [
+                int(value) % repeated_index
+                for value in coordinate_numerators
+            ],
+            dtype=object,
+        )
+        conventional_numerators = (
+            wrapped_numerators @ repeated_supercell
+        )
+
+        conventional_row = []
+        for value in conventional_numerators:
+            quotient, remainder = divmod(
+                int(value),
+                repeated_index,
+            )
+            if remainder != 0:
+                raise ValueError(
+                    "Exact origin reconstruction was not divisible by the "
+                    "repeated-supercell index."
+                )
+            conventional_row.append(quotient)
+
+        representatives.append(tuple(conventional_row))
+
+    representatives.sort()
+
+    if len(representatives) != expected:
+        raise ValueError(
+            f"Expected {expected} origins but produced {len(representatives)}."
+        )
+    if len(set(representatives)) != expected:
+        raise ValueError(
+            "Origin enumeration produced duplicate quotient-lattice representatives."
+        )
+
+    original_adjugate = integer_adj3(int_supercell)
+    if any(
+        not _integer_membership(
             row,
-            adj_S,
+            original_adjugate,
             det_S,
             repeat_x,
             repeat_y,
             repeat_z,
         )
-    ]
-
-    expected = repeat_x * repeat_y * repeat_z * abs(det_S)
-    if len(accepted) != expected:
+        for row in representatives
+    ):
         raise ValueError(
-            f"expected {expected} origins "
-            f"(repeat={repeat_x},{repeat_y},{repeat_z}, |det|={abs(det_S)}) "
-            f"but got {len(accepted)}. supercell = {int_supercell.tolist()}"
+            "Origin enumeration produced a representative outside the repeated "
+            "half-open supercell."
         )
-    return np.array(accepted, dtype=object)
+
+    return np.asarray(representatives, dtype=object)
 
 
 def enumerate_supercell_origins(
@@ -382,23 +571,20 @@ def enumerate_supercell_origins(
     repeat_y: int,
     repeat_z: int,
 ) -> np.ndarray:
-    """Enumerate all integer conventional-cell origins inside the repeated supercell.
+    """Enumerate integer conventional-cell origins in a repeated supercell.
 
     The repeated supercell is spanned by ``repeat_x * s0``, ``repeat_y * s1``, and
-    ``repeat_z * s2``. Candidates are drawn from the integer bounding box of the eight
-    parallelepiped corners, padded by one lattice step. Membership is tested with
-    ``_integer_membership``, so no floating-point selection is used.
+    ``repeat_z * s2``. Membership and enumeration use exact integer arithmetic only.
 
-    :param supercell: 3 by 3 integer supercell matrix with rows ``s0``, ``s1``, and
-        ``s2``.
-    :param repeat_x: Number of repeats along ``s0``.
-    :param repeat_y: Number of repeats along ``s1``.
-    :param repeat_z: Number of repeats along ``s2``.
-    :return: Array of shape ``(N, 3)`` of accepted integer origins, where ``N ==
-        repeat_x * repeat_y * repeat_z * abs(det(S))``.
-    :raises ValueError: If ``supercell`` cannot be converted to an exact integer matrix,
-        ``supercell`` is singular or has negative determinant, a repeat count is not a
-        positive integer, or the accepted count does not match the expected value.
+    :param supercell: Exact 3 by 3 integer supercell matrix with rows ``s0``, ``s1``,
+        and ``s2``.
+    :param repeat_x: Positive repeat count along ``s0``.
+    :param repeat_y: Positive repeat count along ``s1``.
+    :param repeat_z: Positive repeat count along ``s2``.
+    :return: Object-dtype array of shape ``(N, 3)`` containing Python integers, where
+        ``N == repeat_x * repeat_y * repeat_z * abs(det(S))``.
+    :raises ValueError: If ``supercell`` is malformed, singular, or left-handed; if a
+        repeat count is invalid; or if an exact enumeration invariant fails.
     """
     try:
         int_supercell = as_int_array(supercell, (3, 3), "S")
@@ -413,92 +599,69 @@ def enumerate_supercell_origins(
 
     det_S = integer_det3(int_supercell)
     if det_S == 0:
-        raise ValueError("enumerate_supercell_origins requires non-singular S.")
+        raise ValueError(
+            "enumerate_supercell_origins requires non-singular S."
+        )
     if det_S < 0:
         raise ValueError(
             "S must have positive determinant; ensure P was produced by "
-            "canonicalize_pq with right-handed orientation rows. "
-            f"Got det(S)={det_S}, S={int_supercell.tolist()}."
+            f"canonicalize_pq with right-handed orientation rows. Got det(S)={det_S}, "
+            f"S={int_supercell.tolist()}."
         )
-    return np.asarray(
-        _enumerate_validated_origins(
-            int_supercell,
-            repeat_x,
-            repeat_y,
-            repeat_z,
-            det_S,
-        ),
-        dtype=int,
+
+    return _enumerate_validated_origins(
+        int_supercell,
+        repeat_x,
+        repeat_y,
+        repeat_z,
+        det_S,
     )
 
 
 def _validated_rational_basis(
     rational_basis: RationalBasis | None,
-) -> tuple[tuple[str, ...], tuple[tuple[int, int, int], ...], int]:
-    """Return independently validated exact decorated-basis metadata."""
+) -> tuple[
+    tuple[str, ...],
+    tuple[tuple[int, int, int], ...],
+    int,
+]:
+    """Return exact metadata from a validated ``RationalBasis`` value object.
+
+    ``RationalBasis`` owns validation of species names, numerator shape and exactness,
+    denominator positivity, canonical coordinate bounds, defensive copying, and
+    immutability. This adapter only enforces that the declared value-object contract was
+    actually supplied.
+
+    :param rational_basis: Exact immutable basis metadata from ``UnitCell``.
+    :return: Species names, immutable exact numerator rows, and the positive common
+        denominator.
+    :raises ValueError: If rational metadata is absent or is not a ``RationalBasis``
+        instance.
+    """
     if rational_basis is None:
         raise ValueError(
             "Exact decorated-site enumeration requires UnitCell.rational_basis; "
             "arbitrary floating-point basis coordinates are not rationalized."
         )
 
-    try:
-        raw_names = rational_basis.names
-        raw_numerators = rational_basis.numerators
-        raw_denominator = rational_basis.denominator
-    except AttributeError as exc:
-        raise ValueError(
-            "rational_basis must provide names, numerators, and denominator metadata."
-        ) from exc
+    # Local import avoids introducing a module-import cycle while still enforcing the
+    # declared runtime contract.
+    from GBOpt.UnitCell import RationalBasis
 
-    if isinstance(raw_names, str):
-        raise ValueError("rational_basis names must be a sequence of strings.")
-    try:
-        names = tuple(raw_names)
-    except TypeError as exc:
-        raise ValueError("rational_basis names must be a sequence of strings.") from exc
-    if not names:
-        raise ValueError("rational_basis must contain at least one decorated site.")
-    if any(not isinstance(name, str) for name in names):
-        raise ValueError("rational_basis names must contain only strings.")
-
-    denominator = _positive_integer(
-        raw_denominator,
-        name="rational_basis denominator",
-    )
-
-    try:
-        numerator_array = np.asarray(raw_numerators, dtype=object)
-    except ValueError as exc:
+    if not isinstance(rational_basis, RationalBasis):
         raise ValueError(
-            "rational_basis numerators must have shape (basis_size, 3)."
-        ) from exc
-    if numerator_array.ndim != 2 or numerator_array.shape[1] != 3:
-        raise ValueError(
-            "rational_basis numerators must have shape (basis_size, 3); "
-            f"got {numerator_array.shape}."
-        )
-    if numerator_array.shape[0] != len(names):
-        raise ValueError(
-            "rational_basis species names and numerator rows must have equal lengths."
+            "rational_basis must be a validated UnitCell.RationalBasis instance."
         )
 
-    numerator_rows = _exact_integer_rows(
-        numerator_array,
-        name="rational_basis numerators",
+    numerator_rows = tuple(
+        tuple(int(value) for value in row)
+        for row in rational_basis.numerators
     )
-    for row in numerator_rows:
-        if any(value < 0 or value >= denominator for value in row):
-            raise ValueError(
-                "rational_basis coordinates must lie in the canonical half-open "
-                "interval [0, denominator)."
-            )
-
-    decorated_rows = tuple(zip(names, numerator_rows))
-    if len(decorated_rows) != len(set(decorated_rows)):
-        raise ValueError("rational_basis contains duplicate decorated basis rows.")
-
-    return names, numerator_rows, denominator
+    return (
+        rational_basis.names,
+        numerator_rows,
+        rational_basis.denominator,
+    )
 
 
 def enumerate_supercell_sites(
@@ -511,79 +674,132 @@ def enumerate_supercell_sites(
 ) -> SupercellSites:
     """Enumerate exact decorated sites inside a repeated integer supercell.
 
-    Existing quotient-lattice origin representatives are traversed in their established
-    deterministic order. Every rational decorated-basis row is then attached in basis
-    order. Each site is transformed with integer adjugate arithmetic and wrapped into
-    the repeated half-open supercell. No floating-point membership decision or
-    Cartesian clipping is performed.
+    Quotient-lattice origin representatives are traversed in their established
+    deterministic order, followed by rational decorated-basis row order. Each decorated
+    site is transformed with exact adjugate arithmetic, verified against the defining
+    reconstruction identity, and wrapped into the repeated half-open supercell. No
+    floating-point membership decision is performed.
 
-    :param supercell: Nonsingular 3 by 3 integer supercell matrix ``S``. Either
+    :param supercell: Nonsingular exact 3 by 3 supercell matrix ``S``. Either
         determinant sign is accepted.
-    :param repeat_x: Number of repeats along ``S[0]``.
-    :param repeat_y: Number of repeats along ``S[1]``.
-    :param repeat_z: Number of repeats along ``S[2]``.
-    :param rational_basis: Exact decorated basis from ``UnitCell.rational_basis``.
-        ``None`` is rejected rather than approximating a floating-point basis.
-    :return: Immutable exact supercell-coordinate representatives and basis-row indices.
-    :raises ValueError: If an input is malformed, the supercell is singular, rational
-        metadata is absent or invalid, or an internal exact invariant fails.
+    :param repeat_x: Positive repeat count along ``S[0]``.
+    :param repeat_y: Positive repeat count along ``S[1]``.
+    :param repeat_z: Positive repeat count along ``S[2]``.
+    :param rational_basis: Validated exact basis metadata from
+        ``UnitCell.rational_basis``.
+    :return: Immutable exact supercell representatives and corresponding rational-basis
+        row indices.
+    :raises ValueError: If an input is malformed, ``S`` is singular, rational metadata
+        is unavailable, or an exact count, reconstruction, wrapping, population, or
+        uniqueness invariant fails.
     """
     try:
         int_supercell = as_int_array(supercell, (3, 3), "S")
     except CrystallographyValueError as exc:
         raise ValueError(str(exc)) from exc
 
-    repeats = _validated_repeats(repeat_x, repeat_y, repeat_z)
-    _, basis_rows, basis_denominator = _validated_rational_basis(rational_basis)
+    repeats = _validated_repeats(
+        repeat_x,
+        repeat_y,
+        repeat_z,
+    )
+    _, basis_rows, basis_denominator = _validated_rational_basis(
+        rational_basis
+    )
 
     det_S = integer_det3(int_supercell)
     if det_S == 0:
-        raise ValueError("enumerate_supercell_sites requires non-singular S.")
+        raise ValueError(
+            "enumerate_supercell_sites requires non-singular S."
+        )
+
     abs_det = abs(det_S)
-    adj_S = np.asarray(integer_adj3(int_supercell), dtype=object)
+    adj_S = np.asarray(
+        integer_adj3(int_supercell),
+        dtype=object,
+    )
     origins = _enumerate_validated_origins(
         int_supercell,
         *repeats,
         det_S,
     )
 
+    expected_origins = abs_det * prod(repeats)
+    if len(origins) != expected_origins:
+        raise ValueError(
+            "Origin enumeration returned an unexpected exact population: expected "
+            f"{expected_origins}, got {len(origins)}."
+        )
+
     coordinate_denominator = basis_denominator * abs_det
     wrap_limits = tuple(
-        repeat * coordinate_denominator for repeat in repeats
+        repeat * coordinate_denominator
+        for repeat in repeats
     )
-    coordinate_rows: list[tuple[int, int, int]] = []
-    basis_indices: list[int] = []
+    expected_sites = len(basis_rows) * expected_origins
 
+    coordinate_numerators = np.empty(
+        (expected_sites, 3),
+        dtype=object,
+    )
+    basis_indices = np.empty(
+        expected_sites,
+        dtype=np.intp,
+    )
+
+    site_index = 0
     for origin in origins:
+        exact_origin = tuple(int(value) for value in origin)
+
         for basis_index, basis_row in enumerate(basis_rows):
             site_numerator = np.asarray(
                 tuple(
-                    basis_denominator * int(origin[axis]) + basis_row[axis]
+                    basis_denominator * exact_origin[axis]
+                    + basis_row[axis]
                     for axis in range(3)
                 ),
                 dtype=object,
             )
-            supercell_numerator = site_numerator @ adj_S
+
+            unwrapped_supercell_numerator = site_numerator @ adj_S
             if det_S < 0:
-                supercell_numerator = -supercell_numerator
-            wrapped = tuple(
-                int(supercell_numerator[axis]) % wrap_limits[axis]
+                unwrapped_supercell_numerator = (
+                    -unwrapped_supercell_numerator
+                )
+
+            # Verify the row-vector adjugate identity before periodic wrapping: (site @
+            # signed-adj(S)) @ S == site * abs(det(S)).
+            reconstructed_numerator = (
+                unwrapped_supercell_numerator @ int_supercell
+            )
+            expected_numerator = site_numerator * abs_det
+            if not np.array_equal(
+                reconstructed_numerator,
+                expected_numerator,
+            ):
+                raise ValueError(
+                    "Exact decorated-site transformation failed the adjugate "
+                    "reconstruction identity."
+                )
+
+            coordinate_numerators[site_index, :] = tuple(
+                int(unwrapped_supercell_numerator[axis])
+                % wrap_limits[axis]
                 for axis in range(3)
             )
-            coordinate_rows.append(wrapped)
-            basis_indices.append(basis_index)
+            basis_indices[site_index] = basis_index
+            site_index += 1
 
-    expected = len(basis_rows) * abs_det * prod(repeats)
-    if len(coordinate_rows) != expected:
+    if site_index != expected_sites:
         raise ValueError(
-            f"enumerate_supercell_sites expected {expected} sites but produced "
-            f"{len(coordinate_rows)}."
+            f"enumerate_supercell_sites expected {expected_sites} sites but produced "
+            f"{site_index}."
         )
 
     return SupercellSites(
-        coordinate_numerators=np.array(coordinate_rows, dtype=object),
+        coordinate_numerators=coordinate_numerators,
         basis_denominator=basis_denominator,
-        basis_indices=np.array(basis_indices, dtype=int),
+        basis_indices=basis_indices,
         supercell_matrix=int_supercell,
         repeats=repeats,
         basis_size=len(basis_rows),

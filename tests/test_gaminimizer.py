@@ -4,13 +4,15 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from GBOpt.Atom import Atom
+from GBOpt.BoundaryTopology import BoundaryNormalTopology
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBMinimizer import GeneticAlgorithmMinimizer
-
 
 # These tests use compact GBMaker fixtures; sizing-warning behavior is covered in
 # the GBMaker test modules rather than the minimizer contract tests.
@@ -198,9 +200,9 @@ if __name__ == "__main__":
 
 def test_initial_owned_manipulator_preserves_counts_plane_and_runs_owned_ga(tmp_path):
     from GBOpt.FileGrainOwnership import (
-        GrainOwnership,
         LEFT_GRAIN_LABEL,
         RIGHT_GRAIN_LABEL,
+        GrainOwnership,
     )
 
     theta = math.radians(36.869898)
@@ -256,7 +258,6 @@ def test_initial_owned_manipulator_preserves_counts_plane_and_runs_owned_ga(tmp_
     )
 
 
-
 def _write_preserved_id_candidate(path, atoms, ids, box_dims, *, change_species=False):
     order = np.arange(len(atoms))[::-1]
     output = atoms.copy()
@@ -266,8 +267,8 @@ def _write_preserved_id_candidate(path, atoms, ids, box_dims, *, change_species=
         stream.write("GA fake evaluator output\n\n")
         stream.write(f"{len(output)} atoms\n")
         stream.write(f"{len(set(output['name'].tolist()))} atom types\n")
-        for axis, (lower, upper) in zip("xyz", box_dims):
-            stream.write(f"{lower:.12f} {upper:.12f} {axis}lo {axis}hi\n")
+        stream.writelines(f"{lower:.12f} {upper:.12f} {axis}lo {axis}hi\n" for axis,
+                          (lower, upper) in zip("xyz", box_dims))
         stream.write("\nAtoms\n\n")
         for row in order:
             atom = output[row]
@@ -326,8 +327,10 @@ def test_owned_ga_smoke_preserves_crossing_atom_label_and_counts(tmp_path):
         _write_preserved_id_candidate(
             output, candidate, ids, manipulator.parents[0].box_dims
         )
-        crossing_events.append((str(unique_id), crossing_index + 1, int(candidate_labels[crossing_index])))
-        energy = 10.0 if "initial" in str(unique_id) else float(2 - int(str(unique_id).rsplit("c", 1)[-1]))
+        crossing_events.append((str(unique_id), crossing_index + 1,
+                               int(candidate_labels[crossing_index])))
+        energy = 10.0 if "initial" in str(unique_id) else float(
+            2 - int(str(unique_id).rsplit("c", 1)[-1]))
         return energy, str(output)
 
     minimizer = GeneticAlgorithmMinimizer(
@@ -349,8 +352,10 @@ def test_owned_ga_smoke_preserves_crossing_atom_label_and_counts(tmp_path):
     assert best.manipulator.parents[0].whole_system[moved_id - 1]["x"] > gb.gb_plane_x
     assert best.manipulator.parents[0].gb_plane_x == gb.gb_plane_x
     assert len(best.manipulator.parents[0].whole_system) == len(labels)
-    assert np.count_nonzero(best.manipulator.parents[0].grain_labels == 0) == np.count_nonzero(labels == 0)
-    assert np.count_nonzero(best.manipulator.parents[0].grain_labels == 1) == np.count_nonzero(labels == 1)
+    assert np.count_nonzero(
+        best.manipulator.parents[0].grain_labels == 0) == np.count_nonzero(labels == 0)
+    assert np.count_nonzero(
+        best.manipulator.parents[0].grain_labels == 1) == np.count_nonzero(labels == 1)
 
 
 def test_owned_evaluator_failure_is_filtered_before_selection(tmp_path):
@@ -504,3 +509,57 @@ def test_energy_selection_is_stable_for_ties(tmp_path):
     lowest, intermediate = minimizer._select_indices_by_energy([2.0, 1.0, 1.0, 3.0])
     assert lowest == [1, 2]
     assert intermediate == [1, 2, 0, 3]
+
+
+@pytest.mark.parametrize(
+    "topology",
+    [
+        BoundaryNormalTopology.PERIODIC_BICRYSTAL,
+        BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
+    ],
+)
+def test_candidate_file_mapping_preserves_manipulator_geometry(topology):
+    atoms = np.asarray(
+        [
+            ("U", 3.0, 0.0, 1.0),
+            ("O", 7.5, 2.0, 3.0),
+            ("O", 9.0, 4.0, 5.0),
+            ("U", 14.0, 6.0, 7.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    labels = np.asarray([0, 0, 1, 1], dtype=np.int8)
+    parent = SimpleNamespace(
+        box_dims=np.asarray(
+            [[2.0, 16.0], [-1.0, 9.0], [0.0, 10.0]],
+            dtype=float,
+        ),
+        gb_plane_x=8.25,
+        inplane_periodic=(True, True),
+        left_grain_x_bounds=np.asarray([2.5, 8.0]),
+        right_grain_x_bounds=np.asarray([8.5, 15.5]),
+        coordinate_tolerance=1.0e-10,
+        normal_topology=topology,
+    )
+    manipulator = SimpleNamespace(
+        candidate_grain_labels=labels,
+        parents=[parent],
+    )
+
+    minimizer = GeneticAlgorithmMinimizer.__new__(GeneticAlgorithmMinimizer)
+    mapping = minimizer._candidate_file_mapping(manipulator, atoms)
+
+    assert mapping.normal_topology is topology
+    assert mapping.periodic_outer_x_interface == (
+        topology is BoundaryNormalTopology.PERIODIC_BICRYSTAL
+    )
+    assert np.array_equal(mapping.box_dims, parent.box_dims)
+    assert mapping.gb_plane_x == parent.gb_plane_x
+    assert np.array_equal(
+        mapping.left_grain_x_bounds,
+        parent.left_grain_x_bounds,
+    )
+    assert np.array_equal(
+        mapping.right_grain_x_bounds,
+        parent.right_grain_x_bounds,
+    )

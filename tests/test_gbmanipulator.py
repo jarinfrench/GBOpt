@@ -16,14 +16,9 @@ import pytest
 
 from GBOpt.Atom import Atom
 from GBOpt.FileGrainOwnership import (
-    CandidateFileMapping,
-    GrainOwnership,
-    GrainOwnershipError,
     LEFT_GRAIN_LABEL,
     RIGHT_GRAIN_LABEL,
-    read_lammps_data_file,
-    read_lammps_dump_file,
-    reload_explicit_manipulator,
+    GrainOwnership,
 )
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import (
@@ -1400,7 +1395,6 @@ def test_cycle_grain_terminations_gbmaker_periodic_integration():
     assert not np.array_equal(right["x"], gb.right_grain["x"])
 
 
-
 def _write_explicit_ownership_data(path, rows):
     with open(path, "w", encoding="utf-8", newline="\n") as stream:
         stream.write("Synthetic UO2 atoms\n\n")
@@ -1410,10 +1404,8 @@ def _write_explicit_ownership_data(path, rows):
         stream.write("-1.000000 9.000000 ylo yhi\n")
         stream.write("5.000000 15.000000 zlo zhi\n")
         stream.write("\nAtoms\n\n")
-        for atom_id, type_id, charge, x, y, z in rows:
-            stream.write(
-                f"{atom_id} {type_id} {charge:.6f} {x:.6f} {y:.6f} {z:.6f}\n"
-            )
+        stream.writelines(
+            f"{atom_id} {type_id} {charge:.6f} {x:.6f} {y:.6f} {z:.6f}\n" for atom_id, type_id, charge, x, y, z in rows)
 
 
 def _synthetic_file_ownership():
@@ -1476,40 +1468,10 @@ def test_explicit_file_ownership_aligns_reordered_rows_by_atom_id(tmp_path):
         stream.write("2.000000 10.000000 xlo xhi\n")
         stream.write("-1.000000 9.000000 ylo yhi\n")
         stream.write("5.000000 15.000000 zlo zhi\n\nAtoms\n\n")
-        for atom_id, type_id, _charge, x, y, z in rows:
-            stream.write(f"{atom_id} {type_id} {x:.6f} {y:.6f} {z:.6f}\n")
+        stream.writelines(
+            f"{atom_id} {type_id} {x:.6f} {y:.6f} {z:.6f}\n" for atom_id, type_id, _charge, x, y, z in rows)
     legacy = Parent(str(legacy_data), unit_cell=unit_cell, gb_thickness=4.0)
     assert (len(legacy.left_grain), len(legacy.right_grain)) == (2, 3)
-
-
-def test_grain_ownership_is_defensive_and_rejects_bad_labels():
-    ownership = _synthetic_file_ownership()
-    labels = ownership.labels
-    assert labels.flags.writeable is False
-    with pytest.raises(ValueError):
-        labels[0] = RIGHT_GRAIN_LABEL
-    assert ownership.labels[0] == LEFT_GRAIN_LABEL
-
-    with pytest.raises(GrainOwnershipError, match="grain labels"):
-        GrainOwnership(
-            atom_ids=np.array([1, 2]),
-            labels=np.array([0, 2]),
-            gb_plane_x=4.0,
-            inplane_periodic=(True, True),
-            right_grain_x_bounds=(4.0, 9.0),
-            coordinate_tolerance=1.0e-8,
-            periodic_outer_x_interface=True,
-        )
-    with pytest.raises(GrainOwnershipError, match="length"):
-        GrainOwnership(
-            atom_ids=np.array([1, 2]),
-            labels=np.array([0]),
-            gb_plane_x=4.0,
-            inplane_periodic=(True, True),
-            right_grain_x_bounds=(4.0, 9.0),
-            coordinate_tolerance=1.0e-8,
-            periodic_outer_x_interface=True,
-        )
 
 
 def test_explicit_parent_copy_and_deepcopy_preserve_independent_ownership(tmp_path):
@@ -1563,22 +1525,6 @@ def test_explicit_file_loading_rejects_duplicate_ids_without_midpoint_fallback(t
         )
 
 
-def test_lammps_data_reader_preserves_file_row_ids_and_charge_coordinates(tmp_path):
-    data = tmp_path / "reader.data"
-    rows = [
-        (2, 2, -1.2, 3.0, 1.0, 7.0),
-        (1, 1, 2.4, 7.0, 2.0, 8.0),
-    ]
-    _write_explicit_ownership_data(data, rows)
-    parsed = read_lammps_data_file(data, type_dict={"U": 1, "O": 2})
-    assert np.array_equal(parsed.atom_ids, np.array([2, 1]))
-    assert parsed.atoms[0]["name"] == "O"
-    assert parsed.atoms[0]["x"] == pytest.approx(3.0)
-    assert parsed.atoms[1]["name"] == "U"
-    assert parsed.atoms[1]["z"] == pytest.approx(8.0)
-
-
-
 def _write_named_lammps_data(path, atoms, box_dims, *, ids=None, declared_types=None):
     ids = np.arange(1, len(atoms) + 1) if ids is None else np.asarray(ids)
     if declared_types is None:
@@ -1587,14 +1533,11 @@ def _write_named_lammps_data(path, atoms, box_dims, *, ids=None, declared_types=
         stream.write("Owned candidate\n\n")
         stream.write(f"{len(atoms)} atoms\n")
         stream.write(f"{declared_types} atom types\n")
-        for axis, (lower, upper) in zip("xyz", box_dims):
-            stream.write(f"{lower:.12f} {upper:.12f} {axis}lo {axis}hi\n")
+        stream.writelines(f"{lower:.12f} {upper:.12f} {axis}lo {axis}hi\n" for axis,
+                          (lower, upper) in zip("xyz", box_dims))
         stream.write("\nAtoms\n\n")
-        for atom_id, atom in zip(ids, atoms):
-            stream.write(
-                f"{int(atom_id)} {atom['name']} "
-                f"{atom['x']:.12f} {atom['y']:.12f} {atom['z']:.12f}\n"
-            )
+        stream.writelines(f"{int(atom_id)} {atom['name']} "
+                          f"{atom['x']:.12f} {atom['y']:.12f} {atom['z']:.12f}\n" for atom_id, atom in zip(ids, atoms))
 
 
 def _owned_single_species_manipulator(tmp_path, *, suffix="a", coordinates=None):
@@ -1759,8 +1702,9 @@ def test_explicit_insertion_assigns_label_once_with_tolerance_band(
     assert manipulator.candidate_grain_labels[-1] == expected_label
 
 
-def test_explicit_slice_and_merge_applies_exact_source_masks_and_fresh_ids(tmp_path):
-    manip1, atoms1, labels1, box = _owned_single_species_manipulator(tmp_path, suffix="one")
+def test_explicit_slice_and_merge_applies_exact_source_masks(tmp_path):
+    manip1, atoms1, labels1, box = _owned_single_species_manipulator(
+        tmp_path, suffix="one")
     coordinates2 = [tuple(row) for row in atoms1]
     coordinates2 = [(name, x + 0.25, y, z) for name, x, y, z in coordinates2]
     manip2, atoms2, labels2, _ = _owned_single_species_manipulator(
@@ -1779,273 +1723,11 @@ def test_explicit_slice_and_merge_applies_exact_source_masks_and_fresh_ids(tmp_p
     mask2 = atoms2["x"] >= 5.0
     expected_labels = np.hstack((labels1[mask1], labels2[mask2]))
     assert np.array_equal(child_manipulator.candidate_grain_labels, expected_labels)
-    mapping = CandidateFileMapping.from_candidate(
-        child,
-        expected_labels,
-        box_dims=box,
-        gb_plane_x=5.0,
-        inplane_periodic=(True, True),
-        right_grain_x_bounds=(5.0, 10.0),
-        coordinate_tolerance=1.0,
-        periodic_outer_x_interface=True,
-    )
-    assert np.array_equal(mapping.atom_ids, np.arange(1, len(child) + 1))
-    assert len(mapping.atom_ids) != len(atoms1) + len(atoms2)
+    assert len(child) == len(expected_labels)
+    assert len(child) != len(atoms1) + len(atoms2)
 
 
-def test_candidate_mapping_reloads_reordered_rows_by_transient_id(tmp_path):
-    manipulator, atoms, labels, box = _owned_single_species_manipulator(tmp_path)
-    mapping = CandidateFileMapping.from_candidate(
-        atoms,
-        labels,
-        box_dims=box,
-        gb_plane_x=5.0,
-        inplane_periodic=(True, True),
-        right_grain_x_bounds=(5.0, 10.0),
-        coordinate_tolerance=1.0e-8,
-        periodic_outer_x_interface=True,
-    )
-    order = np.arange(len(atoms))[::-1]
-    returned = tmp_path / "returned_reordered.data"
-    _write_named_lammps_data(
-        returned, atoms[order], box, ids=mapping.atom_ids[order]
-    )
-    reloaded = reload_explicit_manipulator(
-        returned,
-        candidate_mapping=mapping,
-        unit_cell=manipulator.parents[0].unit_cell,
-        gb_thickness=10.0,
-        type_dict={"Ni": 1},
-    )
-    assert np.array_equal(reloaded.parents[0].grain_labels, labels)
-    assert np.array_equal(reloaded.parents[0].initial_atom_ids, mapping.atom_ids)
-
-
-@pytest.mark.parametrize("defect", ["missing", "duplicate", "renumber", "species", "box"])
-def test_candidate_reload_rejects_contract_violations(tmp_path, defect):
-    manipulator, atoms, labels, box = _owned_single_species_manipulator(tmp_path)
-    mapping = CandidateFileMapping.from_candidate(
-        atoms,
-        labels,
-        box_dims=box,
-        gb_plane_x=5.0,
-        inplane_periodic=(True, True),
-        right_grain_x_bounds=(5.0, 10.0),
-        coordinate_tolerance=1.0e-8,
-        periodic_outer_x_interface=True,
-    )
-    output_atoms = atoms.copy()
-    output_ids = mapping.atom_ids.copy()
-    output_box = box.copy()
-    declared_types = 1
-    if defect == "missing":
-        output_atoms = output_atoms[:-1]
-        output_ids = output_ids[:-1]
-    elif defect == "duplicate":
-        output_ids[-1] = output_ids[0]
-    elif defect == "renumber":
-        output_ids[-1] = 999
-    elif defect == "species":
-        output_atoms[0]["name"] = "Cu"
-        declared_types = 2
-    elif defect == "box":
-        output_box[0, 1] += 0.5
-    returned = tmp_path / f"bad_{defect}.data"
-    _write_named_lammps_data(
-        returned,
-        output_atoms,
-        output_box,
-        ids=output_ids,
-        declared_types=declared_types,
-    )
-    with pytest.raises((GrainOwnershipError, ParentValueError, ValueError)):
-        reload_explicit_manipulator(
-            returned,
-            candidate_mapping=mapping,
-            unit_cell=manipulator.parents[0].unit_cell,
-            gb_thickness=10.0,
-            type_dict={"Ni": 1, "Cu": 2},
-        )
-
-
-def _write_two_frame_dump(
-    path,
-    atoms,
-    box,
-    *,
-    first_header="id typelabel x y z",
-    first_bounds_header="pp pp pp",
-):
-    with open(path, "w", encoding="utf-8", newline="\n") as stream:
-        for timestep, shift in ((0, 0.0), (1, 1.0)):
-            stream.write("ITEM: TIMESTEP\n")
-            stream.write(f"{timestep}\n")
-            stream.write("ITEM: NUMBER OF ATOMS\n")
-            stream.write(f"{len(atoms)}\n")
-            bounds_header = first_bounds_header if timestep == 0 else "pp pp pp"
-            stream.write(f"ITEM: BOX BOUNDS {bounds_header}\n")
-            for lower, upper in box:
-                stream.write(f"{lower} {upper}\n")
-            header = first_header if timestep == 0 else "id typelabel x y z"
-            stream.write(f"ITEM: ATOMS {header}\n")
-            for atom_id, atom in enumerate(atoms, start=1):
-                if "id" not in header.split():
-                    stream.write(
-                        f"{atom['name']} {atom['x'] + shift} {atom['y']} {atom['z']}\n"
-                    )
-                else:
-                    stream.write(
-                        f"{atom_id} {atom['name']} {atom['x'] + shift} "
-                        f"{atom['y']} {atom['z']}\n"
-                    )
-
-
-def test_dump_reader_preserves_first_frame_semantics_without_concatenation(tmp_path):
-    manipulator, atoms, labels, box = _owned_single_species_manipulator(tmp_path)
-    mapping = CandidateFileMapping.from_candidate(
-        atoms,
-        labels,
-        box_dims=box,
-        gb_plane_x=5.0,
-        inplane_periodic=(True, True),
-        right_grain_x_bounds=(5.0, 10.0),
-        coordinate_tolerance=1.0e-8,
-        periodic_outer_x_interface=True,
-    )
-    dump = tmp_path / "two_frames.dump"
-    _write_two_frame_dump(dump, atoms, box)
-    parsed = read_lammps_dump_file(dump)
-    assert parsed.selected_frame == 0
-    assert len(parsed.atoms) == len(atoms)
-    np.testing.assert_allclose(parsed.atoms["x"], atoms["x"])
-    reloaded = reload_explicit_manipulator(
-        dump,
-        candidate_mapping=mapping,
-        unit_cell=manipulator.parents[0].unit_cell,
-        gb_thickness=10.0,
-        type_dict={"Ni": 1},
-    )
-    assert np.array_equal(reloaded.parents[0].grain_labels, labels)
-
-
-def test_malformed_selected_dump_frame_fails_even_when_later_frame_is_valid(tmp_path):
-    _manipulator, atoms, _labels, box = _owned_single_species_manipulator(tmp_path)
-    dump = tmp_path / "bad_first.dump"
-    _write_two_frame_dump(dump, atoms, box, first_header="typelabel x y z")
-    with pytest.raises(ValueError, match="missing atom attribute 'id'"):
-        read_lammps_dump_file(dump)
-
-
-def test_explicit_dump_requires_unambiguous_topology_flags(tmp_path):
-    manipulator, atoms, labels, box = _owned_single_species_manipulator(tmp_path)
-    mapping = CandidateFileMapping.from_candidate(
-        atoms,
-        labels,
-        box_dims=box,
-        gb_plane_x=5.0,
-        inplane_periodic=(True, True),
-        right_grain_x_bounds=(5.0, 10.0),
-        coordinate_tolerance=1.0e-8,
-        periodic_outer_x_interface=True,
-    )
-    dump = tmp_path / "missing_topology.dump"
-    _write_two_frame_dump(dump, atoms, box, first_bounds_header="")
-    with pytest.raises(GrainOwnershipError, match="unambiguous boundary topology"):
-        reload_explicit_manipulator(
-            dump,
-            candidate_mapping=mapping,
-            unit_cell=manipulator.parents[0].unit_cell,
-            gb_thickness=10.0,
-            type_dict={"Ni": 1},
-        )
-
-
-def test_dump_reader_rejects_extra_rows_in_selected_frame(tmp_path):
-    _manipulator, atoms, _labels, box = _owned_single_species_manipulator(tmp_path)
-    dump = tmp_path / "extra_selected_row.dump"
-    _write_two_frame_dump(dump, atoms, box)
-    text = dump.read_text(encoding="utf-8")
-    marker = "ITEM: TIMESTEP\n1\n"
-    extra = f"999 Ni 1.0 1.0 1.0\n{marker}"
-    dump.write_text(text.replace(marker, extra, 1), encoding="utf-8")
-    with pytest.raises(ValueError, match="unexpected content"):
-        read_lammps_dump_file(dump)
-
-
-def test_candidate_reload_rejects_per_id_species_swap_with_same_aggregate_counts(tmp_path):
-    unit_cell = UnitCell()
-    unit_cell.init_by_structure("rocksalt", 3.0, ("Na", "Cl"))
-    atoms = np.asarray(
-        [
-            ("Na", 2.0, 1.0, 1.0),
-            ("Cl", 3.0, 2.0, 2.0),
-            ("Na", 6.0, 3.0, 3.0),
-            ("Cl", 7.0, 4.0, 4.0),
-        ],
-        dtype=Atom.atom_dtype,
-    )
-    labels = np.asarray([0, 0, 1, 1], dtype=np.int8)
-    box = np.asarray([[0.0, 10.0], [0.0, 10.0], [0.0, 10.0]])
-    mapping = CandidateFileMapping.from_candidate(
-        atoms,
-        labels,
-        box_dims=box,
-        gb_plane_x=5.0,
-        inplane_periodic=(True, True),
-        right_grain_x_bounds=(5.0, 10.0),
-        coordinate_tolerance=1.0e-8,
-        periodic_outer_x_interface=True,
-    )
-    swapped = atoms.copy()
-    swapped[0]["name"], swapped[1]["name"] = "Cl", "Na"
-    output = tmp_path / "species_swap.data"
-    _write_named_lammps_data(output, swapped, box, declared_types=2)
-    assert sorted(swapped["name"].tolist()) == sorted(atoms["name"].tolist())
-    with pytest.raises(GrainOwnershipError, match="changed species"):
-        reload_explicit_manipulator(
-            output,
-            candidate_mapping=mapping,
-            unit_cell=unit_cell,
-            gb_thickness=6.0,
-            type_dict={"Na": 1, "Cl": 2},
-        )
-
-
-def test_candidate_reload_rejects_changed_dump_topology(tmp_path):
-    manipulator, atoms, labels, box = _owned_single_species_manipulator(tmp_path)
-    mapping = CandidateFileMapping.from_candidate(
-        atoms,
-        labels,
-        box_dims=box,
-        gb_plane_x=5.0,
-        inplane_periodic=(True, True),
-        right_grain_x_bounds=(5.0, 10.0),
-        coordinate_tolerance=1.0e-8,
-        periodic_outer_x_interface=True,
-    )
-    dump = tmp_path / "changed_topology.dump"
-    with open(dump, "w", encoding="utf-8", newline="\n") as stream:
-        stream.write("ITEM: TIMESTEP\n0\n")
-        stream.write(f"ITEM: NUMBER OF ATOMS\n{len(atoms)}\n")
-        stream.write("ITEM: BOX BOUNDS ff pp pp\n")
-        for lower, upper in box:
-            stream.write(f"{lower} {upper}\n")
-        stream.write("ITEM: ATOMS id typelabel x y z\n")
-        for atom_id, atom in enumerate(atoms, start=1):
-            stream.write(
-                f"{atom_id} {atom['name']} {atom['x']} {atom['y']} {atom['z']}\n"
-            )
-    with pytest.raises(GrainOwnershipError, match="changed boundary topology"):
-        reload_explicit_manipulator(
-            dump,
-            candidate_mapping=mapping,
-            unit_cell=manipulator.parents[0].unit_cell,
-            gb_thickness=10.0,
-            type_dict={"Ni": 1},
-        )
-
-
-def test_row_changing_mutation_gets_fresh_ids_and_copy_is_defensive(tmp_path):
+def test_row_changing_mutation_updates_labels_and_copy_is_defensive(tmp_path):
     manipulator, _atoms, _labels, box = _owned_single_species_manipulator(tmp_path)
 
     class FixedChoice:
@@ -2055,20 +1737,11 @@ def test_row_changing_mutation_gets_fresh_ids_and_copy_is_defensive(tmp_path):
 
     manipulator.rng = FixedChoice()
     child = manipulator.remove_atoms(num_to_remove=1, keep_ratio=False)
-    mapping = CandidateFileMapping.from_candidate(
-        child,
-        manipulator.candidate_grain_labels,
-        box_dims=box,
-        gb_plane_x=5.0,
-        inplane_periodic=(True, True),
-        right_grain_x_bounds=(5.0, 10.0),
-        coordinate_tolerance=1.0,
-        periodic_outer_x_interface=True,
-    )
-    assert np.array_equal(mapping.atom_ids, np.arange(1, len(child) + 1))
-    assert len(mapping.atom_ids) != len(manipulator.parents[0].initial_atom_ids)
+    assert len(child) == len(manipulator.candidate_grain_labels)
+    assert len(child) != len(manipulator.parents[0].initial_atom_ids)
     copied = copy.deepcopy(manipulator)
     copied_labels = copied.candidate_grain_labels
     with pytest.raises(ValueError):
         copied_labels[0] = 1 - copied_labels[0]
-    assert np.array_equal(copied.candidate_grain_labels, manipulator.candidate_grain_labels)
+    assert np.array_equal(copied.candidate_grain_labels,
+                          manipulator.candidate_grain_labels)

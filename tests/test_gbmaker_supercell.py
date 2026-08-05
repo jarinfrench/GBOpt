@@ -4,11 +4,11 @@
 
 from collections import Counter
 from itertools import product
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import GBOpt.gbmaker_supercell as gbmaker_supercell_module
 from GBOpt.crystallography.integer import integer_adj3, integer_det3
 from GBOpt.gbmaker_supercell import (
     SupercellSites,
@@ -60,6 +60,42 @@ def _int_matrix(rows) -> np.ndarray:
 def _origin_set(origins: np.ndarray) -> set[tuple[int, int, int]]:
     """Return integer origins as an order-independent set of tuples."""
     return {tuple(int(value) for value in row) for row in origins}
+
+
+def _brute_force_origin_reference(
+    supercell: np.ndarray,
+    repeats: tuple[int, int, int],
+) -> np.ndarray:
+    """Return a small-case brute-force reference origin enumeration."""
+    determinant = integer_det3(supercell)
+    adjugate = integer_adj3(supercell)
+    corners = np.array(
+        [
+            i * repeats[0] * supercell[0]
+            + j * repeats[1] * supercell[1]
+            + k * repeats[2] * supercell[2]
+            for i in (0, 1)
+            for j in (0, 1)
+            for k in (0, 1)
+        ],
+        dtype=object,
+    )
+    lower = [int(corners[:, axis].min()) - 1 for axis in range(3)]
+    upper = [int(corners[:, axis].max()) + 1 for axis in range(3)]
+
+    accepted = [
+        tuple(int(value) for value in candidate)
+        for candidate in product(
+            *(range(lower[axis], upper[axis] + 1) for axis in range(3))
+        )
+        if _integer_membership(
+            candidate,
+            adjugate,
+            determinant,
+            *repeats,
+        )
+    ]
+    return np.asarray(accepted, dtype=object)
 
 
 # ---------------------------------------------------------------------------
@@ -227,9 +263,29 @@ def test_enumerate_supercell_origins_satisfies_count_uniqueness_and_membership(
     upper_bounds = np.asarray(repeats, dtype=object) * determinant
 
     assert origins.shape == (int(np.prod(repeats)) * determinant, 3)
-    assert len(np.unique(origins, axis=0)) == len(origins)
+    assert len(_origin_set(origins)) == len(origins)
     assert np.all(numerators >= 0)
     assert np.all(numerators < upper_bounds)
+
+
+@pytest.mark.parametrize(
+    ("supercell_rows", "repeats"),
+    [
+        pytest.param(IDENTITY_ROWS, (2, 1, 2), id="identity"),
+        pytest.param(OBLIQUE_INDEX2_ROWS, (1, 2, 1), id="oblique-index-two"),
+        pytest.param(SIGMA5_RIGHT_GRAIN_ROWS, (1, 1, 1), id="sigma-five"),
+    ],
+)
+def test_enumerate_supercell_origins_matches_small_brute_force_reference(
+    supercell_rows,
+    repeats,
+):
+    supercell = _int_matrix(supercell_rows)
+
+    actual = enumerate_supercell_origins(supercell, *repeats)
+    expected = _brute_force_origin_reference(supercell, repeats)
+
+    np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize(
@@ -303,8 +359,45 @@ def test_enumerate_supercell_origins_preserves_known_oblique_order():
 
     np.testing.assert_array_equal(
         origins,
-        np.array(((0, 0, 0), (1, 0, 0)), dtype=int),
+        np.array(((0, 0, 0), (1, 0, 0)), dtype=object),
     )
+    assert origins.dtype == object
+    assert all(type(value) is int for value in origins.flat)
+
+
+def test_enumerate_supercell_origins_bounds_membership_work_by_output_size(
+    monkeypatch,
+):
+    shear = 100
+    supercell = _int_matrix(
+        ((1, 0, 0), (0, 1, shear), (0, 0, 1))
+    )
+    membership_calls = 0
+    original_membership = gbmaker_supercell_module._integer_membership
+
+    def bounded_membership(*args, **kwargs):
+        nonlocal membership_calls
+        membership_calls += 1
+        if membership_calls > 4:
+            pytest.fail(
+                "origin enumeration performed work proportional to the Cartesian "
+                "bounding box rather than the quotient-lattice output size"
+            )
+        return original_membership(*args, **kwargs)
+
+    monkeypatch.setattr(
+        gbmaker_supercell_module,
+        "_integer_membership",
+        bounded_membership,
+    )
+
+    origins = enumerate_supercell_origins(supercell, 1, 1, 1)
+
+    np.testing.assert_array_equal(
+        origins,
+        np.array(((0, 0, 0),), dtype=object),
+    )
+    assert membership_calls <= len(origins)
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +450,8 @@ def _assert_site_invariants(
 
     assert sites.site_count == expected_count
     assert sites.coordinate_numerators.shape == (expected_count, 3)
+    assert sites.coordinate_numerators.dtype == object
+    assert all(type(value) is int for value in sites.coordinate_numerators.flat)
     assert sites.basis_indices.shape == (expected_count,)
     assert sites.repeats == tuple(repeats)
     assert sites.supercell_index == determinant
@@ -477,6 +572,42 @@ def test_enumerate_supercell_sites_order_is_origin_then_basis_row():
     )
 
 
+def test_enumerate_supercell_sites_uses_row_vector_adjugate_convention():
+    basis = RationalBasis(
+        names=("A", "B"),
+        numerators=np.array(((0, 0, 0), (1, 1, 1)), dtype=object),
+        denominator=2,
+    )
+    supercell = _int_matrix(
+        ((1, 0, 0), (1, 2, 0), (0, 1, 1))
+    )
+
+    sites = enumerate_supercell_sites(
+        supercell,
+        1,
+        1,
+        1,
+        rational_basis=basis,
+    )
+
+    np.testing.assert_array_equal(
+        sites.coordinate_numerators,
+        np.array(
+            (
+                (0, 0, 0),
+                (2, 0, 2),
+                (2, 2, 0),
+                (0, 2, 2),
+            ),
+            dtype=object,
+        ),
+    )
+    np.testing.assert_array_equal(
+        sites.basis_indices,
+        np.array((0, 1, 0, 1)),
+    )
+
+
 def test_enumerate_supercell_sites_is_deterministic():
     basis = _fluorite_basis()
     arguments = (_int_matrix(SHEARED_INDEX2_ROWS), 2, 2, 1)
@@ -568,25 +699,6 @@ def test_enumerate_supercell_sites_wraps_crossing_decorated_sites_without_loss()
     assert Counter(int(index) for index in sites.basis_indices) == {0: 2, 1: 2}
 
 
-def test_enumerate_supercell_sites_allows_same_coordinate_for_different_species_rows():
-    basis = RationalBasis(
-        names=("A", "B"),
-        numerators=np.array(((0, 0, 0), (0, 0, 0)), dtype=object),
-        denominator=1,
-    )
-
-    sites = enumerate_supercell_sites(
-        _int_matrix(IDENTITY_ROWS),
-        1,
-        1,
-        1,
-        rational_basis=basis,
-    )
-
-    assert sites.site_count == 2
-    assert len(_decorated_site_keys(sites)) == 2
-
-
 @pytest.mark.parametrize(
     ("bad_supercell", "match"),
     INVALID_3X3_INTEGER_MATRICES,
@@ -646,61 +758,14 @@ def test_enumerate_supercell_sites_rejects_missing_rational_metadata():
         )
 
 
-@pytest.mark.parametrize(
-    ("rational_basis", "match"),
-    [
-        pytest.param(
-            SimpleNamespace(names=("A",), numerators=[[0, 0]], denominator=1),
-            "shape",
-            id="wrong-coordinate-shape",
-        ),
-        pytest.param(
-            SimpleNamespace(names=("A",), numerators=[[0.5, 0, 0]], denominator=1),
-            "only integers",
-            id="noninteger-coordinate",
-        ),
-        pytest.param(
-            SimpleNamespace(names=("A",), numerators=[[0, 0, 0]], denominator=0),
-            "denominator",
-            id="nonpositive-denominator",
-        ),
-        pytest.param(
-            SimpleNamespace(names=("A", "B"), numerators=[[0, 0, 0]], denominator=1),
-            "equal lengths",
-            id="species-coordinate-mismatch",
-        ),
-        pytest.param(
-            SimpleNamespace(
-                names=("A", "A"),
-                numerators=[[0, 0, 0], [0, 0, 0]],
-                denominator=1,
-            ),
-            "duplicate decorated",
-            id="duplicate-decorated-row",
-        ),
-        pytest.param(
-            SimpleNamespace(names=("A",), numerators=[[-1, 0, 0]], denominator=2),
-            "canonical half-open",
-            id="negative-coordinate",
-        ),
-        pytest.param(
-            SimpleNamespace(names=("A",), numerators=[[2, 0, 0]], denominator=2),
-            "canonical half-open",
-            id="coordinate-at-denominator",
-        ),
-    ],
-)
-def test_enumerate_supercell_sites_rejects_bypassed_rational_basis_contract(
-    rational_basis,
-    match,
-):
-    with pytest.raises(ValueError, match=match):
+def test_enumerate_supercell_sites_rejects_unvalidated_rational_basis_object():
+    with pytest.raises(ValueError, match="RationalBasis"):
         enumerate_supercell_sites(
             _int_matrix(IDENTITY_ROWS),
             1,
             1,
             1,
-            rational_basis=rational_basis,
+            rational_basis=object(),  # type: ignore[ty:invalid-argument-type]
         )
 
 
@@ -716,15 +781,55 @@ def test_supercell_sites_rejects_internal_count_mismatch():
         )
 
 
-def test_supercell_sites_rejects_internal_duplicate_representatives():
-    with pytest.raises(ValueError, match="duplicate wrapped exact representatives"):
+@pytest.mark.parametrize(
+    "repeats",
+    [
+        pytest.param(None, id="not-a-sequence"),
+        pytest.param((1, 1), id="too-short"),
+        pytest.param((1, 1, 1, 1), id="too-long"),
+    ],
+)
+def test_supercell_sites_rejects_malformed_repeat_sequence(repeats):
+    with pytest.raises(ValueError, match="length-3"):
+        SupercellSites(
+            coordinate_numerators=np.array(((0, 0, 0),), dtype=object),
+            basis_denominator=1,
+            basis_indices=np.array((0,)),
+            supercell_matrix=_int_matrix(IDENTITY_ROWS),
+            repeats=repeats,  # type: ignore[ty:invalid-argument-type]
+            basis_size=1,
+        )
+
+
+def test_supercell_sites_accepts_exactly_integral_numeric_arrays():
+    sites = SupercellSites(
+        coordinate_numerators=np.array(((0.0, 0.0, 0.0),)),
+        basis_denominator=1,
+        basis_indices=np.array((0.0,)),
+        supercell_matrix=_int_matrix(IDENTITY_ROWS),
+        repeats=(1, 1, 1),
+        basis_size=1,
+    )
+
+    np.testing.assert_array_equal(
+        sites.coordinate_numerators,
+        np.array(((0, 0, 0),), dtype=object),
+    )
+    np.testing.assert_array_equal(sites.basis_indices, np.array((0,)))
+
+
+def test_supercell_sites_rejects_same_coordinate_for_different_basis_indices():
+    with pytest.raises(
+        ValueError,
+        match="duplicate wrapped exact coordinate representatives",
+    ):
         SupercellSites(
             coordinate_numerators=np.array(((0, 0, 0), (0, 0, 0)), dtype=object),
             basis_denominator=1,
-            basis_indices=np.array((0, 0)),
-            supercell_matrix=_int_matrix(OBLIQUE_INDEX2_ROWS),
+            basis_indices=np.array((0, 1)),
+            supercell_matrix=_int_matrix(IDENTITY_ROWS),
             repeats=(1, 1, 1),
-            basis_size=1,
+            basis_size=2,
         )
 
 

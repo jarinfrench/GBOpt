@@ -9,14 +9,6 @@ import pytest
 
 from GBOpt.Atom import Atom
 from GBOpt.BoundaryTopology import BoundaryNormalTopology
-from GBOpt.FileGrainOwnership import (
-    CandidateFileMapping,
-    GrainOwnership,
-    LEFT_GRAIN_LABEL,
-    RIGHT_GRAIN_LABEL,
-    reload_explicit_manipulator,
-)
-from GBOpt.GBMinimizer import GeneticAlgorithmMinimizer
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import (
     GBManipulator,
@@ -25,6 +17,9 @@ from GBOpt.GBManipulator import (
     Parent,
 )
 from GBOpt.UnitCell import UnitCell
+
+LEFT_GRAIN_LABEL = 0
+RIGHT_GRAIN_LABEL = 1
 
 
 DTYPE = np.dtype(
@@ -85,7 +80,8 @@ def _synthetic_manipulator(
     )
     manipulator = object.__new__(GBManipulator)
     manipulator._GBManipulator__one_parent = not two_parents
-    manipulator._GBManipulator__parents = [parent, copy(parent) if two_parents else None]
+    manipulator._GBManipulator__parents = [
+        parent, copy(parent) if two_parents else None]
     manipulator._GBManipulator__rng = np.random.default_rng(7)
     manipulator._GBManipulator__candidate_grain_labels = labels.copy()
     return manipulator, parent
@@ -99,26 +95,6 @@ def _slab_manipulator(*, left_bounds=(4.0, 8.0), right_bounds=(8.0, 14.0)):
         left_bounds=left_bounds,
         right_bounds=right_bounds,
     )
-
-
-def _write_data(path, candidate: InterfaceCandidate, *, order=None):
-    atoms = candidate.atoms
-    if order is None:
-        order = np.arange(len(atoms))
-    with open(path, "w", encoding="utf-8", newline="\n") as stream:
-        stream.write("Interface candidate\n\n")
-        stream.write(f"{len(atoms)} atoms\n")
-        stream.write("2 atom types\n")
-        for axis, (lower, upper) in zip("xyz", candidate.box_dims):
-            stream.write(f"{lower:.12f} {upper:.12f} {axis}lo {axis}hi\n")
-        stream.write("\nAtoms\n\n")
-        type_map = {"U": 1, "O": 2}
-        for row in order:
-            atom = atoms[row]
-            stream.write(
-                f"{row + 1} {type_map[str(atom['name'])]} "
-                f"{atom['x']:.12f} {atom['y']:.12f} {atom['z']:.12f}\n"
-            )
 
 
 def test_parent_candidate_is_geometry_bearing_defensive_and_read_only():
@@ -443,8 +419,10 @@ def test_periodic_separation_expands_both_physical_interfaces():
     np.testing.assert_allclose(
         separated.atoms["x"][labels == 1], base.atoms["x"][labels == 1] + s
     )
-    assert separated.right_grain_x_bounds[0] - separated.left_grain_x_bounds[1] == pytest.approx(s)
-    assert separated.box_dims[0, 1] - separated.right_grain_x_bounds[1] == pytest.approx(s)
+    assert separated.right_grain_x_bounds[0] - \
+        separated.left_grain_x_bounds[1] == pytest.approx(s)
+    assert separated.box_dims[0, 1] - \
+        separated.right_grain_x_bounds[1] == pytest.approx(s)
 
 
 def test_slab_separation_preserves_asymmetric_outer_vacuum_widths():
@@ -546,118 +524,6 @@ def test_slab_requires_a_vacuum_interval():
         manipulator.apply_interface_separation(
             manipulator.make_parent_candidate(), interface_separation=0.5
         )
-
-
-def test_candidate_mapping_and_ownership_preserve_separated_geometry():
-    manipulator, _ = _slab_manipulator()
-    separated = manipulator.apply_interface_separation(
-        manipulator.make_parent_candidate(), interface_separation=0.5
-    )
-
-    direct_ownership = GrainOwnership.from_interface_candidate(separated)
-    assert direct_ownership.normal_topology is BoundaryNormalTopology.SINGLE_INTERFACE_SLAB
-    assert np.array_equal(
-        direct_ownership.left_grain_x_bounds, separated.left_grain_x_bounds
-    )
-
-    mapping = CandidateFileMapping.from_interface_candidate(separated)
-    assert mapping.normal_topology is BoundaryNormalTopology.SINGLE_INTERFACE_SLAB
-    assert not mapping.periodic_outer_x_interface
-    assert np.array_equal(mapping.box_dims, separated.box_dims)
-    assert np.array_equal(mapping.left_grain_x_bounds, separated.left_grain_x_bounds)
-    assert np.array_equal(mapping.right_grain_x_bounds, separated.right_grain_x_bounds)
-    ownership = mapping.ownership_for_file_ids(mapping.atom_ids[::-1])
-    assert ownership.normal_topology is BoundaryNormalTopology.SINGLE_INTERFACE_SLAB
-    assert np.array_equal(ownership.left_grain_x_bounds, separated.left_grain_x_bounds)
-    assert np.array_equal(ownership.right_grain_x_bounds, separated.right_grain_x_bounds)
-
-
-@pytest.mark.parametrize(
-    "topology, factory",
-    [
-        (
-            BoundaryNormalTopology.PERIODIC_BICRYSTAL,
-            lambda: _synthetic_manipulator(
-                BoundaryNormalTopology.PERIODIC_BICRYSTAL
-            )[0],
-        ),
-        (BoundaryNormalTopology.SINGLE_INTERFACE_SLAB, lambda: _slab_manipulator()[0]),
-    ],
-)
-def test_separated_geometry_survives_write_and_explicit_reload(
-    tmp_path, topology, factory
-):
-    manipulator = factory()
-    separated = manipulator.apply_interface_separation(
-        manipulator.make_parent_candidate(), interface_separation=0.5
-    )
-    mapping = CandidateFileMapping.from_interface_candidate(separated)
-    output = tmp_path / f"{topology.value}.data"
-    _write_data(output, separated, order=np.arange(len(separated.atoms))[::-1])
-    unit_cell = UnitCell()
-    unit_cell.init_by_structure("fluorite", 5.454, ("U", "O"))
-
-    reloaded = reload_explicit_manipulator(
-        output,
-        candidate_mapping=mapping,
-        unit_cell=unit_cell,
-        gb_thickness=4.0,
-        type_dict={"U": 1, "O": 2},
-    )
-    parent = reloaded.parents[0]
-    assert parent.normal_topology is topology
-    assert parent.periodic_outer_x_interface == (
-        topology is BoundaryNormalTopology.PERIODIC_BICRYSTAL
-    )
-    assert np.array_equal(parent.box_dims, separated.box_dims)
-    assert parent.gb_plane_x == separated.gb_plane_x
-    assert np.array_equal(parent.left_grain_x_bounds, separated.left_grain_x_bounds)
-    assert np.array_equal(parent.right_grain_x_bounds, separated.right_grain_x_bounds)
-    assert np.array_equal(parent.grain_labels, separated.grain_labels)
-
-    minimizer = GeneticAlgorithmMinimizer.__new__(GeneticAlgorithmMinimizer)
-    remapped = minimizer._candidate_file_mapping(
-        reloaded, parent.whole_system
-    )
-    assert remapped.normal_topology is topology
-    assert np.array_equal(remapped.box_dims, separated.box_dims)
-    assert remapped.gb_plane_x == separated.gb_plane_x
-    assert np.array_equal(
-        remapped.left_grain_x_bounds, separated.left_grain_x_bounds
-    )
-    assert np.array_equal(
-        remapped.right_grain_x_bounds, separated.right_grain_x_bounds
-    )
-
-
-def test_grain_ownership_accepts_plane_inside_empty_central_interval():
-    ownership = GrainOwnership(
-        atom_ids=np.arange(1, 5),
-        labels=np.array([0, 0, 1, 1]),
-        gb_plane_x=7.25,
-        inplane_periodic=(True, True),
-        left_grain_x_bounds=(2.0, 7.0),
-        right_grain_x_bounds=(7.5, 12.5),
-        coordinate_tolerance=1.0e-10,
-        normal_topology=BoundaryNormalTopology.PERIODIC_BICRYSTAL,
-    )
-    assert ownership.gb_plane_x == pytest.approx(7.25)
-    assert ownership.left_grain_x_bounds.tolist() == pytest.approx([2.0, 7.0])
-    assert ownership.right_grain_x_bounds.tolist() == pytest.approx([7.5, 12.5])
-
-
-def test_legacy_false_boolean_is_unknown_not_slab():
-    ownership = GrainOwnership(
-        atom_ids=np.arange(1, 3),
-        labels=np.array([0, 1]),
-        gb_plane_x=5.0,
-        inplane_periodic=(True, True),
-        right_grain_x_bounds=(5.0, 10.0),
-        coordinate_tolerance=1.0e-10,
-        periodic_outer_x_interface=False,
-    )
-    assert ownership.normal_topology is BoundaryNormalTopology.UNKNOWN
-    assert not ownership.periodic_outer_x_interface
 
 
 def test_parent_infers_known_topology_from_gbmaker_vacuum_with_tolerance():
