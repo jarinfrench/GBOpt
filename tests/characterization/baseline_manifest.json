@@ -1,0 +1,1386 @@
+{
+  "baseline": {
+    "environment": {
+      "packages": {
+        "matplotlib": "3.10.8",
+        "numba": "0.65.1",
+        "numpy": "2.3.5",
+        "pandas": "2.2.3",
+        "scipy": "1.17.0",
+        "spglib": "unavailable-test-stub"
+      },
+      "platform": "Linux-6.18.35-x86_64-with-glibc2.41",
+      "python": "3.13.5 (main, May  5 2026, 21:05:52) [GCC 14.2.0]"
+    },
+    "source_archive": "gbopt_source.tar(1).gz",
+    "source_archive_sha256": "d0c24898b334b26f5445304d209cb3bf3fbc1ac3882eb7a5b029045ac565d6b1"
+  },
+  "behavior": {
+    "gbmaker": {
+      "approximate_fcc_non_csl": {
+        "dimensions": {
+          "box_dims": [
+            [
+              0.0,
+              36.15
+            ],
+            [
+              0.0,
+              18.075
+            ],
+            [
+              0.0,
+              7.23
+            ]
+          ],
+          "gb_plane_x": 18.075,
+          "x_dim": 36.15,
+          "y_dim": 18.075,
+          "z_dim": 7.23
+        },
+        "inplane_periodic": [
+          false,
+          false
+        ],
+        "left_grain": {
+          "coordinate_max": [
+            16.2675,
+            16.2675,
+            5.4225
+          ],
+          "coordinate_min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "count": 200,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "6c0bcd1f56cc3783d4c861dee279411c11459378f4dbda6f390148900f232a18",
+          "order_sensitive_sha256": "17f41f06a94fb5cb0bcbcb9158f9e7168031682bab4bb5a803be4172f2954e46",
+          "species_counts": {
+            "Cu": 200
+          }
+        },
+        "normal_topology": "periodic_bicrystal",
+        "right_grain": {
+          "coordinate_max": [
+            36.149983855227,
+            17.7135045205,
+            5.4225
+          ],
+          "coordinate_min": [
+            18.436479334727,
+            0.72302324843,
+            0.0
+          ],
+          "count": 152,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "e8cb00902a563d662bb14e56f0be3a2e7221d8d1bae9837aa4c654e08400271a",
+          "order_sensitive_sha256": "17c28c5bd763ae32b533580da9f3bacb75eef71eabc43a99d4b6ebe6fbe3a904",
+          "species_counts": {
+            "Cu": 152
+          }
+        },
+        "spacing": {
+          "x": {
+            "left": 3.615,
+            "right": 18.075
+          },
+          "y": 18.075,
+          "z": 3.615
+        },
+        "uses_exact_construction": false,
+        "warnings": [
+          {
+            "category": "UserWarning",
+            "message": "Recommended repeat factor is at least 2."
+          },
+          {
+            "category": "UserWarning",
+            "message": "Repeat factor in z modified to 2 to satisfy the minimum in-plane dimension cutoff of 7.23 A."
+          },
+          {
+            "category": "UserWarning",
+            "message": "Gap equalization would remove all atoms from the right grain (1 x-periods; right_x = 18.0750 A, x_period = 18.0750 A). Skipping equalization to preserve a non-empty grain."
+          }
+        ],
+        "whole_system": {
+          "coordinate_max": [
+            36.149983855227,
+            17.7135045205,
+            5.4225
+          ],
+          "coordinate_min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "count": 352,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "e1bf48d20c42df5aabef4fc7dac18a800adf9d18eae534fae9569041c909c2c4",
+          "order_sensitive_sha256": "e007cae1d830f6d28c071f3995b62ea38a2f284e121d06c1458463363555bf93",
+          "species_counts": {
+            "Cu": 352
+          }
+        }
+      },
+      "exact_csl_fcc_periodic": {
+        "dimensions": {
+          "box_dims": [
+            [
+              0.0,
+              36.15
+            ],
+            [
+              0.0,
+              36.15
+            ],
+            [
+              0.0,
+              7.23
+            ]
+          ],
+          "gb_plane_x": 18.075,
+          "x_dim": 36.15,
+          "y_dim": 36.15,
+          "z_dim": 7.23
+        },
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "left_grain": {
+          "coordinate_max": [
+            16.2675,
+            34.3425,
+            5.4225
+          ],
+          "coordinate_min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "count": 400,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "cbe3c3290b230a6fd2560ffb66b8f149bbb5f12564956358812541e2b23c87a4",
+          "order_sensitive_sha256": "297055d992446591205436c35e41a3a95b848301fc4a7a877a7a078f30131137",
+          "species_counts": {
+            "Cu": 400
+          }
+        },
+        "normal_topology": "periodic_bicrystal",
+        "right_grain": {
+          "coordinate_max": [
+            35.7885,
+            35.7885,
+            5.4225
+          ],
+          "coordinate_min": [
+            18.075,
+            0.0,
+            0.0
+          ],
+          "count": 400,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "cf7c667df2e7140a1ed032eb1f8a27e1d2010fb9364eb0b715416e776d0999dc",
+          "order_sensitive_sha256": "eccc31346d73512947506a9c81afce1496e7a9e605758438d7ccd414251093fb",
+          "species_counts": {
+            "Cu": 400
+          }
+        },
+        "spacing": {
+          "x": {
+            "left": 3.615,
+            "right": 18.075
+          },
+          "y": 18.075,
+          "z": 3.615
+        },
+        "uses_exact_construction": true,
+        "warnings": [],
+        "whole_system": {
+          "coordinate_max": [
+            35.7885,
+            35.7885,
+            5.4225
+          ],
+          "coordinate_min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "count": 800,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "370e51db800ccb41c2e18253fd9cd031e6c2a4bccb88276d4a16d618574a641b",
+          "order_sensitive_sha256": "e44bcac5bed925962a7fdf958f50e343d2b2b4007bd9a99dceb27604ae172efc",
+          "species_counts": {
+            "Cu": 800
+          }
+        }
+      },
+      "exact_pq_fcc_periodic": {
+        "dimensions": {
+          "box_dims": [
+            [
+              0.0,
+              36.15
+            ],
+            [
+              0.0,
+              36.15
+            ],
+            [
+              0.0,
+              7.23
+            ]
+          ],
+          "gb_plane_x": 18.075,
+          "x_dim": 36.15,
+          "y_dim": 36.15,
+          "z_dim": 7.23
+        },
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "left_grain": {
+          "coordinate_max": [
+            16.2675,
+            34.3425,
+            5.4225
+          ],
+          "coordinate_min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "count": 400,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "cbe3c3290b230a6fd2560ffb66b8f149bbb5f12564956358812541e2b23c87a4",
+          "order_sensitive_sha256": "297055d992446591205436c35e41a3a95b848301fc4a7a877a7a078f30131137",
+          "species_counts": {
+            "Cu": 400
+          }
+        },
+        "normal_topology": "periodic_bicrystal",
+        "right_grain": {
+          "coordinate_max": [
+            35.7885,
+            35.7885,
+            5.4225
+          ],
+          "coordinate_min": [
+            18.075,
+            0.0,
+            0.0
+          ],
+          "count": 400,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "cf7c667df2e7140a1ed032eb1f8a27e1d2010fb9364eb0b715416e776d0999dc",
+          "order_sensitive_sha256": "eccc31346d73512947506a9c81afce1496e7a9e605758438d7ccd414251093fb",
+          "species_counts": {
+            "Cu": 400
+          }
+        },
+        "spacing": {
+          "x": {
+            "left": 3.615,
+            "right": 18.075
+          },
+          "y": 18.075,
+          "z": 3.615
+        },
+        "uses_exact_construction": true,
+        "warnings": [],
+        "whole_system": {
+          "coordinate_max": [
+            35.7885,
+            35.7885,
+            5.4225
+          ],
+          "coordinate_min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "count": 800,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "370e51db800ccb41c2e18253fd9cd031e6c2a4bccb88276d4a16d618574a641b",
+          "order_sensitive_sha256": "e44bcac5bed925962a7fdf958f50e343d2b2b4007bd9a99dceb27604ae172efc",
+          "species_counts": {
+            "Cu": 800
+          }
+        }
+      },
+      "exact_pq_fluorite_slab": {
+        "dimensions": {
+          "box_dims": [
+            [
+              0.0,
+              58.7
+            ],
+            [
+              0.0,
+              27.35
+            ],
+            [
+              0.0,
+              10.94
+            ]
+          ],
+          "gb_plane_x": 29.35,
+          "x_dim": 54.7,
+          "y_dim": 27.35,
+          "z_dim": 10.94
+        },
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "left_grain": {
+          "coordinate_max": [
+            27.9825,
+            25.9825,
+            9.5725
+          ],
+          "coordinate_min": [
+            2.0,
+            0.0,
+            0.0
+          ],
+          "count": 600,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "db280c2f4d944a291790dd0951a8faa54155077d9d132120d4d2e33abac6c791",
+          "order_sensitive_sha256": "6387b582541cfe44e4025b2449a28279ad37b6120da0e0958ccd8c0e09dc811e",
+          "species_counts": {
+            "O": 400,
+            "U": 200
+          }
+        },
+        "normal_topology": "single_interface_slab",
+        "right_grain": {
+          "coordinate_max": [
+            56.4265,
+            27.0765,
+            9.5725
+          ],
+          "coordinate_min": [
+            29.35,
+            0.0,
+            0.0
+          ],
+          "count": 600,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "361d366ce682c7466be6f847cabe7dbf46eae841a01419ef22d6c219b34af5bb",
+          "order_sensitive_sha256": "619435ef729a43affd56ef6c77d857ec20488702d81bb09da8f2ee855e435a7b",
+          "species_counts": {
+            "O": 400,
+            "U": 200
+          }
+        },
+        "spacing": {
+          "x": {
+            "left": 5.47,
+            "right": 27.35
+          },
+          "y": 27.35,
+          "z": 5.47
+        },
+        "uses_exact_construction": true,
+        "warnings": [
+          {
+            "category": "UserWarning",
+            "message": "Recommended repeat factor is at least 2."
+          },
+          {
+            "category": "UserWarning",
+            "message": "Repeat factor in z modified to 2 to satisfy the minimum in-plane dimension cutoff of 10.94 A."
+          }
+        ],
+        "whole_system": {
+          "coordinate_max": [
+            56.4265,
+            27.0765,
+            9.5725
+          ],
+          "coordinate_min": [
+            2.0,
+            0.0,
+            0.0
+          ],
+          "count": 1200,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "578b5b21c3c1c738cf54b70ba756b83ad04ae2e841de3d59d33f546fa0ff1dd8",
+          "order_sensitive_sha256": "12a1e874c1ddf3ffe40608b6b87ce93aacf3c41dfab7672e6656ceaa5ba1269e",
+          "species_counts": {
+            "O": 800,
+            "U": 400
+          }
+        }
+      },
+      "exact_pq_mismatch_accommodation": {
+        "dimensions": {
+          "box_dims": [
+            [
+              0.0,
+              41.157370777791
+            ],
+            [
+              0.0,
+              97.470926944478
+            ],
+            [
+              0.0,
+              3.615
+            ]
+          ],
+          "gb_plane_x": 19.467370777791,
+          "x_dim": 41.157370777791,
+          "y_dim": 97.470926944478,
+          "z_dim": 3.615
+        },
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "left_grain": {
+          "coordinate_max": [
+            18.796082130281,
+            96.798713655206,
+            0.0
+          ],
+          "coordinate_min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "count": 145,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "00b086ab52a54b76a5a5d3136718fc5f8f85a40e84f47869ab36985117825ebd",
+          "order_sensitive_sha256": "e5e847bc7c403c833a534fd067060a7721e1709b4c5b6edb3b0f8f46cb5ab0ef",
+          "species_counts": {
+            "Cu": 145
+          }
+        },
+        "normal_topology": "periodic_bicrystal",
+        "right_grain": {
+          "coordinate_max": [
+            37.542370777791,
+            93.860892613201,
+            0.0
+          ],
+          "coordinate_min": [
+            19.467370777791,
+            0.0,
+            0.0
+          ],
+          "count": 162,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "f8613ea14e32f198a3966fe9ab34640d72b73d7160cfeaa102bca9aef947eb7f",
+          "order_sensitive_sha256": "7324df7ebd011ea756f1948e280ed8c221f0ce1464bc54ec428ec79a04830f1e",
+          "species_counts": {
+            "Cu": 162
+          }
+        },
+        "spacing": {
+          "x": {
+            "left": 19.467370777791,
+            "right": 3.615
+          },
+          "y": 19.467370777791,
+          "z": 3.615
+        },
+        "uses_exact_construction": true,
+        "warnings": [],
+        "whole_system": {
+          "coordinate_max": [
+            37.542370777791,
+            96.798713655206,
+            0.0
+          ],
+          "coordinate_min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "count": 307,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "24b701f1ef977e2dd828e5fa27259ac71031329a47000d06af25ea82d1e2f9df",
+          "order_sensitive_sha256": "9ed40bfb75f54e496343520de527c9ef065e9f0c4c9805bfbab31d02d67ab1f9",
+          "species_counts": {
+            "Cu": 307
+          }
+        }
+      },
+      "legacy_fcc_periodic": {
+        "dimensions": {
+          "box_dims": [
+            [
+              0.0,
+              44.524869455171
+            ],
+            [
+              0.0,
+              11.131217363793
+            ],
+            [
+              0.0,
+              10.56
+            ]
+          ],
+          "gb_plane_x": 22.262434727585,
+          "x_dim": 44.524869455171,
+          "y_dim": 11.131217363793,
+          "z_dim": 10.56
+        },
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "left_grain": {
+          "coordinate_max": [
+            21.149312998087,
+            10.574656473242,
+            8.8
+          ],
+          "coordinate_min": [
+            1.1131217467,
+            0.556560804546,
+            0.0
+          ],
+          "count": 168,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "545db7a191e5e6113d1e70f885fca54ed31bc24b8d2f4ca963e51c9764597d53",
+          "order_sensitive_sha256": "3574d3cd026bf542d27c6b2cfec015603d2b53e286ae51447d19e2da38b40bcc",
+          "species_counts": {
+            "Ni": 168
+          }
+        },
+        "normal_topology": "periodic_bicrystal",
+        "right_grain": {
+          "coordinate_max": [
+            32.837091200827,
+            10.018095634294,
+            8.8
+          ],
+          "coordinate_min": [
+            22.818995566533,
+            1.1131217467,
+            0.0
+          ],
+          "count": 72,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "760cb8deea09643fe32e465782b7a1d8001a7ad7005a7fb2add4ef750da5c7e9",
+          "order_sensitive_sha256": "888db613afe31a7830765fe1d0b71db474d7bd7e00f771456e7a9737158d437f",
+          "species_counts": {
+            "Ni": 72
+          }
+        },
+        "spacing": {
+          "x": {
+            "left": 11.131217363793,
+            "right": 11.131217363793
+          },
+          "y": 11.131217363793,
+          "z": 3.52
+        },
+        "uses_exact_construction": false,
+        "warnings": [
+          {
+            "category": "DeprecationWarning",
+            "message": "GBMaker(...) is deprecated; use GBMaker.from_boundary_spec(...)."
+          },
+          {
+            "category": "UserWarning",
+            "message": "Recommended repeat factor is at least 2."
+          },
+          {
+            "category": "UserWarning",
+            "message": "Repeat factor in z modified to 3 to satisfy the minimum in-plane dimension cutoff of 8 A."
+          }
+        ],
+        "whole_system": {
+          "coordinate_max": [
+            32.837091200827,
+            10.574656473242,
+            8.8
+          ],
+          "coordinate_min": [
+            1.1131217467,
+            0.556560804546,
+            0.0
+          ],
+          "count": 240,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "ed1e35a954861c3563cd23981c6e94762e8db04eb72b52573f5bc3204b2f951d",
+          "order_sensitive_sha256": "cdace727994ffb4bdac55bfde7cf8034ba0d32a11feb4ed01448cd07d2920b18",
+          "species_counts": {
+            "Ni": 240
+          }
+        }
+      },
+      "legacy_fcc_slab": {
+        "dimensions": {
+          "box_dims": [
+            [
+              0.0,
+              48.524869455171
+            ],
+            [
+              0.0,
+              11.131217363793
+            ],
+            [
+              0.0,
+              10.56
+            ]
+          ],
+          "gb_plane_x": 24.262434727585,
+          "x_dim": 44.524869455171,
+          "y_dim": 11.131217363793,
+          "z_dim": 10.56
+        },
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "left_grain": {
+          "coordinate_max": [
+            23.149312998087,
+            10.574656473242,
+            8.8
+          ],
+          "coordinate_min": [
+            3.1131217467,
+            0.556560804546,
+            0.0
+          ],
+          "count": 168,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "fbb68e2db730615ee71142903f6279ca0ddc4c1beee7468b13956ffdcbdef7e4",
+          "order_sensitive_sha256": "fca26d3e6a51a3bef2dc118c6522695af7f2acb1accdb385c059019a8f9f4b19",
+          "species_counts": {
+            "Ni": 168
+          }
+        },
+        "normal_topology": "single_interface_slab",
+        "right_grain": {
+          "coordinate_max": [
+            45.96830856462,
+            10.018095668696,
+            8.8
+          ],
+          "coordinate_min": [
+            24.818995566533,
+            3.4402e-08,
+            0.0
+          ],
+          "count": 168,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "525dd669346acfe5a878f6a62901f4c9027368a24aaddd7fffc77c2ce9099eb6",
+          "order_sensitive_sha256": "389465ba9e6ab2ce4c8a3b4a445672486f9d0bf11b33dd1914ae610b88596d6d",
+          "species_counts": {
+            "Ni": 168
+          }
+        },
+        "spacing": {
+          "x": {
+            "left": 11.131217363793,
+            "right": 11.131217363793
+          },
+          "y": 11.131217363793,
+          "z": 3.52
+        },
+        "uses_exact_construction": false,
+        "warnings": [
+          {
+            "category": "DeprecationWarning",
+            "message": "GBMaker(...) is deprecated; use GBMaker.from_boundary_spec(...)."
+          },
+          {
+            "category": "UserWarning",
+            "message": "Recommended repeat factor is at least 2."
+          },
+          {
+            "category": "UserWarning",
+            "message": "Repeat factor in z modified to 3 to satisfy the minimum in-plane dimension cutoff of 8 A."
+          }
+        ],
+        "whole_system": {
+          "coordinate_max": [
+            45.96830856462,
+            10.574656473242,
+            8.8
+          ],
+          "coordinate_min": [
+            3.1131217467,
+            3.4402e-08,
+            0.0
+          ],
+          "count": 336,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "11efa4678027a4b8181391c1c22217f79e0ad83e46dc9a66a08d074a93082304",
+          "order_sensitive_sha256": "2350a6a6b8ae225ded1e538db5224169683a6a33c67e9477d66c852ea567d845",
+          "species_counts": {
+            "Ni": 336
+          }
+        }
+      }
+    },
+    "manipulation": {
+      "periodic_parent": {
+        "atoms": {
+          "coordinate_max": [
+            32.837091200827,
+            10.574656473242,
+            8.8
+          ],
+          "coordinate_min": [
+            1.1131217467,
+            0.556560804546,
+            0.0
+          ],
+          "count": 240,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "ed1e35a954861c3563cd23981c6e94762e8db04eb72b52573f5bc3204b2f951d",
+          "order_sensitive_sha256": "cdace727994ffb4bdac55bfde7cf8034ba0d32a11feb4ed01448cd07d2920b18",
+          "species_counts": {
+            "Ni": 240
+          }
+        },
+        "box_dims": [
+          [
+            0.0,
+            44.524869455171
+          ],
+          [
+            0.0,
+            11.131217363793
+          ],
+          [
+            0.0,
+            10.56
+          ]
+        ],
+        "coordinate_tolerance": 1e-10,
+        "gb_plane_x": 22.262434727585,
+        "grain_labels_sha256": "11e8e1319b0311430831a43e8d4b38e3a2b02df1294c95953617d0cc017b8bb5",
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "interface_separation": 0.0,
+        "left_count": 168,
+        "left_grain_x_bounds": [
+          0.0,
+          22.262434727585
+        ],
+        "normal_topology": "periodic_bicrystal",
+        "right_count": 72,
+        "right_grain_x_bounds": [
+          22.262434727585,
+          44.524869455171
+        ]
+      },
+      "periodic_termination": {
+        "atoms": {
+          "coordinate_max": [
+            33.337091200827,
+            10.574656473242,
+            8.8
+          ],
+          "coordinate_min": [
+            1.3631217467,
+            0.556560804546,
+            0.0
+          ],
+          "count": 240,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "1a2b20b4c42c912a807b10b233ec5264d39800614e320003fee3710f876eb649",
+          "order_sensitive_sha256": "b4df29257ebac221391185284a640f8ff102fa399c2b5e5a3a180bb1952593ef",
+          "species_counts": {
+            "Ni": 240
+          }
+        },
+        "box_dims": [
+          [
+            0.0,
+            44.524869455171
+          ],
+          [
+            0.0,
+            11.131217363793
+          ],
+          [
+            0.0,
+            10.56
+          ]
+        ],
+        "coordinate_tolerance": 1e-10,
+        "gb_plane_x": 22.262434727585,
+        "grain_labels_sha256": "11e8e1319b0311430831a43e8d4b38e3a2b02df1294c95953617d0cc017b8bb5",
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "interface_separation": 0.0,
+        "left_count": 168,
+        "left_grain_x_bounds": [
+          0.0,
+          22.262434727585
+        ],
+        "normal_topology": "periodic_bicrystal",
+        "right_count": 72,
+        "right_grain_x_bounds": [
+          22.262434727585,
+          44.524869455171
+        ]
+      },
+      "periodic_termination_then_separation": {
+        "atoms": {
+          "coordinate_max": [
+            34.087091200827,
+            10.574656473242,
+            8.8
+          ],
+          "coordinate_min": [
+            1.3631217467,
+            0.556560804546,
+            0.0
+          ],
+          "count": 240,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "7646ecf4a954ecce8f269e3866f20d2077e50ae3026f5a880d00f22ea10e0677",
+          "order_sensitive_sha256": "2c6ee3cb7956db9109e53710a70d45d64576bb619487b516c2afbc3d8899a6b9",
+          "species_counts": {
+            "Ni": 240
+          }
+        },
+        "box_dims": [
+          [
+            0.0,
+            46.024869455171
+          ],
+          [
+            0.0,
+            11.131217363793
+          ],
+          [
+            0.0,
+            10.56
+          ]
+        ],
+        "coordinate_tolerance": 1e-10,
+        "gb_plane_x": 22.637434727585,
+        "grain_labels_sha256": "11e8e1319b0311430831a43e8d4b38e3a2b02df1294c95953617d0cc017b8bb5",
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "interface_separation": 0.75,
+        "left_count": 168,
+        "left_grain_x_bounds": [
+          0.0,
+          22.262434727585
+        ],
+        "normal_topology": "periodic_bicrystal",
+        "right_count": 72,
+        "right_grain_x_bounds": [
+          23.012434727585,
+          45.274869455171
+        ]
+      },
+      "periodic_translation": {
+        "atoms": {
+          "coordinate_max": [
+            32.837091200827,
+            10.574656473242,
+            9.05
+          ],
+          "coordinate_min": [
+            1.1131217467,
+            0.556560804546,
+            0.0
+          ],
+          "count": 240,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "3a5cf41b6b917dd3ac7affee65acadeac14fa8fdd0ece9d48a4cedf04a2838e0",
+          "order_sensitive_sha256": "7b6b75308f7e05ded1003237b84ddd60cce09a228ecc734cf772c259398b5ffd",
+          "species_counts": {
+            "Ni": 240
+          }
+        },
+        "box_dims": [
+          [
+            0.0,
+            44.524869455171
+          ],
+          [
+            0.0,
+            11.131217363793
+          ],
+          [
+            0.0,
+            10.56
+          ]
+        ],
+        "coordinate_tolerance": 1e-10,
+        "gb_plane_x": 22.262434727585,
+        "grain_labels_sha256": "11e8e1319b0311430831a43e8d4b38e3a2b02df1294c95953617d0cc017b8bb5",
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "interface_separation": 0.0,
+        "left_count": 168,
+        "left_grain_x_bounds": [
+          0.0,
+          22.262434727585
+        ],
+        "normal_topology": "periodic_bicrystal",
+        "right_count": 72,
+        "right_grain_x_bounds": [
+          22.262434727585,
+          44.524869455171
+        ]
+      },
+      "slab_parent": {
+        "atoms": {
+          "coordinate_max": [
+            45.96830856462,
+            10.574656473242,
+            8.8
+          ],
+          "coordinate_min": [
+            3.1131217467,
+            3.4402e-08,
+            0.0
+          ],
+          "count": 336,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "11efa4678027a4b8181391c1c22217f79e0ad83e46dc9a66a08d074a93082304",
+          "order_sensitive_sha256": "2350a6a6b8ae225ded1e538db5224169683a6a33c67e9477d66c852ea567d845",
+          "species_counts": {
+            "Ni": 336
+          }
+        },
+        "box_dims": [
+          [
+            0.0,
+            48.524869455171
+          ],
+          [
+            0.0,
+            11.131217363793
+          ],
+          [
+            0.0,
+            10.56
+          ]
+        ],
+        "coordinate_tolerance": 1e-10,
+        "gb_plane_x": 24.262434727585,
+        "grain_labels_sha256": "77f66fdf32d0bbc0ad7d7033d69b4a161b54be82ec16df71f5a092dd22e12e28",
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "interface_separation": 0.0,
+        "left_count": 168,
+        "left_grain_x_bounds": [
+          2.0,
+          24.262434727585
+        ],
+        "normal_topology": "single_interface_slab",
+        "right_count": 168,
+        "right_grain_x_bounds": [
+          24.262434727585,
+          46.524869455171
+        ]
+      },
+      "slab_termination": {
+        "atoms": {
+          "coordinate_max": [
+            46.46830856462,
+            10.574656473242,
+            8.8
+          ],
+          "coordinate_min": [
+            3.3631217467,
+            0.125000034402,
+            0.0
+          ],
+          "count": 336,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "e13ea3575965b3a45934cfc347db620debde432c6486c249375a22acba950bd3",
+          "order_sensitive_sha256": "09eb4dd3a117fea66ccf6c1b17c3662a59e235c324c4d0500aee015ce91a6d34",
+          "species_counts": {
+            "Ni": 336
+          }
+        },
+        "box_dims": [
+          [
+            0.0,
+            48.524869455171
+          ],
+          [
+            0.0,
+            11.131217363793
+          ],
+          [
+            0.0,
+            10.56
+          ]
+        ],
+        "coordinate_tolerance": 1e-10,
+        "gb_plane_x": 24.262434727585,
+        "grain_labels_sha256": "77f66fdf32d0bbc0ad7d7033d69b4a161b54be82ec16df71f5a092dd22e12e28",
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "interface_separation": 0.0,
+        "left_count": 168,
+        "left_grain_x_bounds": [
+          2.0,
+          24.262434727585
+        ],
+        "normal_topology": "single_interface_slab",
+        "right_count": 168,
+        "right_grain_x_bounds": [
+          24.262434727585,
+          46.524869455171
+        ]
+      },
+      "slab_termination_then_separation": {
+        "atoms": {
+          "coordinate_max": [
+            47.21830856462,
+            10.574656473242,
+            8.8
+          ],
+          "coordinate_min": [
+            3.3631217467,
+            0.125000034402,
+            0.0
+          ],
+          "count": 336,
+          "dtype_fields": [
+            "name",
+            "x",
+            "y",
+            "z"
+          ],
+          "order_insensitive_sha256": "632fe53ab40ed80816fa410a4eba98f82204b34d07c9f4c44bbe5534cfedff8c",
+          "order_sensitive_sha256": "a1a1022e1457ab6341147c7fa98765b48f095ef58fa9b925b1f42187eeb1c598",
+          "species_counts": {
+            "Ni": 336
+          }
+        },
+        "box_dims": [
+          [
+            0.0,
+            49.274869455171
+          ],
+          [
+            0.0,
+            11.131217363793
+          ],
+          [
+            0.0,
+            10.56
+          ]
+        ],
+        "coordinate_tolerance": 1e-10,
+        "gb_plane_x": 24.637434727585,
+        "grain_labels_sha256": "77f66fdf32d0bbc0ad7d7033d69b4a161b54be82ec16df71f5a092dd22e12e28",
+        "inplane_periodic": [
+          true,
+          true
+        ],
+        "interface_separation": 0.75,
+        "left_count": 168,
+        "left_grain_x_bounds": [
+          2.0,
+          24.262434727585
+        ],
+        "normal_topology": "single_interface_slab",
+        "right_count": 168,
+        "right_grain_x_bounds": [
+          25.012434727585,
+          47.274869455171
+        ]
+      }
+    },
+    "optimization": {
+      "fixed_seed_legacy_scalar_ga": {
+        "GBE_vals": [
+          [
+            16.084609097045
+          ],
+          [
+            1e+30,
+            16.084609097045
+          ]
+        ],
+        "best_energy": 16.084609097045,
+        "best_path": "GA_initial202.data",
+        "history": [
+          [
+            [
+              [
+                "shift9.03199456dy3.04408751dz",
+                "GA_initial202.data"
+              ],
+              1e+30
+            ],
+            [
+              [
+                "shift2.76087358dy2.85480236dz",
+                "GA_initial202.data"
+              ],
+              16.084609097045
+            ]
+          ]
+        ],
+        "penalty": 1e+30
+      },
+      "fixed_seed_mc": {
+        "GBE_vals": [
+          0.0,
+          10.0,
+          10.0,
+          10.0
+        ],
+        "accepted_idx": [
+          0
+        ],
+        "best_energy": 0.0,
+        "operation_list": [
+          [
+            "START",
+            true
+          ],
+          [
+            "shift5.27237423dy0.45256711dz",
+            false
+          ],
+          [
+            "shift1.56209945dy0.10098531dz",
+            false
+          ],
+          [
+            "shift1.37041291dy0.24788043dz",
+            false
+          ]
+        ]
+      },
+      "owned_batch_ga": {
+        "best_energy": 1.0,
+        "best_path": "batch_GA_303_g0_c1.data",
+        "evaluations": [
+          {
+            "energy": 1e+30,
+            "failure_reason": "evaluator output changed species/type for one or more atom IDs",
+            "has_manipulator": false,
+            "has_mapping": true,
+            "input_index": 0,
+            "labels_sha256": null,
+            "structure_path": null,
+            "success": false
+          },
+          {
+            "energy": 1.0,
+            "failure_reason": null,
+            "has_manipulator": true,
+            "has_mapping": true,
+            "input_index": 1,
+            "labels_sha256": "a7c56ddb3e660b942c09394f5e98937e4763447fa30630fa53f9d406591cb809",
+            "structure_path": "batch_GA_303_g0_c1.data",
+            "success": true
+          }
+        ],
+        "gb_plane_x": 18.075,
+        "left_count": 400,
+        "left_owned_rows_right_of_plane": 1,
+        "right_count": 400
+      }
+    },
+    "writers": {
+      "orthogonal": {
+        "has_tilt_line": false,
+        "header": [
+          "Crystalline Ni atoms",
+          "",
+          "240 atoms",
+          "1 atom types",
+          "0.000000000000 44.524869455171 xlo xhi",
+          "0.000000000000 11.131217363793 ylo yhi",
+          "0.000000000000 10.560000000000 zlo zhi",
+          "",
+          "Atoms",
+          "",
+          "1 1 1.113121746700 3.339365205698 0.000000000000",
+          "2 1 1.669682620050 5.009047808546 1.760000000000"
+        ],
+        "line_count": 250,
+        "sha256": "cfdf6aeebf4efdb5b153d6f731cd92fe429ab5a00ab0c9d9ccaa0e37637738f8"
+      },
+      "triclinic": {
+        "has_tilt_line": true,
+        "header": [
+          "Crystalline Ni atoms",
+          "",
+          "240 atoms",
+          "1 atom types",
+          "0.000000000000 44.524869455171 xlo xhi",
+          "0.000000000000 11.131217363793 ylo yhi",
+          "0.000000000000 10.560000000000 zlo zhi",
+          "0.000000034402 0.000000000000 0.000000000000 xy xz yz",
+          "",
+          "Atoms",
+          "",
+          "1 1 1.113121746700 3.339365205698 0.000000000000"
+        ],
+        "line_count": 251,
+        "sha256": "c97d302f2205109fafb9e05e210e82a16bac48a03f71a84402b58d0ae14d53f6"
+      }
+    }
+  },
+  "schema_version": 1
+}
