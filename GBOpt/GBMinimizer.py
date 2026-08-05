@@ -15,10 +15,12 @@ import numpy as np
 from GBOpt import GBMaker, GBManipulator
 from GBOpt.FileGrainOwnership import GrainOwnership
 from GBOpt._explicit_ownership_evaluation import (
-    PENALTY,
     CandidateEvaluation,
     ExplicitOwnershipEvaluator,
 )
+
+
+PENALTY = 1.0e30
 
 
 class Mutator:
@@ -269,6 +271,7 @@ class GeneticAlgorithmMinimizer:
                 scalar_energy_func=gb_energy_func,
                 batch_energy_func=gb_batch_energy_func,
                 local_random=self.local_random,
+                penalty=PENALTY,
             )
             if initial_ownership is not None
             else None

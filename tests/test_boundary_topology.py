@@ -10,94 +10,63 @@ from GBOpt.BoundaryTopology import (
 
 
 @pytest.mark.parametrize(
-    ("value", "legacy", "expected"),
+    ("value", "expected"),
     [
         pytest.param(
-            None,
             None,
             BoundaryNormalTopology.UNKNOWN,
             id="missing-metadata",
         ),
         pytest.param(
-            None,
-            False,
+            BoundaryNormalTopology.PERIODIC_BICRYSTAL,
+            BoundaryNormalTopology.PERIODIC_BICRYSTAL,
+            id="periodic-enum",
+        ),
+        pytest.param(
+            BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
+            BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
+            id="slab-enum",
+        ),
+        pytest.param(
             BoundaryNormalTopology.UNKNOWN,
-            id="legacy-false-remains-unknown",
+            BoundaryNormalTopology.UNKNOWN,
+            id="unknown-enum",
         ),
         pytest.param(
-            None,
-            True,
+            "periodic_bicrystal",
             BoundaryNormalTopology.PERIODIC_BICRYSTAL,
-            id="legacy-true-is-periodic",
-        ),
-        pytest.param(
-            BoundaryNormalTopology.PERIODIC_BICRYSTAL,
-            None,
-            BoundaryNormalTopology.PERIODIC_BICRYSTAL,
-            id="explicit-periodic-enum",
+            id="periodic-string",
         ),
         pytest.param(
             "single_interface_slab",
-            None,
             BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
-            id="explicit-slab-string",
+            id="slab-string",
         ),
         pytest.param(
-            BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
-            False,
-            BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
-            id="explicit-slab-compatible-with-false",
-        ),
-        pytest.param(
+            "unknown",
             BoundaryNormalTopology.UNKNOWN,
-            False,
-            BoundaryNormalTopology.UNKNOWN,
-            id="explicit-unknown-compatible-with-false",
+            id="unknown-string",
         ),
     ],
 )
-def test_normalize_boundary_normal_topology(value, legacy, expected):
-    assert (
-        normalize_boundary_normal_topology(
-            value,
-            periodic_outer_x_interface=legacy,
-        )
-        is expected
-    )
-
-
-@pytest.mark.parametrize(
-    "legacy",
-    [
-        pytest.param(0, id="integer-zero"),
-        pytest.param(1, id="integer-one"),
-        pytest.param("", id="empty-string"),
-        pytest.param("yes", id="truthy-string"),
-        pytest.param([], id="empty-list"),
-        pytest.param(object(), id="arbitrary-object"),
-    ],
-)
-def test_normalize_rejects_non_boolean_legacy_values(legacy):
-    with pytest.raises(
-        BoundaryTopologyError,
-        match="periodic_outer_x_interface must be a bool or None",
-    ):
-        normalize_boundary_normal_topology(
-            BoundaryNormalTopology.PERIODIC_BICRYSTAL,
-            periodic_outer_x_interface=legacy,
-        )
+def test_normalize_boundary_normal_topology(value, expected):
+    assert normalize_boundary_normal_topology(value) is expected
 
 
 @pytest.mark.parametrize(
     "value",
     [
         pytest.param("periodic", id="unsupported-string"),
-        pytest.param(1, id="integer"),
-        pytest.param(True, id="boolean"),
+        pytest.param("", id="empty-string"),
+        pytest.param(0, id="integer-zero"),
+        pytest.param(1, id="integer-one"),
+        pytest.param(True, id="boolean-true"),
+        pytest.param(False, id="boolean-false"),
+        pytest.param([], id="list"),
         pytest.param(object(), id="arbitrary-object"),
     ],
 )
-def test_normalize_rejects_unsupported_explicit_topology(value):
+def test_normalize_rejects_unsupported_topology_values(value):
     with pytest.raises(
         BoundaryTopologyError,
         match="Unsupported boundary-normal topology",
@@ -105,40 +74,8 @@ def test_normalize_rejects_unsupported_explicit_topology(value):
         normalize_boundary_normal_topology(value)
 
 
-@pytest.mark.parametrize(
-    ("topology", "legacy"),
-    [
-        pytest.param(
-            BoundaryNormalTopology.PERIODIC_BICRYSTAL,
-            False,
-            id="periodic-versus-false",
-        ),
-        pytest.param(
-            BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
-            True,
-            id="slab-versus-true",
-        ),
-        pytest.param(
-            BoundaryNormalTopology.UNKNOWN,
-            True,
-            id="unknown-versus-true",
-        ),
-    ],
-)
-def test_normalize_rejects_conflicting_topology_metadata(topology, legacy):
-    with pytest.raises(
-        BoundaryTopologyError,
-        match="conflicts with boundary-normal topology",
-    ):
-        normalize_boundary_normal_topology(
-            topology,
-            periodic_outer_x_interface=legacy,
-        )
+def test_normalize_chains_original_conversion_error():
+    with pytest.raises(BoundaryTopologyError) as exc_info:
+        normalize_boundary_normal_topology("periodic")
 
-
-def test_legacy_boolean_property_is_explicitly_lossy():
-    assert BoundaryNormalTopology.PERIODIC_BICRYSTAL.periodic_outer_x_interface is True
-    assert (
-        BoundaryNormalTopology.SINGLE_INTERFACE_SLAB.periodic_outer_x_interface is False
-    )
-    assert BoundaryNormalTopology.UNKNOWN.periodic_outer_x_interface is False
+    assert isinstance(exc_info.value.__cause__, ValueError)

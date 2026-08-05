@@ -12,7 +12,7 @@ import pytest
 from GBOpt.Atom import Atom
 from GBOpt.BoundaryTopology import BoundaryNormalTopology
 from GBOpt.GBMaker import GBMaker
-from GBOpt.GBMinimizer import GeneticAlgorithmMinimizer
+from GBOpt.GBMinimizer import PENALTY, GeneticAlgorithmMinimizer
 from GBOpt._explicit_ownership_evaluation import ExplicitOwnershipEvaluator
 
 # These tests use compact GBMaker fixtures; sizing-warning behavior is covered in
@@ -607,6 +607,7 @@ def test_candidate_file_mapping_preserves_manipulator_geometry(topology):
         scalar_energy_func=lambda *args: None,
         batch_energy_func=None,
         local_random=np.random.default_rng(0),
+        penalty=PENALTY,
     )
     mapping = evaluator._candidate_file_mapping(manipulator, atoms)
 
