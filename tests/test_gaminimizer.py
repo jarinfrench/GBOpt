@@ -234,9 +234,22 @@ def test_initial_owned_manipulator_preserves_counts_plane_and_runs_owned_ga(tmp_
         periodic_outer_x_interface=True,
     )
 
+    def fake_energy(GB, manipulator, atom_positions, unique_id):
+        output = tmp_path / f"{unique_id}.data"
+        _write_preserved_id_candidate(
+            output,
+            np.array(atom_positions, copy=True),
+            np.arange(1, len(atom_positions) + 1),
+            manipulator.parents[0].box_dims,
+        )
+        if "initial" in str(unique_id):
+            return 10.0, str(output)
+        candidate_index = int(str(unique_id).rsplit("c", 1)[-1])
+        return float(candidate_index + 1), str(output)
+
     minimizer = GeneticAlgorithmMinimizer(
         gb,
-        lambda *args: (0.0, str(seed_path)),
+        fake_energy,
         ["translate_right_grain"],
         seed=0,
         initial_structure=str(seed_path),
@@ -251,12 +264,20 @@ def test_initial_owned_manipulator_preserves_counts_plane_and_runs_owned_ga(tmp_
     assert np.array_equal(parent.grain_labels, labels)
 
     best_energy, best_path = minimizer.run_GA(unique_id=1)
-    assert best_energy == pytest.approx(0.0)
-    assert Path(best_path) == seed_path
+    assert best_energy == pytest.approx(1.0)
+    assert Path(best_path).is_file()
+    assert Path(best_path) != seed_path
     assert minimizer.best_evaluation.success
-    assert np.array_equal(
-        minimizer.best_evaluation.manipulator.parents[0].grain_labels, labels
-    )
+
+    records = minimizer.last_generation_evaluations
+    assert len(records) == 2
+    assert all(record.success for record in records)
+    assert len({record.structure_path for record in records}) == 2
+    for record in records:
+        assert np.array_equal(
+            record.manipulator.parents[0].grain_labels,
+            labels,
+        )
 
 
 def _write_preserved_id_candidate(path, atoms, ids, box_dims, *, change_species=False):

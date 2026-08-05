@@ -3,8 +3,6 @@
 """Integration tests for GBMaker's exact integer grain-construction path."""
 
 import importlib
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 from scipy.spatial import KDTree
@@ -13,6 +11,7 @@ from GBOpt.Atom import Atom
 from GBOpt.BoundarySpec import CSLExactSpec, PQSpec
 from GBOpt.crystallography import pq_spec_to_embedding
 from GBOpt.GBMaker import GBMaker, GBMakerValueError
+from GBOpt.gbmaker_supercell import SupercellSites
 from GBOpt.UnitCell import UnitCell
 from tests.data.zhang_2022_uo2_ceo2_gb_energies import BOUNDARIES
 
@@ -175,21 +174,6 @@ def build_gb():
 def _positions(atoms):
     """Return structured atom coordinates as an ``(N, 3)`` float array."""
     return np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
-
-
-def _fake_fcc_supercell_sites(coordinate_numerators, *, denominator):
-    """Return the minimal exact-site result needed by ``__generate_grain_exact``."""
-    return SimpleNamespace(
-        supercell_index=1,
-        site_count=4,
-        basis_indices=np.arange(4, dtype=np.intp),
-        coordinate_numerators=np.asarray(
-            coordinate_numerators,
-            dtype=object,
-        ),
-        supercell_matrix=np.eye(3, dtype=object),
-        coordinate_denominator=denominator,
-    )
 
 
 def _assert_fluorite_stoichiometry(atoms, *, label):
@@ -390,25 +374,45 @@ def test_exact_builder_returns_complete_small_fcc_grains(build_gb):
         )
 
 
-def test_exact_builder_translates_unrepresentable_integer_coordinates(
+def test_exact_builder_rejects_unrepresentable_integer_coordinates(
     build_gb,
     monkeypatch,
 ):
     gb = build_gb()
-    sites = _fake_fcc_supercell_sites(
+    supercell = np.array(
         [
-            [10**400, 0, 0],
+            [1, 10**400, 0],
+            [0, 1, 0],
             [0, 0, 1],
-            [1, 0, 0],
-            [1, 1, 0],
         ],
-        denominator=2,
+        dtype=object,
+    )
+    sites = SupercellSites(
+        coordinate_numerators=np.array(
+            [
+                [1, 0, 0],
+                [0, 0, 1],
+                [0, 1, 0],
+                [1, 1, 1],
+            ],
+            dtype=object,
+        ),
+        basis_denominator=2,
+        basis_indices=np.arange(4, dtype=np.intp),
+        supercell_matrix=supercell,
+        repeats=(1, 1, 1),
+        basis_size=4,
     )
 
     monkeypatch.setattr(
         GBMaker,
         "_GBMaker__exact_grain_repeats",
-        lambda _self, _P_or_Q, _x_length, _grain_side: (1, 1, 1),
+        lambda _self, _P_or_Q, _x_length, _grain_side: (
+            supercell,
+            1,
+            1,
+            1,
+        ),
     )
     monkeypatch.setattr(
         importlib.import_module("GBOpt.GBMaker"),
@@ -429,25 +433,39 @@ def test_exact_builder_translates_unrepresentable_integer_coordinates(
         )
 
 
-def test_exact_builder_canonicalizes_upper_x_face_into_half_open_slab(
+def test_exact_builder_canonicalizes_rounded_upper_x_face_into_half_open_slab(
     build_gb,
     monkeypatch,
 ):
     gb = build_gb()
-    sites = _fake_fcc_supercell_sites(
-        [
-            [2, 0, 0],
-            [0, 0, 1],
-            [1, 0, 0],
-            [1, 1, 0],
-        ],
-        denominator=2,
+    denominator = 10**20
+    supercell = np.eye(3, dtype=object)
+    sites = SupercellSites(
+        coordinate_numerators=np.array(
+            [
+                [denominator - 1, 0, 0],
+                [0, 0, 1],
+                [1, 0, 0],
+                [1, 1, 0],
+            ],
+            dtype=object,
+        ),
+        basis_denominator=denominator,
+        basis_indices=np.arange(4, dtype=np.intp),
+        supercell_matrix=supercell,
+        repeats=(1, 1, 1),
+        basis_size=4,
     )
 
     monkeypatch.setattr(
         GBMaker,
         "_GBMaker__exact_grain_repeats",
-        lambda _self, _P_or_Q, _x_length, _grain_side: (1, 1, 1),
+        lambda _self, _P_or_Q, _x_length, _grain_side: (
+            supercell,
+            1,
+            1,
+            1,
+        ),
     )
     monkeypatch.setattr(
         importlib.import_module("GBOpt.GBMaker"),
@@ -553,7 +571,7 @@ def test_exact_construction_rejects_missing_rational_basis(monkeypatch):
     )
 
     with pytest.raises(
-        ValueError,
+        GBMakerValueError,
         match=r"Exact grain generation requires UnitCell\.rational_basis",
     ):
         GBMaker.from_boundary_spec(
@@ -668,6 +686,9 @@ def test_exact_gap_handling_rejects_negative_gap_without_layer_deletion(
     periodic_gap,
 ):
     gb = build_gb(vacuum=0.0)
+    left_before = gb.left_grain.copy()
+    right_before = gb.right_grain.copy()
+    whole_before = gb.whole_system.copy()
 
     monkeypatch.setattr(
         GBMaker,
@@ -692,6 +713,10 @@ def test_exact_gap_handling_rejects_negative_gap_without_layer_deletion(
             vacuum0_trim_applied=False,
             x_period_right=None,
         )
+
+    np.testing.assert_array_equal(gb.left_grain, left_before)
+    np.testing.assert_array_equal(gb.right_grain, right_before)
+    np.testing.assert_array_equal(gb.whole_system, whole_before)
 
 
 def test_vacuum_zero_exact_gap_metrics_are_diagnostic_only(build_gb):

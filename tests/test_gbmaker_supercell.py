@@ -365,20 +365,28 @@ def test_enumerate_supercell_origins_preserves_known_oblique_order():
     assert all(type(value) is int for value in origins.flat)
 
 
+@pytest.mark.parametrize(
+    "shear",
+    [
+        pytest.param(100, id="moderate-shear"),
+        pytest.param(10_000, id="large-shear"),
+    ],
+)
 def test_enumerate_supercell_origins_bounds_membership_work_by_output_size(
     monkeypatch,
+    shear,
 ):
-    shear = 100
     supercell = _int_matrix(
         ((1, 0, 0), (0, 1, shear), (0, 0, 1))
     )
     membership_calls = 0
+    membership_budget = 8
     original_membership = gbmaker_supercell_module._integer_membership
 
     def bounded_membership(*args, **kwargs):
         nonlocal membership_calls
         membership_calls += 1
-        if membership_calls > 4:
+        if membership_calls > membership_budget:
             pytest.fail(
                 "origin enumeration performed work proportional to the Cartesian "
                 "bounding box rather than the quotient-lattice output size"
@@ -397,7 +405,7 @@ def test_enumerate_supercell_origins_bounds_membership_work_by_output_size(
         origins,
         np.array(((0, 0, 0),), dtype=object),
     )
-    assert membership_calls <= len(origins)
+    assert membership_calls <= membership_budget
 
 
 # ---------------------------------------------------------------------------

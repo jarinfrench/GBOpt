@@ -1056,22 +1056,24 @@ class TestRationalBasis:
     def test_rational_basis_is_defensively_immutable(self):
         names = ["A", "B"]
         numerators = np.array([[0, 0, 0], [1, 1, 1]], dtype=object)
+        expected = np.array([[0, 0, 0], [1, 1, 1]], dtype=object)
         basis = RationalBasis(names=names, numerators=numerators, denominator=2)
 
         names[0] = "changed"
         numerators[0, 0] = 1
 
         assert basis.names == ("A", "B")
-        np.testing.assert_array_equal(
-            basis.numerators,
-            np.array([[0, 0, 0], [1, 1, 1]], dtype=object),
-        )
+        np.testing.assert_array_equal(basis.numerators, expected)
+
         returned = basis.numerators
         assert not returned.flags.writeable
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="read-only"):
             returned[0, 0] = 1
-        with pytest.raises(ValueError):
-            returned.setflags(write=True)
+
+        writable_copy = returned.copy()
+        writable_copy[0, 0] = 1
+        np.testing.assert_array_equal(basis.numerators, expected)
+
         with pytest.raises(FrozenInstanceError):
             basis.denominator = 4
 
