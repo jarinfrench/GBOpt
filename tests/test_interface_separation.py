@@ -303,6 +303,10 @@ def test_interface_candidate_rejects_coercive_grain_labels(labels):
     [
         pytest.param((1, 0), id="integer-flags"),
         pytest.param(("False", "True"), id="string-flags"),
+        pytest.param(
+            np.asarray([True, False], dtype=np.bool_),
+            id="numpy-boolean-array",
+        ),
     ],
 )
 def test_interface_candidate_rejects_coercive_periodicity(periodic):
@@ -325,29 +329,6 @@ def test_interface_candidate_rejects_coercive_periodicity(periodic):
         )
 
 
-def test_interface_candidate_normalizes_boolean_array_periodicity():
-    manipulator, _ = _synthetic_manipulator(
-        BoundaryNormalTopology.PERIODIC_BICRYSTAL
-    )
-    base = manipulator.make_parent_candidate()
-    periodic = np.asarray([True, False], dtype=np.bool_)
-
-    candidate = InterfaceCandidate(
-        atoms=base.atoms,
-        box_dims=base.box_dims,
-        gb_plane_x=base.gb_plane_x,
-        left_grain_x_bounds=base.left_grain_x_bounds,
-        right_grain_x_bounds=base.right_grain_x_bounds,
-        grain_labels=base.grain_labels,
-        inplane_periodic=periodic,
-        normal_topology=base.normal_topology,
-        coordinate_tolerance=base.coordinate_tolerance,
-    )
-
-    assert candidate.inplane_periodic == (True, False)
-    periodic[0] = False
-    assert candidate.inplane_periodic == (True, False)
-
 
 def test_fixed_cell_operations_return_complete_candidates():
     manipulator, _ = _synthetic_manipulator(
@@ -358,17 +339,12 @@ def test_fixed_cell_operations_return_complete_candidates():
     translated = manipulator.make_translation_candidate(0.5, 0.25)
     assert np.array_equal(translated.atoms, translated_atoms)
 
-    cycled_atoms = manipulator.cycle_grain_terminations(
+    cycled = manipulator.cycle_grain_terminations(
         left_phase_shift=0.5,
         right_phase_shift=0.75,
         right_dy=0.25,
     )
-    cycled = manipulator.make_termination_candidate(
-        left_phase_shift=0.5,
-        right_phase_shift=0.75,
-        right_dy=0.25,
-    )
-    assert np.array_equal(cycled.atoms, cycled_atoms)
+    assert isinstance(cycled, InterfaceCandidate)
     assert np.array_equal(cycled.box_dims, translated.box_dims)
     assert cycled.gb_plane_x == translated.gb_plane_x
     assert np.array_equal(cycled.grain_labels, np.array([0, 0, 1, 1]))
@@ -380,16 +356,12 @@ def test_slab_termination_companion_is_grain_local_and_geometry_preserving():
     )
     parent_before = parent.whole_system.copy()
 
-    atoms = manipulator.cycle_slab_terminations(
-        left_phase_shift=0.5,
-        right_phase_shift=1.0,
-    )
-    candidate = manipulator.make_slab_termination_candidate(
+    candidate = manipulator.cycle_slab_terminations(
         left_phase_shift=0.5,
         right_phase_shift=1.0,
     )
 
-    assert np.array_equal(candidate.atoms, atoms)
+    assert isinstance(candidate, InterfaceCandidate)
     assert candidate.normal_topology is BoundaryNormalTopology.SINGLE_INTERFACE_SLAB
     assert candidate.interface_separation == 0.0
     assert candidate.box_dims.tolist() == parent.box_dims.tolist()
@@ -415,7 +387,7 @@ def test_slab_termination_companion_is_grain_local_and_geometry_preserving():
 def test_slab_termination_zero_phase_is_exact_identity():
     manipulator, parent = _slab_manipulator()
 
-    candidate = manipulator.make_slab_termination_candidate()
+    candidate = manipulator.cycle_slab_terminations()
 
     assert np.array_equal(candidate.atoms, parent.whole_system)
     assert np.array_equal(candidate.box_dims, parent.box_dims)
@@ -426,7 +398,7 @@ def test_slab_termination_zero_phase_is_exact_identity():
 def test_slab_termination_wraps_each_physical_upper_face_to_its_lower_face():
     manipulator, _ = _slab_manipulator()
 
-    candidate = manipulator.make_slab_termination_candidate(
+    candidate = manipulator.cycle_slab_terminations(
         left_phase_shift=0.25,
         right_phase_shift=0.25,
     )
@@ -440,7 +412,7 @@ def test_slab_termination_wraps_each_physical_upper_face_to_its_lower_face():
 def test_slab_termination_combines_right_inplane_registry_shift():
     manipulator, parent = _slab_manipulator()
 
-    candidate = manipulator.make_slab_termination_candidate(
+    candidate = manipulator.cycle_slab_terminations(
         right_phase_shift=0.5,
         right_dy=7.0,
         right_dz=6.0,
@@ -455,7 +427,7 @@ def test_slab_termination_combines_right_inplane_registry_shift():
 def test_slab_termination_preserves_nonperiodic_inplane_rejection():
     manipulator, parent = _slab_manipulator(inplane_periodic=(False, True))
 
-    valid = manipulator.make_slab_termination_candidate(right_dy=0.5)
+    valid = manipulator.cycle_slab_terminations(right_dy=0.5)
     np.testing.assert_allclose(valid.atoms["y"][2:], parent.right_grain["y"] + 0.5)
 
     with pytest.raises(GBManipulatorValueError, match="nonperiodic half-open y"):
@@ -466,7 +438,7 @@ def test_slab_termination_composes_with_interface_separation():
     manipulator, _ = _slab_manipulator(
         left_bounds=(3.5, 8.0), right_bounds=(8.0, 13.0)
     )
-    terminated = manipulator.make_slab_termination_candidate(
+    terminated = manipulator.cycle_slab_terminations(
         left_phase_shift=0.5,
         right_phase_shift=0.75,
     )
@@ -592,7 +564,7 @@ def test_slab_termination_gbmaker_integration_preserves_vacuum_geometry():
     manipulator = GBManipulator(gb, seed=17)
     base = manipulator.make_parent_candidate()
 
-    candidate = manipulator.make_slab_termination_candidate(
+    candidate = manipulator.cycle_slab_terminations(
         left_phase_shift=0.25,
         right_phase_shift=0.5,
         right_dy=0.125,
