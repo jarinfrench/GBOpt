@@ -1,9 +1,9 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from numbers import Integral
-from typing import Sequence, Tuple, Union
 
 import numpy as np
 from scipy.spatial import KDTree
@@ -13,22 +13,18 @@ from GBOpt import Atom
 
 class UnitCellError(Exception):
     """Base class for exceptions in the UnitCell class"""
-    pass
 
 
 class UnitCellValueError(UnitCellError):
     """Exceptions raised when an incorrect value is assigned to a UnitCell attribute."""
-    pass
 
 
 class UnitCellTypeError(UnitCellError):
     """Exceptions raised when an incorrect type is assigned to a UnitCell attribute."""
-    pass
 
 
 class UnitCellRuntimeError(UnitCellError):
     """Exceptions raised when there is an error during runtime in the UnitCell class."""
-    pass
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -99,11 +95,11 @@ class RationalBasis:
                 normalized_row.append(integer)
             normalized_rows.append(tuple(normalized_row))
 
-        decorated_rows = tuple(zip(names, normalized_rows))
-        if len(decorated_rows) != len(set(decorated_rows)):
+        coordinate_rows = tuple(normalized_rows)
+        if len(coordinate_rows) != len(set(coordinate_rows)):
             raise UnitCellValueError(
-                "Rational-basis decorated rows must be unique within the conventional "
-                "cell."
+                "Rational-basis coordinates must be unique within the conventional "
+                "cell, regardless of species."
             )
 
         object.__setattr__(self, "names", names)
@@ -206,9 +202,18 @@ class UnitCell:
     Atom positions are given as fractional coordinates. Types start at 1
     """
 
-    __slots__ = ["__unit_cell", "__conventional", "__primitive", "__a0",
-                 "__radius", "__reciprocal", "__ideal_bond_lengths",
-                 "__ratio", "__type_map", "__rational_basis"]
+    __slots__ = [
+        "__a0",
+        "__conventional",
+        "__ideal_bond_lengths",
+        "__primitive",
+        "__radius",
+        "__ratio",
+        "__rational_basis",
+        "__reciprocal",
+        "__type_map",
+        "__unit_cell",
+    ]
 
     # TODO: Basis might be needed for more complicated structures.
     def __init__(self):
@@ -223,8 +228,8 @@ class UnitCell:
         self.__rational_basis = None
 
     def init_by_structure(
-            self, structure: str, a0: float, atoms: Union[str, Tuple[str, ...]],
-            type_map: Union[dict[str, int], dict[int, str]] = None) -> None:
+            self, structure: str, a0: float, atoms: str | tuple[str, ...],
+            type_map: dict[str, int] | dict[int, str] = None) -> None:
         """
         Initialize the UnitCell by crystal structure.
 
@@ -413,7 +418,7 @@ class UnitCell:
                        unit_cell_types: str | Sequence[str], a0: float,
                        conventional: np.ndarray, reciprocal: np.ndarray,
                        ideal_bond_lengths: dict, ratio: dict[int, int] = {1: 1},
-                       type_map: Union[dict[int, str], dict[str, int]] = None) -> None:
+                       type_map: dict[int, str] | dict[str, int] = None) -> None:
         """
         Initialize the UnitCell with a custom-built lattice.
 
@@ -614,7 +619,7 @@ class UnitCell:
         return self.__type_map
 
     @type_map.setter
-    def type_map(self, value: Union[dict[str, int], dict[int, str]]) -> None:
+    def type_map(self, value: dict[str, int] | dict[int, str]) -> None:
         """
         Sets the string-to-int map that is used to assign types/strings to each atom.
         """

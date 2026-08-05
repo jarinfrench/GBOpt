@@ -224,7 +224,7 @@ class TestUnitCell(unittest.TestCase):
         }
         self.assertTrue(cell.ideal_bond_lengths.keys() == ideal_fluorite_bonds.keys())
         self.assertTrue(all([math.isclose(cell.ideal_bond_lengths[i],
-                        ideal_fluorite_bonds[i]) for i in ideal_fluorite_bonds.keys()]))
+                        ideal_fluorite_bonds[i]) for i in ideal_fluorite_bonds]))
         self.assertEqual(cell.ratio, {1: 1, 2: 2})
 
     def test_rocksalt_initialization(self):
@@ -278,7 +278,7 @@ class TestUnitCell(unittest.TestCase):
         }
         self.assertTrue(cell.ideal_bond_lengths.keys() == ideal_rocksalt_bonds.keys())
         self.assertTrue(all([math.isclose(cell.ideal_bond_lengths[i],
-                        ideal_rocksalt_bonds[i]) for i in ideal_rocksalt_bonds.keys()]))
+                        ideal_rocksalt_bonds[i]) for i in ideal_rocksalt_bonds]))
         self.assertEqual(cell.ratio, {1: 1, 2: 1})
 
     def test_zincblende_initialization(self):
@@ -332,7 +332,7 @@ class TestUnitCell(unittest.TestCase):
         }
         self.assertTrue(cell.ideal_bond_lengths.keys() == ideal_zincblende_bonds.keys())
         self.assertTrue(all([math.isclose(cell.ideal_bond_lengths[i],
-                        ideal_zincblende_bonds[i]) for i in ideal_zincblende_bonds.keys()]))
+                        ideal_zincblende_bonds[i]) for i in ideal_zincblende_bonds]))
         self.assertEqual(cell.ratio, {1: 1, 2: 1})
 
     def test_custom_initialization(self):
@@ -426,7 +426,7 @@ class TestUnitCell(unittest.TestCase):
         )
         self.assertTrue(cell.ideal_bond_lengths.keys() == custom_ideal_bonds.keys())
         self.assertTrue(all([math.isclose(cell.ideal_bond_lengths[i],
-                        custom_ideal_bonds[i]) for i in custom_ideal_bonds.keys()]))
+                        custom_ideal_bonds[i]) for i in custom_ideal_bonds]))
         self.assertEqual(cell.ratio, custom_ratio)
         self.assertEqual(cell.type_map, {'H': 1, 'C': 2})
         cell.type_map = custom_type_map
@@ -889,8 +889,36 @@ BUILTIN_RATIONAL_BASIS_CASES = [
 INVALID_RATIONAL_BASES = [
     pytest.param(
         UnitCellTypeError,
+        {"names": "A", "numerators": [[0, 0, 0]], "denominator": 2},
+        id="names-is-string",
+    ),
+    pytest.param(
+        UnitCellTypeError,
+        {
+            "names": ("A", 2),
+            "numerators": [[0, 0, 0], [1, 1, 1]],
+            "denominator": 2,
+        },
+        id="nonstring-name",
+    ),
+    pytest.param(
+        UnitCellValueError,
+        {
+            "names": (),
+            "numerators": np.empty((0, 3), dtype=object),
+            "denominator": 2,
+        },
+        id="empty-basis",
+    ),
+    pytest.param(
+        UnitCellTypeError,
         {"names": ("A",), "numerators": [[0, 0, 0]], "denominator": 2.0},
         id="noninteger-denominator",
+    ),
+    pytest.param(
+        UnitCellValueError,
+        {"names": ("A",), "numerators": [[0, 0, 0]], "denominator": 0},
+        id="zero-denominator",
     ),
     pytest.param(
         UnitCellValueError,
@@ -901,6 +929,11 @@ INVALID_RATIONAL_BASES = [
         UnitCellValueError,
         {"names": ("A",), "numerators": [0, 0, 0], "denominator": 2},
         id="malformed-numerator-shape",
+    ),
+    pytest.param(
+        UnitCellValueError,
+        {"names": ("A",), "numerators": [[0, 0]], "denominator": 2},
+        id="wrong-coordinate-width",
     ),
     pytest.param(
         UnitCellValueError,
@@ -918,12 +951,17 @@ INVALID_RATIONAL_BASES = [
     ),
     pytest.param(
         UnitCellValueError,
+        {"names": ("A",), "numerators": [[-1, 0, 0]], "denominator": 2},
+        id="negative-coordinate",
+    ),
+    pytest.param(
+        UnitCellValueError,
         {
-            "names": ("A", "A"),
+            "names": ("A", "B"),
             "numerators": [[0, 0, 0], [0, 0, 0]],
             "denominator": 2,
         },
-        id="duplicate-decorated-site",
+        id="duplicate-coordinate-different-species",
     ),
     pytest.param(
         UnitCellTypeError,
@@ -967,18 +1005,18 @@ class TestRationalBasis:
         )
         assert tuple(atom_array["name"]) == expected_names
 
-    def test_fluorite_basis_is_complete_and_uniquely_decorated(self):
+    def test_fluorite_basis_is_complete_and_spatially_unique(self):
         cell = UnitCell()
         cell.init_by_structure("fluorite", 5.454, ["U", "O"])
 
         basis = cell.rational_basis
-        decorated_rows = tuple(
-            (name, *row)
-            for name, row in zip(basis.names, basis.numerators.tolist())
+        coordinate_rows = tuple(
+            tuple(int(value) for value in row)
+            for row in basis.numerators
         )
 
-        assert len(decorated_rows) == 12
-        assert len(set(decorated_rows)) == 12
+        assert len(coordinate_rows) == 12
+        assert len(set(coordinate_rows)) == 12
         assert Counter(basis.names) == {"U": 4, "O": 8}
 
     def test_fluorite_basis_is_canonical_and_deterministic(self):
@@ -1019,15 +1057,16 @@ class TestRationalBasis:
         with pytest.raises(FrozenInstanceError):
             basis.denominator = 4
 
-    def test_different_species_may_decorate_the_same_periodic_site(self):
-        basis = RationalBasis(
-            names=("A", "B"),
-            numerators=[[0, 0, 0], [0, 0, 0]],
-            denominator=1,
-        )
-
-        assert basis.names == ("A", "B")
-        assert basis.numerators.shape == (2, 3)
+    def test_different_species_may_not_occupy_the_same_periodic_site(self):
+        with pytest.raises(
+            UnitCellValueError,
+            match="coordinates must be unique.*regardless of species",
+        ):
+            RationalBasis(
+                names=("A", "B"),
+                numerators=[[0, 0, 0], [0, 0, 0]],
+                denominator=1,
+            )
 
     @pytest.mark.parametrize(("error", "kwargs"), INVALID_RATIONAL_BASES)
     def test_rational_basis_rejects_invalid_data(self, error, kwargs):
