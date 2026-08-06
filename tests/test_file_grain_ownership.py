@@ -19,8 +19,8 @@ from GBOpt.FileGrainOwnership import (
     read_lammps_data_file,
     read_lammps_dump_file,
     read_lammps_structure_file,
-    reload_explicit_manipulator,
 )
+from GBOpt._explicit_ownership_evaluation import reload_explicit_manipulator
 from GBOpt.GBManipulator import InterfaceCandidate
 from GBOpt.UnitCell import UnitCell
 
@@ -912,3 +912,7 @@ def test_candidate_file_mapping_rejects_noncanonical_candidate_ids() -> None:
             coordinate_tolerance=1.0e-8,
             normal_topology=BoundaryNormalTopology.PERIODIC_BICRYSTAL,
         )
+
+
+def test_grain_ownership_is_defined_by_interface_domain_layer():
+    assert GrainOwnership.__module__ == "GBOpt.InterfaceDomain"

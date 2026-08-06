@@ -1,9 +1,7 @@
 """Adapt file-backed evaluator callbacks to explicit grain ownership.
 
-The adapter consumes optimizer-supplied callbacks, candidate structures, ownership
-mappings, and failure energy policy. It returns aligned :class:`CandidateEvaluation`
-records after result normalization, artifact validation, and candidate reconstruction.
-Optimizer selection and breeding policy do not belong here.
+This module owns callback invocation, result normalization, artifact validation, and
+candidate reconstruction. Optimizer selection and breeding policy do not belong here.
 """
 
 from __future__ import annotations
@@ -18,12 +16,12 @@ import numpy as np
 
 from GBOpt.FileGrainOwnership import (
     CandidateFileMapping,
-    GrainOwnershipError,
     LammpsDataError,
-    reload_explicit_manipulator,
+    validate_explicit_structure,
 )
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import GBManipulator, GBManipulatorError, ParentError
+from GBOpt.InterfaceDomain import GrainOwnershipError
 
 _MISSING = object()
 
@@ -32,17 +30,17 @@ _MISSING = object()
 class CandidateEvaluation:
     """Aligned result for one explicit-ownership candidate evaluation.
 
-    :param input_index: Candidate position in the submitted population, or ``-1`` for
-        the initial seed evaluation.
-    :param energy: Normalized finite energy, including the optimizer-supplied failure
-        energy when ``success`` is false.
+    :param input_index: Candidate position in the submitted population.
+    :param energy: Normalized finite energy, including the optimizer-selected penalty on
+        failure.
     :param structure_path: Canonical evaluator artifact path, when available.
     :param mapping: Candidate-to-file ownership mapping, when available.
-    :param manipulator: Evaluator-owned reconstructed candidate, when successful.
+    :param manipulator: Validated reconstructed candidate, when successful.
     :param success: Whether evaluation and reconstruction both succeeded.
     :param failure_reason: Failure context when ``success`` is false.
-    :raises TypeError: If scalar fields have invalid types.
-    :raises ValueError: If energy is non-finite or result fields contradict ``success``.
+    :raises TypeError: If a field has an unsupported type.
+    :raises ValueError: If a scalar is non-finite or result fields contradict
+        ``success``.
     """
 
     input_index: int
@@ -54,52 +52,106 @@ class CandidateEvaluation:
     failure_reason: str | None = None
 
     def __post_init__(self) -> None:
-        """Normalize scalar fields and enforce success/failure state coherence.
+        """Validate and normalize one persistent evaluation result.
 
-        :raises TypeError: If scalar fields have invalid types.
-        :raises ValueError: If energy is non-finite or result fields contradict
+        :raises TypeError: If a field has an unsupported type.
+        :raises ValueError: If a scalar is non-finite or result fields contradict
             ``success``.
         """
         if isinstance(self.input_index, (bool, np.bool_)) or not isinstance(
             self.input_index, Integral
         ):
             raise TypeError("input_index must be a non-Boolean integer")
-        if isinstance(self.energy, (bool, np.bool_)) or not isinstance(
-            self.energy, Real
-        ):
-            raise TypeError("energy must be a non-Boolean real scalar")
-        normalized_energy = float(self.energy)
-        if not np.isfinite(normalized_energy):
-            raise ValueError("energy must be finite")
-        if not isinstance(self.success, bool):
-            raise TypeError("success must be a bool")
-        if self.structure_path is not None and not isinstance(self.structure_path, str):
-            raise TypeError("structure_path must be a string or None")
-        if self.failure_reason is not None and not isinstance(self.failure_reason, str):
-            raise TypeError("failure_reason must be a string or None")
+        energy = ExplicitOwnershipEvaluator._normalize_energy(self.energy)
+        object.__setattr__(self, "input_index", int(self.input_index))
+        object.__setattr__(self, "energy", energy)
 
-        if self.success:
+        if self.structure_path is not None:
+            if not isinstance(self.structure_path, str) or not self.structure_path:
+                raise TypeError("structure_path must be a nonempty string or None")
+        if self.mapping is not None and not isinstance(
+            self.mapping, CandidateFileMapping
+        ):
+            raise TypeError("mapping must be a CandidateFileMapping or None")
+        if self.manipulator is not None and not isinstance(
+            self.manipulator, GBManipulator
+        ):
+            raise TypeError("manipulator must be a GBManipulator or None")
+        if not isinstance(self.success, (bool, np.bool_)):
+            raise TypeError("success must be Boolean")
+        success = bool(self.success)
+        object.__setattr__(self, "success", success)
+
+        if self.failure_reason is not None and (
+            not isinstance(self.failure_reason, str) or not self.failure_reason
+        ):
+            raise TypeError("failure_reason must be a nonempty string or None")
+        if success:
             if (
                 self.structure_path is None
                 or self.mapping is None
                 or self.manipulator is None
             ):
                 raise ValueError(
-                    "successful evaluation requires a structure path, mapping, "
-                    "and manipulator"
+                    "successful evaluations require a path, mapping, and manipulator"
                 )
             if self.failure_reason is not None:
                 raise ValueError(
-                    "successful evaluation must not include a failure reason"
+                    "successful evaluations must not include a failure reason"
                 )
         else:
             if self.manipulator is not None:
-                raise ValueError("failed evaluation must not include a manipulator")
-            if not self.failure_reason:
-                raise ValueError("failed evaluation requires a failure reason")
+                raise ValueError(
+                    "failed evaluations must not include a reconstructed manipulator"
+                )
+            if self.failure_reason is None:
+                raise ValueError("failed evaluations require a failure reason")
 
-        object.__setattr__(self, "input_index", int(self.input_index))
-        object.__setattr__(self, "energy", normalized_energy)
+
+def reload_explicit_manipulator(
+    returned_structure: str | Path,
+    *,
+    candidate_mapping: CandidateFileMapping,
+    unit_cell: object,
+    gb_thickness: float,
+    type_dict: dict | None = None,
+) -> GBManipulator:
+    """Validate and reconstruct an evaluator-returned owned candidate.
+
+    :param returned_structure: Path to the evaluator-returned LAMMPS structure.
+    :param candidate_mapping: Keyword argument, required. Expected candidate mapping.
+    :param unit_cell: Keyword argument, required. Unit cell for parent reconstruction.
+    :param gb_thickness: Keyword argument, required. GB-region thickness in angstroms.
+    :param type_dict: Keyword argument, optional, defaults to ``None``. LAMMPS type
+        mapping.
+    :return: Reconstructed manipulator with explicit ownership aligned by atom ID.
+    :raises FileNotFoundError: If the returned structure does not exist.
+    :raises LammpsDataError: If the returned structure cannot be read unambiguously.
+    :raises GrainOwnershipError: If candidate identity or ownership changed.
+    :raises ParentError: If parent reconstruction fails.
+    :raises GBManipulatorError: If manipulator reconstruction fails.
+    """
+    ownership = validate_explicit_structure(
+        returned_structure,
+        candidate_mapping=candidate_mapping,
+        type_dict=type_dict,
+    )
+    manipulator = GBManipulator(
+        str(returned_structure),
+        unit_cell=unit_cell,
+        gb_thickness=gb_thickness,
+        type_dict=type_dict,
+        grain_ownership=ownership,
+    )
+    parent = manipulator.parents[0]
+    if (
+        parent.grain_labels is None
+        or len(parent.grain_labels) != candidate_mapping.expected_count
+    ):
+        raise GrainOwnershipError(
+            "reloaded ownership length does not match atom count"
+        )
+    return manipulator
 
 
 class ExplicitOwnershipEvaluator:
@@ -107,15 +159,11 @@ class ExplicitOwnershipEvaluator:
 
     :param GB: Keyword argument, required. Reference grain-boundary construction.
     :param scalar_energy_func: Keyword argument, required. Scalar evaluator callback.
-    :param batch_energy_func: Keyword argument, required. Ordered batch evaluator
-        callback, or ``None``.
-    :param local_random: Keyword argument, required. Optimizer-owned random-number
-        generator.
-    :param penalty: Keyword argument, required. Optimizer-supplied finite energy used
-        for failed calculations.
-    :raises TypeError: If a callback, random-number generator, or penalty has an
-        invalid type.
-    :raises ValueError: If ``penalty`` is non-finite.
+    :param batch_energy_func: Keyword argument, optional, defaults to ``None``.
+        Ordered batch evaluator callback.
+    :param local_random: Keyword argument, required. Optimizer-owned
+        random-number generator.
+    :param penalty: Keyword argument, required. Energy assigned to failed calculations.
     """
 
     def __init__(
@@ -123,7 +171,7 @@ class ExplicitOwnershipEvaluator:
         *,
         GB: GBMaker,
         scalar_energy_func: Callable,
-        batch_energy_func: Callable | None,
+        batch_energy_func: Callable | None = None,
         local_random: np.random.Generator,
         penalty: float,
     ) -> None:
@@ -132,27 +180,25 @@ class ExplicitOwnershipEvaluator:
         :param GB: Keyword argument, required. Reference grain-boundary construction.
         :param scalar_energy_func: Keyword argument, required. Scalar evaluator
             callback.
-        :param batch_energy_func: Keyword argument, required. Ordered batch callback, or
-            ``None``.
-        :param local_random: Keyword argument, required. Optimizer-owned random-number
-            generator.
-        :param penalty: Keyword argument, required. Optimizer-supplied finite energy
-            used for failed calculations.
-        :raises TypeError: If a callback, random-number generator, or penalty has an
-            invalid type.
+        :param batch_energy_func: Keyword argument, optional, defaults to ``None``.
+            Ordered batch callback.
+        :param local_random: Keyword argument, required. Optimizer-owned
+            random-number generator.
+        :param penalty: Keyword argument, required. Energy assigned to failed
+            calculations.
+        :raises TypeError: If ``GB``, a callback, ``local_random``, or ``penalty``
+            has an unsupported type.
         :raises ValueError: If ``penalty`` is non-finite.
         """
+        if not isinstance(GB, GBMaker):
+            raise TypeError("GB must be a GBMaker")
         if not callable(scalar_energy_func):
             raise TypeError("scalar_energy_func must be callable")
         if batch_energy_func is not None and not callable(batch_energy_func):
             raise TypeError("batch_energy_func must be callable or None")
         if not isinstance(local_random, np.random.Generator):
             raise TypeError("local_random must be a numpy.random.Generator")
-        if isinstance(penalty, (bool, np.bool_)) or not isinstance(penalty, Real):
-            raise TypeError("penalty must be a non-Boolean real scalar")
-        normalized_penalty = float(penalty)
-        if not np.isfinite(normalized_penalty):
-            raise ValueError("penalty must be finite")
+        normalized_penalty = self._normalize_energy(penalty)
 
         self.GB = GB
         self.scalar_energy_func = scalar_energy_func
@@ -205,13 +251,10 @@ class ExplicitOwnershipEvaluator:
     ) -> CandidateEvaluation:
         """Create one penalty-bearing failed evaluation result.
 
-        :param input_index: Candidate position in the submitted population, or ``-1``
-            for the initial seed evaluation.
+        :param input_index: Candidate position in the submitted population.
         :param reason: Human-readable failure context.
-        :param mapping: Optional, defaults to ``None``. Candidate/file mapping when
-            construction reached that stage.
-        :param structure_path: Optional, defaults to ``None``. Canonical artifact path
-            when supplied by the evaluator.
+        :param mapping: Candidate/file mapping, when construction reached that stage.
+        :param structure_path: Canonical artifact path, when supplied by the evaluator.
         :return: Failed evaluation carrying both penalty and failure context.
         """
         return CandidateEvaluation(
@@ -246,9 +289,6 @@ class ExplicitOwnershipEvaluator:
 
         :param structure_path: Evaluator-returned path-like value.
         :return: Canonical path string, or None for a non-path value.
-        :raises OSError: If the path cannot be resolved.
-        :raises RuntimeError: If path resolution encounters a symlink loop.
-        :raises ValueError: If the path contains an invalid value.
         """
         if not isinstance(structure_path, (str, Path)):
             return None
@@ -266,21 +306,17 @@ class ExplicitOwnershipEvaluator:
         :return: Reconstructed manipulator with the optimizer RNG attached.
         :raises FileNotFoundError: If the artifact does not exist.
         :raises LammpsDataError: If the artifact cannot be read unambiguously.
-        :raises GrainOwnershipError: If the artifact changed candidate identity or
-            could not reconstruct a valid candidate.
+        :raises GrainOwnershipError: If the artifact changed candidate identity.
+        :raises ParentError: If the reconstructed parent is invalid.
+        :raises GBManipulatorError: If manipulator reconstruction fails.
         """
-        try:
-            manipulator = reload_explicit_manipulator(
-                structure_path,
-                candidate_mapping=mapping,
-                unit_cell=self.GB.unit_cell,
-                gb_thickness=self.GB.gb_thickness,
-                type_dict=self.GB.unit_cell.type_map,
-            )
-        except (ParentError, GBManipulatorError) as exc:
-            raise GrainOwnershipError(
-                f"evaluator artifact could not reconstruct a valid candidate: {exc}"
-            ) from exc
+        manipulator = reload_explicit_manipulator(
+            structure_path,
+            candidate_mapping=mapping,
+            unit_cell=self.GB.unit_cell,
+            gb_thickness=self.GB.gb_thickness,
+            type_dict=self.GB.unit_cell.type_map,
+        )
         manipulator.rng = self.local_random
         return manipulator
 
@@ -299,14 +335,14 @@ class ExplicitOwnershipEvaluator:
         evaluator failures is intentionally deferred until evaluators expose a typed
         failure classification.
 
-        :param input_index: Keyword argument, required. Candidate position in the
-            submitted population, or ``-1`` for the initial seed evaluation.
-        :param mapping: Keyword argument, required. Candidate/file mapping
-            established before evaluation.
-        :param energy: Keyword argument, optional, defaults to ``_MISSING``.
-            Evaluator-returned energy, or an internal missing sentinel.
-        :param structure_path: Keyword argument, optional, defaults to ``_MISSING``.
-            Evaluator-returned artifact path, or an internal missing sentinel.
+        :param input_index: Keyword argument. Candidate position in the submitted
+            population.
+        :param mapping: Keyword argument. Candidate/file mapping established before
+            evaluation.
+        :param energy: Keyword argument. Evaluator-returned energy, or an internal
+            missing sentinel.
+        :param structure_path: Keyword argument. Evaluator-returned artifact path, or
+            an internal missing sentinel.
         :return: Successful reconstructed evaluation or a penalty-bearing failure.
         """
         missing_fields = []
@@ -358,7 +394,8 @@ class ExplicitOwnershipEvaluator:
         if path in self._claimed_paths:
             return self._failed_evaluation(
                 input_index,
-                f"evaluator reused a structure path already assigned in this run: {path}",
+                "evaluator reused a structure path already assigned in this "
+                f"run: {path}",
                 mapping,
                 diagnostic_path,
             )
@@ -368,7 +405,13 @@ class ExplicitOwnershipEvaluator:
             #   FileNotFoundError is a subclass of OSError and is converted to a
             #   failed evaluation by the surrounding OSError recovery boundary.
             manipulator = self._reload_mapping(diagnostic_path, mapping)
-        except (OSError, LammpsDataError, GrainOwnershipError) as exc:
+        except (
+            OSError,
+            LammpsDataError,
+            GrainOwnershipError,
+            ParentError,
+            GBManipulatorError,
+        ) as exc:
             return self._failed_evaluation(
                 input_index,
                 f"{type(exc).__name__}: {exc}",
@@ -398,8 +441,7 @@ class ExplicitOwnershipEvaluator:
         :param manipulator: Candidate manipulator carrying ownership state.
         :param atoms: Candidate atom rows.
         :param unique_id: Evaluator invocation identifier.
-        :param input_index: Candidate position in the population, or ``-1`` for the
-            initial seed evaluation.
+        :param input_index: Candidate position in the population.
         :return: Normalized candidate evaluation.
         """
         try:
@@ -446,8 +488,8 @@ class ExplicitOwnershipEvaluator:
         :param gen: Generation index.
         :param unique_id: Run identifier used to construct callback IDs.
         :return: One aligned typed evaluation per input candidate.
-        :raises ValueError: If population arrays or batch results are not aligned, or if
-            a batch result is not a dictionary.
+        :raises ValueError: If population arrays or batch results are not aligned, or
+            if a batch result is not a dictionary.
         :raises RuntimeError: If an internal alignment invariant is lost.
         """
         population_length = len(population_structures)
@@ -457,8 +499,8 @@ class ExplicitOwnershipEvaluator:
             == population_length
         ):
             raise ValueError(
-                "explicit-ownership population manipulators, structures, and lineages "
-                "must remain index-aligned"
+                "explicit-ownership population manipulators, structures, and "
+                "lineages must remain index-aligned"
             )
 
         unique_ids = [
@@ -514,8 +556,8 @@ class ExplicitOwnershipEvaluator:
                 for result_index, result in enumerate(raw_results):
                     if not isinstance(result, dict):
                         raise ValueError(
-                            f"explicit-ownership batch result {result_index} must be a "
-                            "dictionary"
+                            "explicit-ownership batch result "
+                            f"{result_index} must be a dictionary"
                         )
                 for input_index, mapping, result in zip(
                     valid_indices,

@@ -24,6 +24,7 @@ from GBOpt.FileGrainOwnership import (
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import (
     GBManipulator,
+    InterfaceCandidate,
     GBManipulatorValueError,
     Parent,
     ParentCorruptedFileError,
@@ -1565,7 +1566,9 @@ def _write_named_lammps_data(path, atoms, box_dims, *, ids=None, declared_types=
                           f"{atom['x']:.12f} {atom['y']:.12f} {atom['z']:.12f}\n" for atom_id, atom in zip(ids, atoms))
 
 
-def _owned_single_species_manipulator(tmp_path, *, suffix="a", coordinates=None):
+def _owned_single_species_manipulator(
+    tmp_path, *, suffix="a", coordinates=None, gb_plane_x=5.0, seed=2
+):
     unit_cell = UnitCell()
     unit_cell.init_by_structure("fcc", 3.52, "Ni")
     if coordinates is None:
@@ -1587,9 +1590,9 @@ def _owned_single_species_manipulator(tmp_path, *, suffix="a", coordinates=None)
     ownership = GrainOwnership(
         atom_ids=np.arange(1, len(atoms) + 1),
         labels=labels,
-        gb_plane_x=5.0,
+        gb_plane_x=gb_plane_x,
         inplane_periodic=(True, True),
-        right_grain_x_bounds=(5.0, 10.0),
+        right_grain_x_bounds=(gb_plane_x, 10.0),
         coordinate_tolerance=1.0,
         periodic_outer_x_interface=True,
     )
@@ -1598,7 +1601,7 @@ def _owned_single_species_manipulator(tmp_path, *, suffix="a", coordinates=None)
         unit_cell=unit_cell,
         gb_thickness=10.0,
         grain_ownership=ownership,
-        seed=2,
+        seed=seed,
     )
     return manipulator, atoms, labels, box
 
@@ -1771,3 +1774,250 @@ def test_row_changing_mutation_updates_labels_and_copy_is_defensive(tmp_path):
         copied_labels[0] = 1 - copied_labels[0]
     assert np.array_equal(copied.candidate_grain_labels,
                           manipulator.candidate_grain_labels)
+
+
+def _minimal_interface_candidate_kwargs():
+    atoms = np.asarray(
+        [
+            ("Ni", 1.0, 1.0, 1.0),
+            ("Ni", 6.0, 2.0, 2.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    return {
+        "atoms": atoms,
+        "box_dims": np.asarray([[0.0, 10.0], [0.0, 8.0], [0.0, 6.0]]),
+        "gb_plane_x": 5.0,
+        "left_grain_x_bounds": (0.0, 5.0),
+        "right_grain_x_bounds": (5.0, 10.0),
+        "grain_labels": np.asarray([LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL]),
+        "inplane_periodic": (True, True),
+        "normal_topology": BoundaryNormalTopology.PERIODIC_BICRYSTAL,
+        "coordinate_tolerance": 1.0e-8,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("box_dims", [[False, 10.0], [0.0, 8.0], [0.0, 6.0]]),
+        ("box_dims", [["0.0", 10.0], [0.0, 8.0], [0.0, 6.0]]),
+        ("left_grain_x_bounds", (False, 5.0)),
+        ("right_grain_x_bounds", (5.0, "10.0")),
+    ],
+)
+def test_interface_candidate_rejects_coercive_geometry_values(field, value):
+    arguments = _minimal_interface_candidate_kwargs()
+    arguments[field] = value
+
+    with pytest.raises(GBManipulatorValueError, match="finite real value"):
+        InterfaceCandidate(**arguments)
+
+
+def test_seed_zero_is_deterministic_for_manipulator_rng(tmp_path):
+    first, *_ = _owned_single_species_manipulator(
+        tmp_path, suffix="seed_zero_one", seed=0
+    )
+    second, *_ = _owned_single_species_manipulator(
+        tmp_path, suffix="seed_zero_two", seed=0
+    )
+
+    assert np.array_equal(first.rng.integers(0, 2**31, 8),
+                          second.rng.integers(0, 2**31, 8))
+
+
+def test_manipulator_rejects_negative_seed(tmp_path):
+    with pytest.raises(GBManipulatorValueError, match="nonnegative"):
+        _owned_single_species_manipulator(
+            tmp_path, suffix="negative_seed", seed=-1
+        )
+
+
+def test_explicit_dump_rejects_boundary_flags_that_contradict_ownership(tmp_path):
+    dump = tmp_path / "contradictory.dump"
+    atoms = np.asarray(
+        [
+            ("Ni", 1.0, 1.0, 1.0),
+            ("Ni", 2.0, 2.0, 2.0),
+            ("Ni", 6.0, 3.0, 3.0),
+            ("Ni", 7.0, 4.0, 4.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    with dump.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(
+            "ITEM: TIMESTEP\n0\n"
+            "ITEM: NUMBER OF ATOMS\n4\n"
+            "ITEM: BOX BOUNDS ff pp pp\n"
+            "0 10\n0 10\n0 10\n"
+            "ITEM: ATOMS id typelabel x y z\n"
+        )
+        for atom_id, atom in enumerate(atoms, start=1):
+            stream.write(
+                f"{atom_id} {atom['name']} {atom['x']} {atom['y']} {atom['z']}\n"
+            )
+    ownership = GrainOwnership(
+        atom_ids=np.arange(1, 5),
+        labels=np.asarray([0, 0, 1, 1], dtype=np.int8),
+        gb_plane_x=5.0,
+        inplane_periodic=(True, True),
+        left_grain_x_bounds=(0.0, 5.0),
+        right_grain_x_bounds=(5.0, 10.0),
+        coordinate_tolerance=1.0e-8,
+        normal_topology=BoundaryNormalTopology.PERIODIC_BICRYSTAL,
+    )
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("fcc", 3.52, "Ni")
+
+    with pytest.raises(ParentValueError, match="contradict explicit ownership"):
+        Parent(
+            str(dump),
+            unit_cell=unit_cell,
+            gb_thickness=4.0,
+            grain_ownership=ownership,
+        )
+
+
+def test_slice_and_merge_centers_cut_on_explicit_nonmidpoint_plane(tmp_path):
+    first, atoms1, labels1, _ = _owned_single_species_manipulator(
+        tmp_path, suffix="plane_one", gb_plane_x=4.0
+    )
+    coordinates2 = [
+        (name, x + 0.25, y, z) for name, x, y, z in [tuple(row) for row in atoms1]
+    ]
+    second, atoms2, labels2, _ = _owned_single_species_manipulator(
+        tmp_path,
+        suffix="plane_two",
+        coordinates=coordinates2,
+        gb_plane_x=4.0,
+    )
+
+    class CenteredRng:
+        def random(self):
+            return 0.5
+
+    child_manipulator = GBManipulator._from_parents(
+        first.parents[0], second.parents[0], rng=CenteredRng()
+    )
+    child = child_manipulator.slice_and_merge()
+    mask1 = atoms1["x"] < 4.0
+    mask2 = atoms2["x"] >= 4.0
+
+    assert len(child) == np.count_nonzero(mask1) + np.count_nonzero(mask2)
+    assert np.array_equal(
+        child_manipulator.candidate_grain_labels,
+        np.hstack((labels1[mask1], labels2[mask2])),
+    )
+
+
+class _NoOverlapKDTree:
+    def __init__(self, data):
+        self.data = np.asarray(data, dtype=float)
+
+    def query_ball_tree(self, other, radius):
+        return [[] for _ in range(len(self.data))]
+
+    def query(self, points, k=1):
+        return np.ones(len(points)), np.zeros(len(points), dtype=int)
+
+
+def _multispecies_synthetic_manipulator(atom_count=12, seed=7):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("fluorite", 5.454, ("U", "O"))
+    atoms = np.asarray(
+        [
+            (
+                "U" if index % 3 == 0 else "O",
+                float(index % 4),
+                float((index // 4) % 4),
+                float(index // 8),
+            )
+            for index in range(atom_count)
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    return _synthetic_manipulator(unit_cell, atoms, seed=seed), atoms
+
+
+def test_nonstoichiometric_remove_uses_only_manipulator_rng():
+    first, _ = _multispecies_synthetic_manipulator(seed=23)
+    second, _ = _multispecies_synthetic_manipulator(seed=23)
+
+    np.random.seed(1)
+    first_result = first.remove_atoms(num_to_remove=3, keep_ratio=False)
+    np.random.seed(999)
+    second_result = second.remove_atoms(num_to_remove=3, keep_ratio=False)
+
+    assert np.array_equal(first_result, second_result)
+
+
+def test_nonstoichiometric_insert_allows_fewer_atoms_than_species(monkeypatch):
+    module = importlib.import_module("GBOpt.GBManipulator")
+    monkeypatch.setattr(module, "KDTree", _NoOverlapKDTree)
+    manipulator, atoms = _multispecies_synthetic_manipulator(atom_count=4, seed=11)
+
+    inserted, new_atoms = manipulator.insert_atoms(
+        num_to_insert=1,
+        method="grid",
+        keep_ratio=False,
+        return_positions=True,
+    )
+
+    assert len(inserted) == len(atoms) + 1
+    assert len(new_atoms) == 1
+
+
+def test_nonstoichiometric_insert_uses_unique_sites_across_species(monkeypatch):
+    module = importlib.import_module("GBOpt.GBManipulator")
+    monkeypatch.setattr(module, "KDTree", _NoOverlapKDTree)
+    manipulator, atoms = _multispecies_synthetic_manipulator(atom_count=8)
+
+    class SplitTypesRng:
+        def multinomial(self, total, probabilities):
+            assert total == 2
+            return np.asarray([1, 1])
+
+        def choice(self, choices, size=None, replace=False, p=None):
+            values = np.asarray(choices)
+            if size is None:
+                return values[0]
+            return values[:size]
+
+    manipulator.rng = SplitTypesRng()
+    inserted, new_atoms = manipulator.insert_atoms(
+        num_to_insert=2,
+        method="grid",
+        keep_ratio=False,
+        return_positions=True,
+    )
+
+    coordinates = np.column_stack(
+        (new_atoms["x"], new_atoms["y"], new_atoms["z"])
+    )
+    assert len(inserted) == len(atoms) + 2
+    assert len(np.unique(coordinates, axis=0)) == 2
+    assert set(new_atoms["name"].tolist()) == {"U", "O"}
+
+
+def test_nonstoichiometric_insert_uses_only_manipulator_rng(monkeypatch):
+    module = importlib.import_module("GBOpt.GBManipulator")
+    monkeypatch.setattr(module, "KDTree", _NoOverlapKDTree)
+    first, _ = _multispecies_synthetic_manipulator(seed=29)
+    second, _ = _multispecies_synthetic_manipulator(seed=29)
+
+    np.random.seed(2)
+    _, first_new = first.insert_atoms(
+        num_to_insert=3,
+        method="grid",
+        keep_ratio=False,
+        return_positions=True,
+    )
+    np.random.seed(1001)
+    _, second_new = second.insert_atoms(
+        num_to_insert=3,
+        method="grid",
+        keep_ratio=False,
+        return_positions=True,
+    )
+
+    assert np.array_equal(first_new, second_new)

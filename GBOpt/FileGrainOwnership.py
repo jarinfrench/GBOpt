@@ -1,7 +1,7 @@
-"""Narrow file-backed grain ownership support for optimizer seed handoff.
+"""LAMMPS structure I/O for explicit grain-ownership handoff.
 
-LAMMPS atom IDs are used only to align one verified serialized seed with its
-persistent left/right grain labels.  They are not optimizer-wide atom identities.
+This module parses and validates external structure syntax and transient atom-ID
+mappings. Persistent grain identity is defined in :mod:`GBOpt.InterfaceDomain`.
 """
 
 from __future__ import annotations
@@ -9,87 +9,27 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from numbers import Integral, Real
+from numbers import Integral
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 
 from GBOpt.Atom import Atom
-from GBOpt.BoundaryTopology import (
-    BoundaryNormalTopology,
-    normalize_boundary_normal_topology,
+from GBOpt.BoundaryTopology import BoundaryNormalTopology
+from GBOpt.InterfaceDomain import (
+    GrainOwnership,
+    GrainOwnershipError,
+    _readonly_copy,
+    _strict_finite_real,
 )
 
-if TYPE_CHECKING:
-    from GBOpt.GBManipulator import GBManipulator
-
-LEFT_GRAIN_LABEL = 0
-RIGHT_GRAIN_LABEL = 1
-_SUPPORTED_LABELS = frozenset((LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL))
 _INTEGER_TOKEN = re.compile(r"^[+-]?\d+$")
-_INT64_MIN = np.iinfo(np.int64).min
 _INT64_MAX = np.iinfo(np.int64).max
-
-
-class GrainOwnershipError(ValueError):
-    """Raised when explicit file-backed ownership metadata is malformed."""
 
 
 class LammpsDataError(ValueError):
     """Raised when a LAMMPS data file cannot be read unambiguously."""
-
-
-def _readonly_copy(
-    values: np.ndarray, *, dtype: np.dtype | type | None = None
-) -> np.ndarray:
-    """Return an independent read-only NumPy array.
-
-    :param values: Source array whose values will be copied.
-    :param dtype: Keyword argument, optional. Requested result dtype; defaults to
-        ``None``.
-    :return: A copied array with mutation disabled.
-    """
-    result = np.array(values, dtype=dtype, copy=True)
-    result.setflags(write=False)
-    return result
-
-
-def _strict_int(name: str, value: object) -> int:
-    """Validate one integer representable by the ownership storage dtype.
-
-    :param name: Field name used in validation errors.
-    :param value: Value to validate.
-    :return: A normalized Python integer.
-    :raises GrainOwnershipError: If the value is Boolean, nonintegral, or outside the
-        supported ``int64`` range.
-    """
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
-        raise GrainOwnershipError(f"{name} must be an integer")
-
-    normalized = int(value)
-    if normalized < _INT64_MIN or normalized > _INT64_MAX:
-        raise GrainOwnershipError(
-            f"{name} must be representable as a signed 64-bit integer"
-        )
-    return normalized
-
-
-def _strict_finite_real(name: str, value: object) -> float:
-    """Validate one finite real scalar without accepting Boolean coercion.
-
-    :param name: Field name used in validation errors.
-    :param value: Value to validate.
-    :return: A normalized Python float.
-    :raises GrainOwnershipError: If the value is Boolean, non-real, or non-finite.
-    """
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
-        raise GrainOwnershipError(f"{name} must be a real scalar")
-
-    normalized = float(value)
-    if not np.isfinite(normalized):
-        raise GrainOwnershipError(f"{name} must be finite")
-    return normalized
 
 
 def _strict_box_dims(value: object) -> np.ndarray:
@@ -117,47 +57,6 @@ def _strict_box_dims(value: object) -> np.ndarray:
     if np.any(bounds[:, 0] >= bounds[:, 1]):
         raise GrainOwnershipError("candidate box bounds must be strictly ordered")
     return bounds
-
-
-def _strict_boolean_pair(
-    name: str,
-    value: object,
-) -> tuple[bool, bool]:
-    """Validate an explicit pair of Boolean flags.
-
-    :param name: Field name used in validation errors.
-    :param value: Pair to validate.
-    :return: Two normalized Python booleans.
-    :raises GrainOwnershipError: If the value is not exactly two Boolean flags.
-    """
-    try:
-        values = tuple(value)  # type: ignore[ty:invalid-argument-type]
-    except TypeError as exc:
-        raise GrainOwnershipError(
-            f"{name} must contain exactly two Boolean flags"
-        ) from exc
-
-    if len(values) != 2 or not all(
-        isinstance(item, (bool, np.bool_)) for item in values
-    ):
-        raise GrainOwnershipError(f"{name} must contain exactly two Boolean flags")
-
-    return bool(values[0]), bool(values[1])
-
-
-def _strict_optional_boolean(name: str, value: object) -> bool | None:
-    """Validate an optional Boolean compatibility flag.
-
-    :param name: Field name used in validation errors.
-    :param value: Value to validate.
-    :return: ``None`` or a normalized Python boolean.
-    :raises GrainOwnershipError: If a non-Boolean value is supplied.
-    """
-    if value is None:
-        return None
-    if not isinstance(value, (bool, np.bool_)):
-        raise GrainOwnershipError(f"{name} must be a Boolean or None")
-    return bool(value)
 
 
 def _strict_id_token(token: str) -> int:
@@ -210,7 +109,8 @@ def _strict_type_id(value: object) -> int:
 
     :param value: Value to validate.
     :return: A positive Python integer.
-    :raises LammpsDataError: If the value is Boolean, nonintegral, or nonpositive.
+    :raises LammpsDataError: If the value is Boolean, nonintegral, or
+        nonpositive.
     """
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
         raise LammpsDataError("atom type IDs must be integers")
@@ -219,30 +119,6 @@ def _strict_type_id(value: object) -> int:
     if normalized <= 0:
         raise LammpsDataError("atom type IDs must be positive")
     return normalized
-
-
-def _strict_x_bounds(name: str, value: object) -> np.ndarray:
-    """Validate a strictly ordered pair of finite x coordinates.
-
-    :param name: Field name used in validation errors.
-    :param value: Bounds to validate.
-    :return: A two-element floating-point array.
-    :raises GrainOwnershipError: If the bounds are malformed or unordered.
-    """
-    raw = np.asarray(value, dtype=object)
-    if raw.shape != (2,):
-        raise GrainOwnershipError(f"{name} must contain two finite values")
-
-    bounds = np.asarray(
-        [
-            _strict_finite_real(f"{name}[0]", raw[0]),
-            _strict_finite_real(f"{name}[1]", raw[1]),
-        ],
-        dtype=float,
-    )
-    if bounds[0] >= bounds[1]:
-        raise GrainOwnershipError(f"{name} must be strictly ordered")
-    return bounds
 
 
 def _normalize_type_mapping(
@@ -293,305 +169,16 @@ def _normalize_type_mapping(
             previous = normalized.get(type_id)
             if previous is not None and previous != species:
                 raise LammpsDataError(
-                    f"atom type ID {type_id} is mapped to both {previous!r} and "
-                    f"{species!r}"
+                    f"atom type ID {type_id} is mapped to both "
+                    f"{previous!r} and {species!r}"
                 )
             normalized[type_id] = species
 
         return normalized
 
-    raise LammpsDataError("type_dict must be a mapping[str, int] or mapping[int, str]")
-
-
-@dataclass(frozen=True, slots=True, init=False)
-class GrainOwnership:
-    """Immutable left/right labels and geometry for a file-backed Parent.
-
-    ``atom_ids`` are transient serialization identifiers used only for row alignment.
-    Persistent grain identity is represented by ``labels``. The physical grain bounds
-    may be separated by an empty interval containing ``gb_plane_x``.
-    """
-
-    _atom_ids: np.ndarray
-    _labels: np.ndarray
-    gb_plane_x: float
-    inplane_periodic: tuple[bool, bool]
-    _left_grain_x_bounds: np.ndarray | None
-    _right_grain_x_bounds: np.ndarray
-    coordinate_tolerance: float
-    _normal_topology: BoundaryNormalTopology
-
-    def __init__(
-        self,
-        *,
-        atom_ids: np.ndarray,
-        labels: np.ndarray,
-        gb_plane_x: float,
-        inplane_periodic: tuple[bool, bool],
-        right_grain_x_bounds: np.ndarray | tuple[float, float],
-        coordinate_tolerance: float,
-        periodic_outer_x_interface: bool | None = None,
-        left_grain_x_bounds: np.ndarray | tuple[float, float] | None = None,
-        normal_topology: BoundaryNormalTopology | str | None = None,
-    ) -> None:
-        """Construct immutable explicit grain ownership metadata.
-
-        :param atom_ids: Keyword argument. Positive, unique serialization-local atom
-            IDs.
-        :param labels: Keyword argument. Left/right grain labels aligned with
-            ``atom_ids``.
-        :param gb_plane_x: Keyword argument. Nominal central interface plane in
-            angstroms.
-        :param inplane_periodic: Keyword argument. Explicit y/z periodicity flags.
-        :param right_grain_x_bounds: Keyword argument. Physical right-grain x bounds in
-            angstroms.
-        :param coordinate_tolerance: Keyword argument. Positive coordinate tolerance in
-            angstroms.
-        :param periodic_outer_x_interface: Keyword argument, optional. Legacy topology
-            compatibility flag; defaults to ``None``.
-        :param left_grain_x_bounds: Keyword argument, optional. Physical left-grain x
-            bounds; defaults to ``None``.
-        :param normal_topology: Keyword argument, optional. Explicit boundary-normal
-            topology; defaults to ``None``.
-        :raises GrainOwnershipError: If any input or ownership invariant is invalid.
-        """
-        raw_ids = np.asarray(atom_ids, dtype=object)
-        raw_labels = np.asarray(labels, dtype=object)
-        if raw_ids.ndim != 1 or raw_labels.ndim != 1:
-            raise GrainOwnershipError("atom_ids and labels must be one-dimensional")
-        if raw_ids.size != raw_labels.size:
-            raise GrainOwnershipError("ownership-array length must equal atom ID count")
-
-        normalized_ids = np.empty(raw_ids.size, dtype=np.int64)
-        for index, value in enumerate(raw_ids.tolist()):
-            normalized_ids[index] = _strict_int("atom ID", value)
-
-        if np.any(normalized_ids <= 0):
-            raise GrainOwnershipError("atom IDs must be positive")
-        if np.unique(normalized_ids).size != normalized_ids.size:
-            raise GrainOwnershipError("atom IDs must be unique")
-
-        normalized_labels = np.empty(raw_labels.size, dtype=np.int8)
-        for index, value in enumerate(raw_labels.tolist()):
-            parsed = _strict_int("grain label", value)
-            if parsed not in _SUPPORTED_LABELS:
-                raise GrainOwnershipError(
-                    "grain labels must be exactly 0 (left) or 1 (right)"
-                )
-            normalized_labels[index] = parsed
-
-        plane = _strict_finite_real("gb_plane_x", gb_plane_x)
-        tolerance = _strict_finite_real("coordinate_tolerance", coordinate_tolerance)
-        if tolerance <= 0.0:
-            raise GrainOwnershipError("coordinate_tolerance must be positive")
-
-        periodic = _strict_boolean_pair("inplane_periodic", inplane_periodic)
-        legacy_outer_interface = _strict_optional_boolean(
-            "periodic_outer_x_interface",
-            periodic_outer_x_interface,
-        )
-
-        right_bounds = _strict_x_bounds("right_grain_x_bounds", right_grain_x_bounds)
-        if right_bounds[0] < plane - tolerance:
-            raise GrainOwnershipError(
-                "right-grain lower bound must be on or to the right of gb_plane_x"
-            )
-
-        normalized_left: np.ndarray | None
-        if left_grain_x_bounds is None:
-            normalized_left = None
-        else:
-            normalized_left = _strict_x_bounds(
-                "left_grain_x_bounds",
-                left_grain_x_bounds,
-            )
-            if normalized_left[1] > plane + tolerance:
-                raise GrainOwnershipError(
-                    "left-grain upper bound must be on or to the left of gb_plane_x"
-                )
-
-        try:
-            topology = normalize_boundary_normal_topology(normal_topology)
-        except ValueError as exc:
-            raise GrainOwnershipError(str(exc)) from exc
-
-        object.__setattr__(
-            self,
-            "_atom_ids",
-            _readonly_copy(normalized_ids),
-        )
-        object.__setattr__(
-            self,
-            "_labels",
-            _readonly_copy(normalized_labels),
-        )
-        object.__setattr__(self, "gb_plane_x", plane)
-        object.__setattr__(self, "inplane_periodic", periodic)
-        object.__setattr__(
-            self,
-            "_left_grain_x_bounds",
-            (None if normalized_left is None else _readonly_copy(normalized_left)),
-        )
-        object.__setattr__(
-            self,
-            "_right_grain_x_bounds",
-            _readonly_copy(right_bounds),
-        )
-        object.__setattr__(self, "coordinate_tolerance", tolerance)
-        object.__setattr__(self, "_normal_topology", topology)
-
-    @classmethod
-    def from_interface_candidate(
-        cls,
-        candidate: Any,
-        *,
-        atom_ids: np.ndarray | None = None,
-    ) -> GrainOwnership:
-        """Build explicit ownership from an interface-candidate value object.
-
-        :param candidate: Interface-candidate-like object providing atoms, labels,
-            geometry, periodicity, and topology.
-        :param atom_ids: Keyword argument, optional. Serialization-local atom IDs;
-            defaults to ``None``, which assigns consecutive IDs in candidate row order.
-        :return: Immutable ownership metadata aligned with the supplied or generated
-            atom IDs.
-        :raises GrainOwnershipError: If the candidate metadata or supplied atom IDs
-            violate an ownership invariant.
-        """
-        atoms = np.asarray(candidate.atoms)
-        if atom_ids is None:
-            atom_ids = np.arange(1, atoms.size + 1, dtype=np.int64)
-        return cls(
-            atom_ids=atom_ids,
-            labels=candidate.grain_labels,
-            gb_plane_x=candidate.gb_plane_x,
-            inplane_periodic=candidate.inplane_periodic,
-            left_grain_x_bounds=candidate.left_grain_x_bounds,
-            right_grain_x_bounds=candidate.right_grain_x_bounds,
-            coordinate_tolerance=candidate.coordinate_tolerance,
-            normal_topology=candidate.normal_topology,
-        )
-
-    @property
-    def atom_ids(self) -> np.ndarray:
-        """Return a defensive copy of the serialization-local atom IDs.
-
-        :return: A read-only copy of the atom IDs in ownership row order.
-        """
-        return _readonly_copy(self._atom_ids)
-
-    @property
-    def labels(self) -> np.ndarray:
-        """Return a defensive copy of the persistent grain labels.
-
-        :return: A read-only copy of the left/right labels in ownership row order.
-        """
-        return _readonly_copy(self._labels)
-
-    @property
-    def left_grain_x_bounds(self) -> np.ndarray | None:
-        """Return the optional physical left-grain x bounds.
-
-        :return: A read-only copy of the bounds, or ``None`` when unavailable.
-        """
-        if self._left_grain_x_bounds is None:
-            return None
-        return _readonly_copy(self._left_grain_x_bounds)
-
-    @property
-    def right_grain_x_bounds(self) -> np.ndarray:
-        """Return the physical right-grain x bounds.
-
-        :return: A read-only copy of the right-grain bounds.
-        """
-        return _readonly_copy(self._right_grain_x_bounds)
-
-    @property
-    def normal_topology(self) -> BoundaryNormalTopology:
-        """Return the explicit boundary-normal topology.
-
-        :return: The normalized boundary-normal topology value object.
-        """
-        return self._normal_topology
-
-    @property
-    def periodic_outer_x_interface(self) -> bool:
-        """Report whether the outer x boundary represents a periodic interface.
-
-        :return: ``True`` when the normalized topology has a periodic outer x
-            interface; otherwise ``False``.
-        """
-        return self._normal_topology.periodic_outer_x_interface
-
-    def aligned_to(self, atom_ids: np.ndarray) -> GrainOwnership:
-        """Return ownership reordered to supplied file-row atom IDs.
-
-        :param atom_ids: Atom IDs in the row order of a loaded structure file.
-        :return: New immutable ownership metadata aligned to the supplied row order.
-        :raises GrainOwnershipError: If the loaded IDs are malformed, duplicated,
-            nonpositive, out of range, or do not exactly match the ownership ID set.
-        """
-        requested = np.asarray(atom_ids)
-        if requested.ndim != 1:
-            raise GrainOwnershipError("loaded atom IDs must be one-dimensional")
-        normalized = np.empty(requested.size, dtype=np.int64)
-        for index, value in enumerate(requested.tolist()):
-            normalized[index] = _strict_int("loaded atom ID", value)
-        if np.any(normalized <= 0) or np.unique(normalized).size != normalized.size:
-            raise GrainOwnershipError("loaded atom IDs must be positive and unique")
-        if normalized.size != self._atom_ids.size:
-            raise GrainOwnershipError("loaded atom ID count does not match ownership")
-
-        expected_order = np.argsort(self._atom_ids, kind="stable")
-        expected_ids = self._atom_ids[expected_order]
-        loaded_order = np.argsort(normalized, kind="stable")
-        if not np.array_equal(normalized[loaded_order], expected_ids):
-            raise GrainOwnershipError("loaded atom IDs do not match ownership atom IDs")
-        positions = np.searchsorted(expected_ids, normalized)
-        ordered_labels = self._labels[expected_order][positions]
-        return GrainOwnership(
-            atom_ids=normalized,
-            labels=ordered_labels,
-            gb_plane_x=self.gb_plane_x,
-            inplane_periodic=self.inplane_periodic,
-            left_grain_x_bounds=self._left_grain_x_bounds,
-            right_grain_x_bounds=self._right_grain_x_bounds,
-            coordinate_tolerance=self.coordinate_tolerance,
-            normal_topology=self._normal_topology,
-        )
-
-    def __copy__(self) -> GrainOwnership:
-        """Return an independent immutable ownership copy.
-
-        :return: A new ownership object containing copied arrays and identical
-            geometry and topology metadata.
-        """
-        # doccheck: ignore=DOC115[GrainOwnershipError]
-        #   GrainOwnership validates and defensively copies all state during
-        #   construction. Its frozen, read-only representation cannot become invalid
-        #   through the supported API, so constructor failure here would indicate
-        #   unsupported internal corruption rather than a caller-visible copy error.
-        return GrainOwnership(
-            atom_ids=self._atom_ids,
-            labels=self._labels,
-            gb_plane_x=self.gb_plane_x,
-            inplane_periodic=self.inplane_periodic,
-            left_grain_x_bounds=self._left_grain_x_bounds,
-            right_grain_x_bounds=self._right_grain_x_bounds,
-            coordinate_tolerance=self.coordinate_tolerance,
-            normal_topology=self._normal_topology,
-        )
-
-    def __deepcopy__(self, memo: dict[int, object]) -> GrainOwnership:
-        """Return an independent immutable ownership deep copy.
-
-        :param memo: Standard deep-copy memo used to retain object identity mappings.
-        :return: A new ownership object containing copied arrays and identical
-            geometry and topology metadata.
-        """
-        copied = self.__copy__()
-        memo[id(self)] = copied
-        return copied
+    raise LammpsDataError(
+        "type_dict must be a mapping[str, int] or mapping[int, str]"
+    )
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -697,11 +284,7 @@ def read_lammps_data_file(
                 n_types = int(parts[0])
             except ValueError as exc:
                 raise LammpsDataError("invalid atom-type count") from exc
-        elif len(parts) >= 4 and parts[-2:] in (
-            ["xlo", "xhi"],
-            ["ylo", "yhi"],
-            ["zlo", "zhi"],
-        ):
+        elif len(parts) >= 4 and parts[-2:] in (["xlo", "xhi"], ["ylo", "yhi"], ["zlo", "zhi"]):
             axis = parts[-2][0]
             try:
                 bounds = (float(parts[0]), float(parts[1]))
@@ -716,9 +299,7 @@ def read_lammps_data_file(
                 label_parts = lines[index].strip().split()
                 if not label_parts:
                     break
-                if len(label_parts) != 2 or not _INTEGER_TOKEN.fullmatch(
-                    label_parts[0]
-                ):
+                if len(label_parts) != 2 or not _INTEGER_TOKEN.fullmatch(label_parts[0]):
                     break
                 type_id = _strict_type_id(int(label_parts[0]))
                 if n_types is not None and type_id > n_types:
@@ -783,7 +364,8 @@ def read_lammps_data_file(
             type_id = _strict_type_id(int(type_token))
             if type_id > n_types:
                 raise LammpsDataError(
-                    f"atom type id {type_id} exceeds declared atom-type count {n_types}"
+                    f"atom type id {type_id} exceeds declared atom-type count "
+                    f"{n_types}"
                 )
 
             if id_to_name:
@@ -797,15 +379,16 @@ def read_lammps_data_file(
                 try:
                     name = inverse_default[type_id]
                 except KeyError as exc:
-                    raise LammpsDataError(f"unknown atom type id {type_id}") from exc
+                    raise LammpsDataError(
+                        f"unknown atom type id {type_id}"
+                    ) from exc
 
             name = _strict_species_name(name)
         else:
             name = _strict_species_name(type_token)
         try:
-            coordinates = tuple(
-                float(value) for value in parts[coordinate_start: coordinate_start + 3]
-            )
+            coordinates = tuple(float(value)
+                                for value in parts[coordinate_start:coordinate_start + 3])
         except ValueError as exc:
             raise LammpsDataError("atom coordinates must be numeric") from exc
         if len(coordinates) != 3 or not np.all(np.isfinite(coordinates)):
@@ -819,17 +402,9 @@ def read_lammps_data_file(
     # atom-like records instead of silently trusting a header count that understates
     # the serialized structure.  Standard later LAMMPS sections remain acceptable.
     section_headers = {
-        "Velocities",
-        "Bonds",
-        "Angles",
-        "Dihedrals",
-        "Impropers",
-        "Masses",
-        "Pair Coeffs",
-        "Bond Coeffs",
-        "Angle Coeffs",
-        "Dihedral Coeffs",
-        "Improper Coeffs",
+        "Velocities", "Bonds", "Angles", "Dihedrals", "Impropers",
+        "Masses", "Pair Coeffs", "Bond Coeffs", "Angle Coeffs",
+        "Dihedral Coeffs", "Improper Coeffs",
     }
     for remaining in lines[index:]:
         stripped = remaining.split("#", 1)[0].strip()
@@ -909,7 +484,9 @@ class CandidateFileMapping:
         bounds = _strict_box_dims(box_dims)
         plane = _strict_finite_real("candidate gb_plane_x", gb_plane_x)
         if not bounds[0, 0] < plane < bounds[0, 1]:
-            raise GrainOwnershipError("candidate gb_plane_x must lie inside the x box")
+            raise GrainOwnershipError(
+                "candidate gb_plane_x must lie inside the x box"
+            )
 
         if left_grain_x_bounds is None:
             left_grain_x_bounds = (float(bounds[0, 0]), plane)
@@ -944,7 +521,10 @@ class CandidateFileMapping:
             )
 
         normalized_species = np.asarray(
-            [_strict_candidate_species(value) for value in raw_species.tolist()],
+            [
+                _strict_candidate_species(value)
+                for value in raw_species.tolist()
+            ],
             dtype=Atom.atom_dtype["name"],
         )
 
@@ -961,10 +541,14 @@ class CandidateFileMapping:
             or right_bounds[1] > bounds[0, 1] + tolerance
         ):
             raise GrainOwnershipError(
-                "candidate physical grain x bounds must lie inside the candidate box"
+                "candidate physical grain x bounds must lie inside the "
+                "candidate box"
             )
 
-        if left_bounds[1] > plane + tolerance or right_bounds[0] < plane - tolerance:
+        if (
+            left_bounds[1] > plane + tolerance
+            or right_bounds[0] < plane - tolerance
+        ):
             raise GrainOwnershipError(
                 "candidate physical grain bounds must not cross gb_plane_x"
             )
@@ -1061,8 +645,7 @@ class CandidateFileMapping:
         candidate_labels = np.asarray(labels)
         if candidate_labels.ndim != 1 or candidate_labels.size != structured.size:
             raise GrainOwnershipError(
-                "ownership length must equal candidate atom count"
-            )
+                "ownership length must equal candidate atom count")
         atom_ids = np.arange(1, structured.size + 1, dtype=np.int64)
         return cls(
             atom_ids=atom_ids,
@@ -1269,26 +852,22 @@ def read_lammps_dump_file(
     for required in ("id", "x", "y", "z"):
         if required not in attributes:
             raise LammpsDataError(
-                f"selected dump frame is missing atom attribute {required!r}"
-            )
+                f"selected dump frame is missing atom attribute {required!r}")
     if "typelabel" in attributes:
         species_attr = "typelabel"
     elif "type" in attributes:
         species_attr = "type"
     else:
         raise LammpsDataError("selected dump frame requires type or typelabel")
-    attr_index = {
-        name: attributes.index(name) for name in ("id", species_attr, "x", "y", "z")
-    }
+    attr_index = {name: attributes.index(name)
+                  for name in ("id", species_attr, "x", "y", "z")}
     id_to_name = _normalize_type_mapping(type_dict)
     inverse_default = {number: name for name, number in Atom._numbers.items()}
     ids: list[int] = []
     rows: list[tuple[str, float, float, float]] = []
     index += 1
     for row_index in range(n_atoms):
-        if index + row_index >= len(lines) or lines[index + row_index].startswith(
-            "ITEM:"
-        ):
+        if index + row_index >= len(lines) or lines[index + row_index].startswith("ITEM:"):
             raise LammpsDataError(
                 f"selected dump frame expected {n_atoms} atom rows, found {row_index}"
             )
@@ -1317,7 +896,9 @@ def read_lammps_dump_file(
                 try:
                     species = inverse_default[type_id]
                 except KeyError as exc:
-                    raise LammpsDataError(f"unknown atom type id {type_id}") from exc
+                    raise LammpsDataError(
+                        f"unknown atom type id {type_id}"
+                    ) from exc
 
             species = _strict_species_name(species)
         try:
@@ -1331,7 +912,10 @@ def read_lammps_dump_file(
     next_index = index + n_atoms
     while next_index < len(lines) and not lines[next_index].strip():
         next_index += 1
-    if next_index < len(lines) and lines[next_index].strip() != "ITEM: TIMESTEP":
+    if (
+        next_index < len(lines)
+        and lines[next_index].strip() != "ITEM: TIMESTEP"
+    ):
         raise LammpsDataError(
             "selected dump frame contains unexpected content after its atom rows"
         )
@@ -1370,28 +954,20 @@ def read_lammps_structure_file(
     return read_lammps_data_file(file_path, type_dict=type_dict)
 
 
-def reload_explicit_manipulator(
+def validate_explicit_structure(
     returned_structure: str | Path,
     *,
     candidate_mapping: CandidateFileMapping,
-    unit_cell: Any,
-    gb_thickness: float,
     type_dict: Mapping[object, object] | None = None,
-) -> GBManipulator:
-    """Validate and reconstruct an evaluator-returned owned candidate.
-
-    This is the authoritative reload path for explicit-ownership GA execution.
+) -> GrainOwnership:
+    """Validate an evaluator-returned structure and recover aligned ownership.
 
     :param returned_structure: Path to the evaluator-returned LAMMPS structure.
-    :param candidate_mapping: Keyword argument. Expected candidate IDs, species,
-        ownership, geometry, and topology.
-    :param unit_cell: Keyword argument. Unit cell used to initialize the reloaded
-        manipulator parent.
-    :param gb_thickness: Keyword argument. Grain-boundary region thickness in
-        angstroms.
-    :param type_dict: Keyword argument, optional. Mapping in ``species -> type ID``
-        or ``type ID -> species`` form; defaults to ``None``.
-    :return: Manipulator reconstructed with explicit ownership aligned by atom ID.
+    :param candidate_mapping: Keyword argument, required. Expected candidate IDs,
+        species, ownership, geometry, and topology.
+    :param type_dict: Keyword argument, optional, defaults to ``None``. Mapping in
+        ``species -> type ID`` or ``type ID -> species`` form.
+    :return: Explicit ownership aligned to the returned file-row atom IDs.
     :raises FileNotFoundError: If the returned structure file does not exist.
     :raises LammpsDataError: If the returned LAMMPS file or type mapping is
         malformed, unsupported, or ambiguous.
@@ -1434,21 +1010,4 @@ def reload_explicit_manipulator(
         )
         if snapshot.boundary_periodic != expected_periodic:
             raise GrainOwnershipError("evaluator output changed boundary topology")
-    ownership = candidate_mapping.ownership_for_file_ids(file_ids)
-    # Local import avoids a module cycle with GBManipulator -> FileGrainOwnership.
-    from GBOpt.GBManipulator import GBManipulator
-
-    manipulator = GBManipulator(
-        str(returned_structure),
-        unit_cell=unit_cell,
-        gb_thickness=gb_thickness,
-        type_dict=type_dict,
-        grain_ownership=ownership,
-    )
-    parent = manipulator.parents[0]
-    if (
-        parent.grain_labels is None
-        or len(parent.grain_labels) != candidate_mapping.expected_count
-    ):
-        raise GrainOwnershipError("reloaded ownership length does not match atom count")
-    return manipulator
+    return candidate_mapping.ownership_for_file_ids(file_ids)

@@ -5,7 +5,7 @@ import multiprocessing as mp
 import warnings
 from dataclasses import dataclass
 from itertools import combinations_with_replacement
-from numbers import Real
+from numbers import Integral, Real
 from os.path import isfile
 
 import numpy as np
@@ -21,12 +21,14 @@ from GBOpt.BoundaryTopology import (
     normalize_boundary_normal_topology,
 )
 from GBOpt.FileGrainOwnership import (
+    read_lammps_data_file,
+    read_lammps_dump_file,
+)
+from GBOpt.InterfaceDomain import (
     LEFT_GRAIN_LABEL,
     RIGHT_GRAIN_LABEL,
     GrainOwnership,
     GrainOwnershipError,
-    read_lammps_data_file,
-    read_lammps_dump_file,
 )
 from GBOpt.GBMaker import GBMaker
 from GBOpt.UnitCell import UnitCell
@@ -47,11 +49,38 @@ class GBManipulatorValueError(GBManipulatorError):
 
 def _validate_finite_real(name: str, value: object) -> float:
     """Return ``value`` as a finite float or raise a manipulator value error."""
-    if isinstance(value, bool) or not isinstance(value, Real):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
         raise GBManipulatorValueError(f"{name} must be a finite real value.")
     normalized = float(value)
     if not np.isfinite(normalized):
         raise GBManipulatorValueError(f"{name} must be a finite real value.")
+    return normalized
+
+
+def _validate_finite_real_array(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+) -> np.ndarray:
+    """Return a finite real array without accepting coercive inputs.
+
+    :param name: Field name used in validation errors.
+    :param value: Array-like value to validate.
+    :param shape: Keyword argument, required. Exact required shape.
+    :return: A newly allocated floating-point array.
+    :raises GBManipulatorValueError: If shape, type, or finiteness is invalid.
+    """
+    raw = np.asarray(value, dtype=object)
+    if raw.shape != shape:
+        raise GBManipulatorValueError(
+            f"{name} must have shape {shape}."
+        )
+    normalized = np.empty(shape, dtype=float)
+    for index in np.ndindex(shape):
+        normalized[index] = _validate_finite_real(
+            f"{name}{index}", raw[index]
+        )
     return normalized
 
 
@@ -242,9 +271,15 @@ class InterfaceCandidate:
         )
         periodic = _normalize_inplane_periodic(inplane_periodic)
 
-        box = np.asarray(box_dims, dtype=float)
-        left_bounds = np.asarray(left_grain_x_bounds, dtype=float)
-        right_bounds = np.asarray(right_grain_x_bounds, dtype=float)
+        box = _validate_finite_real_array(
+            "InterfaceCandidate box_dims", box_dims, shape=(3, 2)
+        )
+        left_bounds = _validate_finite_real_array(
+            "left_grain_x_bounds", left_grain_x_bounds, shape=(2,)
+        )
+        right_bounds = _validate_finite_real_array(
+            "right_grain_x_bounds", right_grain_x_bounds, shape=(2,)
+        )
         plane = _validate_finite_real("gb_plane_x", gb_plane_x)
         tolerance = _validate_finite_real(
             "coordinate_tolerance", coordinate_tolerance
@@ -260,10 +295,6 @@ class InterfaceCandidate:
             raise GBManipulatorValueError(
                 "interface_separation must be nonnegative."
             )
-        if box.shape != (3, 2) or not np.all(np.isfinite(box)):
-            raise GBManipulatorValueError(
-                "InterfaceCandidate box_dims must be finite with shape (3, 2)."
-            )
         if np.any(box[:, 0] >= box[:, 1]):
             raise GBManipulatorValueError(
                 "InterfaceCandidate box bounds must be strictly ordered."
@@ -276,10 +307,6 @@ class InterfaceCandidate:
             ("left_grain_x_bounds", left_bounds),
             ("right_grain_x_bounds", right_bounds),
         ):
-            if bounds.shape != (2,) or not np.all(np.isfinite(bounds)):
-                raise GBManipulatorValueError(
-                    f"{name} must contain two finite values."
-                )
             if bounds[0] >= bounds[1]:
                 raise GBManipulatorValueError(f"{name} must be strictly ordered.")
         if (
@@ -768,6 +795,19 @@ class Parent:
             order = np.argsort(file_ids, kind="stable")
             sorted_ids = file_ids[order]
             aligned = aligned.aligned_to(sorted_ids)
+            expected_periodic = (
+                aligned.periodic_outer_x_interface,
+                *aligned.inplane_periodic,
+            )
+            if snapshot.boundary_periodic is None:
+                raise ParentValueError(
+                    "explicit ownership requires dump boundary flags"
+                )
+            if snapshot.boundary_periodic != expected_periodic:
+                raise ParentValueError(
+                    "dump boundary flags contradict explicit ownership topology"
+                )
+
             self.__whole_system = snapshot.atoms[order]
             self.__box_dims = snapshot.box_dims
             self.__x_dim = self.__box_dims[0, 1] - self.__box_dims[0, 0]
@@ -1534,11 +1574,18 @@ class GBManipulator:
         type_dict: dict | None = None,
         grain_ownership: GrainOwnership | None = None,
     ) -> None:
-        # initialize the random number generator
-        if not seed:
+        # Initialize the manipulator-owned random-number generator.
+        if seed is None:
             self.__rng = np.random.default_rng()
         else:
-            self.__rng = np.random.default_rng(seed=seed)
+            if isinstance(seed, (bool, np.bool_)) or not isinstance(seed, Integral):
+                raise GBManipulatorValueError(
+                    "seed must be a non-Boolean integer or None"
+                )
+            normalized_seed = int(seed)
+            if normalized_seed < 0:
+                raise GBManipulatorValueError("seed must be nonnegative")
+            self.__rng = np.random.default_rng(seed=normalized_seed)
 
         self.__parents = [None, None]
 
@@ -2422,13 +2469,61 @@ class GBManipulator:
                 "Unable to slice and merge with only one parent.")
         parent1 = self.__parents[0]
         parent2 = self.__parents[1]
+        tolerance = max(
+            parent1.coordinate_tolerance, parent2.coordinate_tolerance
+        )
+        if not np.allclose(
+            parent1.box_dims, parent2.box_dims, atol=tolerance, rtol=0.0
+        ):
+            raise GBManipulatorValueError(
+                "slice_and_merge parents must share box bounds"
+            )
+        if not np.isclose(
+            parent1.gb_plane_x, parent2.gb_plane_x, atol=tolerance, rtol=0.0
+        ):
+            raise GBManipulatorValueError(
+                "slice_and_merge parents must share gb_plane_x"
+            )
+        if parent1.inplane_periodic != parent2.inplane_periodic:
+            raise GBManipulatorValueError(
+                "slice_and_merge parents must share topology"
+            )
+        if parent1.normal_topology is not parent2.normal_topology:
+            raise GBManipulatorValueError(
+                "slice_and_merge parents must share topology"
+            )
+        if not np.allclose(
+            parent1.left_grain_x_bounds,
+            parent2.left_grain_x_bounds,
+            atol=tolerance,
+            rtol=0.0,
+        ) or not np.allclose(
+            parent1.right_grain_x_bounds,
+            parent2.right_grain_x_bounds,
+            atol=tolerance,
+            rtol=0.0,
+        ):
+            raise GBManipulatorValueError(
+                "slice_and_merge parents must share grain bounds"
+            )
+        if not np.isclose(
+            parent1.gb_thickness, parent2.gb_thickness, atol=tolerance, rtol=0.0
+        ):
+            raise GBManipulatorValueError(
+                "slice_and_merge parents must share gb_thickness"
+            )
+
         pos1 = parent1.whole_system
         pos2 = parent2.whole_system
-        # Limit the slice site to be a quarter of the gb width from the GB itself.
-        # TODO: use a more robust calculation for GB position.
-        # Note that this is the third time this has been calculated.
-        slice_pos = (parent1.box_dims[0, 1] - parent1.box_dims[0, 0]) / 2.0 + \
-            parent1.gb_thickness * (-0.25 + 0.5*self.__rng.random())
+        x_lower, x_upper = parent1.box_dims[0]
+        half_window = parent1.gb_thickness / 4.0
+        lower = max(float(x_lower), parent1.gb_plane_x - half_window)
+        upper = min(float(x_upper), parent1.gb_plane_x + half_window)
+        if upper <= lower:
+            raise GBManipulatorValueError(
+                "slice_and_merge interface window is empty"
+            )
+        slice_pos = lower + (upper - lower) * self.__rng.random()
         mask1 = pos1["x"] < slice_pos
         mask2 = pos2["x"] >= slice_pos
         new_positions = np.hstack((pos1[mask1], pos2[mask2]))
@@ -2438,33 +2533,6 @@ class GBManipulator:
             if labels1 is None or labels2 is None:
                 raise GBManipulatorValueError(
                     "slice_and_merge requires ownership labels on both explicit parents"
-                )
-            tolerance = max(parent1.coordinate_tolerance, parent2.coordinate_tolerance)
-            if not np.allclose(parent1.box_dims, parent2.box_dims, atol=tolerance, rtol=0.0):
-                raise GBManipulatorValueError(
-                    "slice_and_merge parents must share box bounds")
-            if not np.isclose(parent1.gb_plane_x, parent2.gb_plane_x, atol=tolerance, rtol=0.0):
-                raise GBManipulatorValueError(
-                    "slice_and_merge parents must share gb_plane_x")
-            if parent1.inplane_periodic != parent2.inplane_periodic:
-                raise GBManipulatorValueError(
-                    "slice_and_merge parents must share topology")
-            if parent1.normal_topology is not parent2.normal_topology:
-                raise GBManipulatorValueError(
-                    "slice_and_merge parents must share topology")
-            if not np.allclose(
-                parent1.left_grain_x_bounds,
-                parent2.left_grain_x_bounds,
-                atol=tolerance,
-                rtol=0.0,
-            ) or not np.allclose(
-                parent1.right_grain_x_bounds,
-                parent2.right_grain_x_bounds,
-                atol=tolerance,
-                rtol=0.0,
-            ):
-                raise GBManipulatorValueError(
-                    "slice_and_merge parents must share grain bounds"
                 )
             new_labels = np.hstack((labels1[mask1], labels2[mask2]))
         else:
@@ -2573,18 +2641,9 @@ class GBManipulator:
             probabilities = max(order) - order + min(order)
             probabilities = probabilities / np.sum(probabilities, dtype=float)
         else:
-            # If we aren't worried about keeping the ratio, randomly assign atoms to be
-            # removed to each type, summing up to num_to_remove.
-            breaks = np.sort(
-                np.random.choice(
-                    range(1, num_to_remove), len(type_map) - 1, replace=False
-                )
-            )
-            breaks = np.concatenate(([0], breaks, [num_to_remove]))
-            values = np.diff(breaks)
-            num_to_remove_dict = {
-                i + 1: int(values[i]) for i in range(len(type_map))
-            }
+            # Without a stoichiometric constraint, sample atoms directly. This permits
+            # zero removals of a species and uses only the manipulator-owned RNG.
+            num_to_remove_dict = None
 
         if keep_ratio and len(type_map) > 1:
             type_mask = atoms[gb_atom_indices][:, 0] == central_type
@@ -2656,13 +2715,20 @@ class GBManipulator:
                     indices_to_remove.extend(type_idx_to_remove)
 
         else:  # keep_ratio == False or len(type_map) == 1
-            indices_to_remove = []
-            for atom_type, num in num_to_remove_dict.items():
-                type_indices = gb_atom_indices[
-                    atoms[gb_atom_indices][:, 0] == atom_type
-                ]
-                type_idx_to_remove = self.__rng.choice(type_indices, num, replace=False)
-                indices_to_remove.extend(type_idx_to_remove)
+            if num_to_remove_dict is None:
+                indices_to_remove = self.__rng.choice(
+                    gb_atom_indices, num_to_remove, replace=False
+                ).tolist()
+            else:
+                indices_to_remove = []
+                for atom_type, num in num_to_remove_dict.items():
+                    type_indices = gb_atom_indices[
+                        atoms[gb_atom_indices][:, 0] == atom_type
+                    ]
+                    type_idx_to_remove = self.__rng.choice(
+                        type_indices, num, replace=False
+                    )
+                    indices_to_remove.extend(type_idx_to_remove)
 
         if not len(indices_to_remove) == num_to_remove:
             raise GBManipulatorValueError("")
@@ -2915,15 +2981,15 @@ class GBManipulator:
             num_to_insert = sum(list(num_to_insert_dict.values()))
             central_type = min(num_to_insert_dict, key=num_to_insert_dict.get)
         else:  # random insertion of random types
-            breaks = np.sort(
-                np.random.choice(
-                    range(1, num_to_insert), len(type_map) - 1, replace=False
-                )
+            type_ids = tuple(sorted(type_map.values()))
+            counts = self.__rng.multinomial(
+                num_to_insert,
+                np.full(len(type_ids), 1.0 / len(type_ids), dtype=float),
             )
-            breaks = np.concatenate([[0], breaks, [num_to_insert]])
-            values = np.diff(breaks)
             num_to_insert_dict = {
-                i + 1: int(values[i]) for i in range(len(type_map))
+                atom_type: int(count)
+                for atom_type, count in zip(type_ids, counts, strict=True)
+                if count
             }
 
         # Calculate the insertion sites using the specified approach.
@@ -2977,14 +3043,35 @@ class GBManipulator:
                     atoms_to_add[atom_type].extend(selected_indices)
         else:
             atoms_to_add = {}
-            site_indices = list(range(len(possible_sites)))
+            assigned_indices: set[int] = set()
             for atom_type, num in num_to_insert_dict.items():
-                available_indices = list(
-                    set(site_indices) - set(np.array(atoms_to_add.values()).flatten()))
-                type_idx_to_insert = self.__rng.choice(
-                    available_indices, num, replace=False, p=probabilities
+                available_indices = np.asarray(
+                    [
+                        index
+                        for index in range(len(possible_sites))
+                        if index not in assigned_indices
+                    ],
+                    dtype=int,
                 )
-                atoms_to_add[atom_type] = type_idx_to_insert
+                if num > available_indices.size:
+                    raise GBManipulatorValueError(
+                        "Not enough unique sites to insert atoms into."
+                    )
+                partial_probabilities = probabilities[available_indices]
+                partial_total = float(np.sum(partial_probabilities))
+                if not np.isfinite(partial_total) or partial_total <= 0.0:
+                    raise GBManipulatorValueError(
+                        "Insertion-site probabilities must have positive finite mass."
+                    )
+                partial_probabilities = partial_probabilities / partial_total
+                selected_indices = self.__rng.choice(
+                    available_indices,
+                    num,
+                    replace=False,
+                    p=partial_probabilities,
+                )
+                atoms_to_add[atom_type] = selected_indices
+                assigned_indices.update(int(index) for index in selected_indices)
 
         new_atoms = np.array(
             [

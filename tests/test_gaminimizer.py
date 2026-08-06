@@ -12,8 +12,17 @@ import pytest
 from GBOpt.Atom import Atom
 from GBOpt.BoundaryTopology import BoundaryNormalTopology
 from GBOpt.GBMaker import GBMaker
-from GBOpt.GBMinimizer import PENALTY, GeneticAlgorithmMinimizer
-from GBOpt._explicit_ownership_evaluation import ExplicitOwnershipEvaluator
+from GBOpt.GBManipulator import GBManipulator
+from GBOpt.GBMinimizer import (
+    DEFAULT_EVALUATION_PENALTY,
+    PENALTY,
+    GeneticAlgorithmMinimizer,
+    Mutator,
+)
+from GBOpt._explicit_ownership_evaluation import (
+    CandidateEvaluation,
+    ExplicitOwnershipEvaluator,
+)
 
 # These tests use compact GBMaker fixtures; sizing-warning behavior is covered in
 # the GBMaker test modules rather than the minimizer contract tests.
@@ -603,11 +612,11 @@ def test_candidate_file_mapping_preserves_manipulator_geometry(topology):
     )
 
     evaluator = ExplicitOwnershipEvaluator(
-        GB=SimpleNamespace(),
+        GB=object.__new__(GBMaker),
         scalar_energy_func=lambda *args: None,
         batch_energy_func=None,
         local_random=np.random.default_rng(0),
-        penalty=PENALTY,
+        penalty=1.0e30,
     )
     mapping = evaluator._candidate_file_mapping(manipulator, atoms)
 
@@ -972,3 +981,174 @@ def test_owned_batch_must_preserve_result_count(tmp_path):
 
     with pytest.raises(ValueError, match="one ordered result dictionary"):
         minimizer.run_GA(unique_id=84)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "exception", "message"),
+    [
+        ("input_index", True, TypeError, "input_index"),
+        ("input_index", 1.5, TypeError, "input_index"),
+        ("energy", True, TypeError, "energy"),
+        ("energy", np.inf, ValueError, "finite"),
+        ("success", 1, TypeError, "success"),
+        ("failure_reason", "", TypeError, "failure_reason"),
+    ],
+)
+def test_candidate_evaluation_rejects_invalid_persistent_state(
+    field, value, exception, message
+):
+    arguments = {
+        "input_index": 0,
+        "energy": 1.0,
+        "structure_path": None,
+        "mapping": None,
+        "manipulator": None,
+        "success": False,
+        "failure_reason": "failed",
+    }
+    arguments[field] = value
+
+    with pytest.raises(exception, match=message):
+        CandidateEvaluation(**arguments)
+
+
+def test_candidate_evaluation_rejects_contradictory_success_state():
+    with pytest.raises(ValueError, match="require a path"):
+        CandidateEvaluation(
+            input_index=np.int64(0),
+            energy=np.float64(1.0),
+            structure_path=None,
+            mapping=None,
+            manipulator=None,
+            success=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "exception", "message"),
+    [
+        ({"GB": SimpleNamespace()}, TypeError, "GB"),
+        ({"scalar_energy_func": object()}, TypeError, "scalar_energy_func"),
+        ({"batch_energy_func": object()}, TypeError, "batch_energy_func"),
+        ({"local_random": object()}, TypeError, "local_random"),
+        ({"penalty": True}, TypeError, "energy"),
+        ({"penalty": np.inf}, ValueError, "finite"),
+    ],
+)
+def test_explicit_ownership_evaluator_validates_constructor_inputs(
+    tmp_path, overrides, exception, message
+):
+    gb, _seed_path, _ownership, _labels = _owned_ga_fixture(tmp_path)
+    arguments = {
+        "GB": gb,
+        "scalar_energy_func": lambda *args: None,
+        "batch_energy_func": None,
+        "local_random": np.random.default_rng(0),
+        "penalty": DEFAULT_EVALUATION_PENALTY,
+    }
+    arguments.update(overrides)
+
+    with pytest.raises(exception, match=message):
+        ExplicitOwnershipEvaluator(**arguments)
+
+
+def test_mutator_rejects_supported_attribute_without_dispatch_implementation(tmp_path):
+    gb, _seed_path, _ownership, _labels = _owned_ga_fixture(tmp_path)
+    manipulator = GBManipulator(gb)
+
+    with pytest.raises(ValueError, match="Unsupported mutation choice"):
+        Mutator(["cycle_grain_terminations"], manipulator)
+
+
+def test_mutator_translation_scales_y_and_z_independently(monkeypatch):
+    theta = math.radians(36.869898)
+    gb = GBMaker(
+        3.52,
+        "fcc",
+        10.0,
+        np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0]),
+        "Ni",
+        repeat_factor=(2, 3),
+        x_dim_min=12.0,
+        vacuum=0.0,
+        interaction_distance=4.0,
+    )
+    manipulator = GBManipulator(gb)
+    captured = {}
+
+    def capture_translation(self, dy, dz):
+        captured.update(dy=dy, dz=dz)
+        return np.array(self.parents[0].whole_system, copy=True)
+
+    monkeypatch.setattr(
+        GBManipulator, "translate_right_grain", capture_translation
+    )
+    mutator = Mutator(["translate_right_grain"], manipulator)
+    rng = np.random.default_rng(41)
+    expected_rng = np.random.default_rng(41)
+    expected_rng.choice(("translate_right_grain",))
+    expected_dz = (
+        gb.z_dim / gb.repeat_factor[1]
+    ) * expected_rng.uniform(0, 1)
+    expected_dy = (
+        gb.y_dim / gb.repeat_factor[0]
+    ) * expected_rng.uniform(0, 1)
+
+    mutator.mutate(rng, gb, manipulator)
+
+    assert captured["dy"] == pytest.approx(expected_dy)
+    assert captured["dz"] == pytest.approx(expected_dz)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "exception", "message"),
+    [
+        ({"gb_energy_func": None}, TypeError, "gb_energy_func"),
+        ({"gb_batch_energy_func": object()}, TypeError, "gb_batch_energy_func"),
+        ({"seed": True}, TypeError, "seed"),
+        ({"seed": -1}, ValueError, "nonnegative"),
+        ({"population_size": True}, TypeError, "population_size"),
+        ({"population_size": 0}, ValueError, "positive"),
+        ({"generations": 0}, ValueError, "positive"),
+        ({"keep_top_pct": 70, "intermediate_pct": 60}, ValueError, "less than"),
+        ({"evaluation_penalty": np.inf}, ValueError, "finite"),
+        ({"choices": []}, ValueError, "at least one"),
+    ],
+)
+def test_genetic_algorithm_validates_public_configuration(
+    tmp_path, overrides, exception, message
+):
+    gb, _seed_path, _ownership, _labels = _owned_ga_fixture(tmp_path)
+    arguments = {
+        "GB": gb,
+        "gb_energy_func": lambda *args: (0.0, None),
+        "choices": ["translate_right_grain"],
+        "population_size": 2,
+        "generations": 1,
+    }
+    arguments.update(overrides)
+
+    with pytest.raises(exception, match=message):
+        GeneticAlgorithmMinimizer(**arguments)
+
+
+def test_legacy_penalty_name_remains_in_optimizer_policy_layer():
+    assert PENALTY == DEFAULT_EVALUATION_PENALTY
+
+
+def test_optimizer_owns_explicit_evaluation_penalty(tmp_path):
+    gb, seed_path, ownership, _labels = _owned_ga_fixture(tmp_path)
+    minimizer = GeneticAlgorithmMinimizer(
+        gb,
+        lambda *args: (0.0, str(seed_path)),
+        ["translate_right_grain"],
+        seed=0,
+        initial_structure=seed_path,
+        initial_ownership=ownership,
+        population_size=2,
+        generations=1,
+        evaluation_penalty=12345.0,
+    )
+
+    assert minimizer.evaluation_penalty == 12345.0
+    assert minimizer._owned_evaluator.penalty == 12345.0

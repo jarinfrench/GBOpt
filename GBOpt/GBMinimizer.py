@@ -5,7 +5,7 @@ import math
 import shutil
 import uuid
 from collections.abc import Callable
-from numbers import Integral
+from numbers import Integral, Real
 from pathlib import Path
 from time import time
 from typing import Any, Optional
@@ -13,58 +13,156 @@ from typing import Any, Optional
 import numpy as np
 
 from GBOpt import GBMaker, GBManipulator
-from GBOpt.FileGrainOwnership import GrainOwnership
+from GBOpt.InterfaceDomain import GrainOwnership
 from GBOpt._explicit_ownership_evaluation import (
     CandidateEvaluation,
     ExplicitOwnershipEvaluator,
 )
 
 
-PENALTY = 1.0e30
+DEFAULT_EVALUATION_PENALTY = 1.0e30
+# Compatibility alias retained in the optimizer-policy layer.
+PENALTY = DEFAULT_EVALUATION_PENALTY
+
+
+def _strict_positive_int(name: str, value: object) -> int:
+    """Validate one positive non-Boolean integer optimizer setting.
+
+    :param name: Setting name used in validation errors.
+    :param value: Setting value to validate.
+    :return: Normalized positive Python integer.
+    :raises TypeError: If ``value`` is Boolean or nonintegral.
+    :raises ValueError: If ``value`` is not positive.
+    """
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be a non-Boolean integer")
+    normalized = int(value)
+    if normalized <= 0:
+        raise ValueError(f"{name} must be positive")
+    return normalized
+
+
+def _strict_percentage(name: str, value: object) -> int:
+    """Validate one integer percentage in the closed interval ``[0, 100]``.
+
+    :param name: Setting name used in validation errors.
+    :param value: Percentage value to validate.
+    :return: Normalized Python integer percentage.
+    :raises TypeError: If ``value`` is Boolean or nonintegral.
+    :raises ValueError: If ``value`` lies outside ``[0, 100]``.
+    """
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be a non-Boolean integer percentage")
+    normalized = int(value)
+    if not 0 <= normalized <= 100:
+        raise ValueError(f"{name} must be between 0 and 100")
+    return normalized
+
+
+def _strict_penalty(value: object) -> float:
+    """Validate the optimizer-owned evaluator-failure penalty.
+
+    :param value: Penalty energy to validate.
+    :return: Normalized finite Python float.
+    :raises TypeError: If ``value`` is Boolean or non-real.
+    :raises ValueError: If ``value`` is non-finite.
+    """
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise TypeError("evaluation_penalty must be a non-Boolean real scalar")
+    normalized = float(value)
+    if not np.isfinite(normalized):
+        raise ValueError("evaluation_penalty must be finite")
+    return normalized
+
+
+def _normalize_seed(seed: object) -> int | None:
+    """Validate and normalize an optional random-number seed.
+
+    :param seed: Random-number seed or ``None``.
+    :return: ``None`` or a normalized nonnegative Python integer.
+    :raises TypeError: If ``seed`` is Boolean or nonintegral.
+    :raises ValueError: If ``seed`` is negative.
+    """
+    if seed is None:
+        return None
+    if isinstance(seed, (bool, np.bool_)) or not isinstance(seed, Integral):
+        raise TypeError("seed must be a non-Boolean integer or None")
+    normalized = int(seed)
+    if normalized < 0:
+        raise ValueError("seed must be nonnegative")
+    return normalized
 
 
 class Mutator:
+    """Perform one supported random manipulation.
+
+    :param choices: Ordered, nonempty list of supported mutation names.
+    :param manipulator: Manipulator used to verify operation availability.
+    :raises TypeError: If inputs have unsupported types.
+    :raises ValueError: If choices are empty, duplicated, or unsupported.
     """
-    Mutator class for performing random manipulations on the passed manipulator.
-    :param choices: A list of strings corresponding to GBManipulator operations.
-    :param manipulator: A GBManipulator instance for mapping the choices list to GBmethod calls.
-    """
-    # TODO: Add more manipulator options to this class as we make more manipulators faster.
+
+    _SUPPORTED_CHOICES = frozenset(
+        ("insert_atoms", "remove_atoms", "translate_right_grain")
+    )
 
     def __init__(self, choices: list, manipulator: GBManipulator):
-        self.choices = {method: getattr(manipulator, method)
-                        for method in choices if hasattr(manipulator, method)}
-        self.choices_keys = list(self.choices.keys())
+        if not isinstance(manipulator, GBManipulator):
+            raise TypeError("manipulator must be a GBManipulator")
+        if not isinstance(choices, (list, tuple)) or isinstance(choices, str):
+            raise TypeError("choices must be a list or tuple of mutation names")
+        if not choices:
+            raise ValueError("choices must contain at least one mutation name")
 
-    def mutate(self, local_random: np.random.default_rng, GB: GBMaker, manipulator: GBManipulator):
-        """Performs a random mutation from the choices.
-        :param local_random: A numpy.random.default_rng object for generating the random choices.
-        "param GB: GBMaker object to get GB parameters for the mutation.
-        :param GBManipulator: GBManipulator object to perform the mutation on.
-        :return: Atom positions after the mutation."""
-        choice_key = local_random.choice(self.choices_keys)
-        mutation = None
-        new_system = None
-        match choice_key:
-            case "insert_atoms":
-                new_system = manipulator.insert_atoms(
-                    method="grid", num_to_insert=1)
-                mutation = "add1"
+        normalized: list[str] = []
+        for choice in choices:
+            if not isinstance(choice, str):
+                raise TypeError("each mutation choice must be a string")
+            if choice not in self._SUPPORTED_CHOICES:
+                raise ValueError(f"Unsupported mutation choice: {choice!r}")
+            if choice in normalized:
+                raise ValueError(f"Duplicate mutation choice: {choice!r}")
+            operation = getattr(manipulator, choice, None)
+            if not callable(operation):
+                raise ValueError(
+                    f"Manipulator does not provide mutation operation {choice!r}"
+                )
+            normalized.append(choice)
+        self.choices_keys = tuple(normalized)
 
-            case "remove_atoms":
-                new_system = manipulator.remove_atoms(num_to_remove=1)
-                mutation = "remove1"
+    def mutate(
+        self,
+        local_random: np.random.Generator,
+        GB: GBMaker,
+        manipulator: GBManipulator,
+    ) -> tuple[str, np.ndarray]:
+        """Perform one randomly selected supported mutation.
 
-            case "translate_right_grain":
-                dz = (GB.z_dim / GB.repeat_factor[1]
-                      ) * local_random.uniform(0, 1)
-                dy = (GB.z_dim / GB.repeat_factor[0]
-                      ) * local_random.uniform(0, 1)
-                new_system = manipulator.translate_right_grain(dy=dy, dz=dz)
-                mutation = f"shift{dy:.8f}dy{dz:.8f}dz"
-            case _:
-                raise ValueError(f"Unhandled mutation choice: {choice_key!r}")
-        return mutation, new_system
+        :param local_random: Optimizer-owned random-number generator.
+        :param GB: Grain-boundary construction supplying mutation dimensions.
+        :param manipulator: Manipulator on which to perform the mutation.
+        :return: Mutation label and resulting atom positions.
+        :raises TypeError: If the RNG, GB, or manipulator type is invalid.
+        """
+        if not isinstance(local_random, np.random.Generator):
+            raise TypeError("local_random must be a numpy.random.Generator")
+        if not isinstance(GB, GBMaker):
+            raise TypeError("GB must be a GBMaker")
+        if not isinstance(manipulator, GBManipulator):
+            raise TypeError("manipulator must be a GBManipulator")
+
+        choice_key = str(local_random.choice(self.choices_keys))
+        if choice_key == "insert_atoms":
+            return "add1", manipulator.insert_atoms(method="grid", num_to_insert=1)
+        if choice_key == "remove_atoms":
+            return "remove1", manipulator.remove_atoms(num_to_remove=1)
+
+        dz = (GB.z_dim / GB.repeat_factor[1]) * local_random.uniform(0, 1)
+        dy = (GB.y_dim / GB.repeat_factor[0]) * local_random.uniform(0, 1)
+        return (
+            f"shift{dy:.8f}dy{dz:.8f}dz",
+            manipulator.translate_right_grain(dy=dy, dz=dz),
+        )
 
 
 class MonteCarloMinimizer:
@@ -217,7 +315,22 @@ class GeneticAlgorithmMinimizer:
     the configuration space.
     """
 
-    def __init__(self, GB: GBMaker, gb_energy_func: Callable, choices: list, seed=None, *, initial_structure: GBMaker | str | Path | None = None, initial_ownership: GrainOwnership | None = None, population_size: int = 20, generations: int = 50, keep_top_pct: int = 10, intermediate_pct: int = 60, gb_batch_energy_func: Callable | None = None):
+    def __init__(
+        self,
+        GB: GBMaker,
+        gb_energy_func: Callable,
+        choices: list,
+        seed=None,
+        *,
+        initial_structure: GBMaker | str | Path | None = None,
+        initial_ownership: GrainOwnership | None = None,
+        population_size: int = 20,
+        generations: int = 50,
+        keep_top_pct: int = 10,
+        intermediate_pct: int = 60,
+        gb_batch_energy_func: Callable | None = None,
+        evaluation_penalty: float = DEFAULT_EVALUATION_PENALTY,
+    ):
         """
         :param GB: GBMaker object to perform minimization on.
         :param gb_energy_func: Function that returns the energy of a GB structure. It must be callable with
@@ -234,16 +347,29 @@ class GeneticAlgorithmMinimizer:
             defaults to 10.
         :param intermediate_pct: Percentage of structures eligible for crossover/mutation selection. Keyword argument,
             optional, defaults to 60.
-        :param gb_batch_energy_func: Optional batch-evaluation function for processing a population in one call. It
-            should accept (GBMaker, manipulators, atom_positions_list, lineages, unique_ids) and return a list of
-            result dictionaries. A candidate result missing ``"energy"`` or
-            ``"final_dump"`` is retained as a failed evaluation with the optimizer
-            penalty. If not provided, fall back to calling ``gb_energy_func`` per
-            candidate.
-        :raises TypeError: If ``initial_ownership`` is not GrainOwnership, or if it
-            accompanies a non-path initial structure.
-        :raises ValueError: If ownership is supplied without an initial structure.
+        :param gb_batch_energy_func: Keyword argument, optional, defaults to ``None``.
+            Batch-evaluation callback accepting ``(GBMaker, manipulators,
+            atom_positions_list, lineages, unique_ids)`` and returning ordered result
+            dictionaries.
+        :param evaluation_penalty: Keyword argument, optional, defaults to
+            ``DEFAULT_EVALUATION_PENALTY``. Finite energy assigned by optimizer policy
+            to failed evaluations.
+        :raises TypeError: If a public input has an unsupported type.
+        :raises ValueError: If ownership, population, percentage, or mutation-choice
+            invariants are invalid.
         """
+        if not isinstance(GB, GBMaker):
+            raise TypeError("GB must be a GBMaker instance")
+        if not callable(gb_energy_func):
+            raise TypeError("gb_energy_func must be callable")
+        if gb_batch_energy_func is not None and not callable(gb_batch_energy_func):
+            raise TypeError("gb_batch_energy_func must be callable or None")
+        if initial_structure is not None and not isinstance(
+            initial_structure, (GBMaker, str, Path)
+        ):
+            raise TypeError(
+                "initial_structure must be a GBMaker, str, Path, or None"
+            )
         if initial_ownership is not None:
             if not isinstance(initial_ownership, GrainOwnership):
                 raise TypeError(
@@ -258,20 +384,42 @@ class GeneticAlgorithmMinimizer:
                     "initial_ownership requires a str or Path initial_structure"
                 )
 
+        normalized_population_size = _strict_positive_int(
+            "population_size", population_size
+        )
+        normalized_generations = _strict_positive_int("generations", generations)
+        normalized_keep = _strict_percentage("keep_top_pct", keep_top_pct)
+        normalized_intermediate = _strict_percentage(
+            "intermediate_pct", intermediate_pct
+        )
+        if normalized_keep > normalized_intermediate:
+            raise ValueError(
+                "keep_top_pct must be less than or equal to intermediate_pct"
+            )
+        normalized_seed = _normalize_seed(seed)
+        normalized_penalty = _strict_penalty(evaluation_penalty)
+
         self.GB = GB
         self.gb_energy_func = gb_energy_func
         self.gb_batch_energy_func = gb_batch_energy_func
         self.history = []
         self.initial_structure = initial_structure
         self.initial_ownership = initial_ownership
-        self.local_random = np.random.default_rng(int(time()) if seed is None else seed)
+        self.population_size = normalized_population_size
+        self.generations = normalized_generations
+        self.keep_top_pct = normalized_keep
+        self.intermediate_pct = normalized_intermediate
+        self.evaluation_penalty = normalized_penalty
+        self.local_random = np.random.default_rng(
+            int(time()) if normalized_seed is None else normalized_seed
+        )
         self._owned_evaluator = (
             ExplicitOwnershipEvaluator(
                 GB=GB,
                 scalar_energy_func=gb_energy_func,
                 batch_energy_func=gb_batch_energy_func,
                 local_random=self.local_random,
-                penalty=PENALTY,
+                penalty=self.evaluation_penalty,
             )
             if initial_ownership is not None
             else None
@@ -279,10 +427,6 @@ class GeneticAlgorithmMinimizer:
         self.manipulator = self._make_initial_manipulator()
         self.mutator = Mutator(choices, self.manipulator)
         self.manipulator.rng = self.local_random
-        self.population_size = population_size
-        self.generations = generations
-        self.keep_top_pct = keep_top_pct
-        self.intermediate_pct = intermediate_pct
         self.GBE_vals = []
 
     def _make_initial_manipulator(self) -> GBManipulator:
@@ -423,7 +567,7 @@ class GeneticAlgorithmMinimizer:
     def _evaluate_generation(self, population_manipulators: list[GBManipulator], population_structures: list[np.ndarray],
                              population_lineages: list[list[str]], gen: int, unique_id: int) -> tuple[list[float], list[Optional[str]], list[Optional[GBManipulator]]]:
         """Evaluate all candidates, optionally using a batch energy function."""
-        PENALTY = 1.0e30
+        penalty = self.evaluation_penalty
         if self.gb_batch_energy_func is not None:
             batch_results = self.gb_batch_energy_func(
                 self.GB,
@@ -438,7 +582,7 @@ class GeneticAlgorithmMinimizer:
             gen_files = []
             evaluated_manipulators = []
             for result in batch_results:
-                energy = float(result.get("energy", PENALTY))
+                energy = float(result.get("energy", penalty))
                 dump = result.get("final_dump", None)
 
                 gen_energies.append(energy)
@@ -449,11 +593,11 @@ class GeneticAlgorithmMinimizer:
                             self._make_manipulator_from_file(dump))
                     except Exception:
                         gen_files[-1] = None
-                        gen_energies[-1] = PENALTY
+                        gen_energies[-1] = penalty
                         evaluated_manipulators.append(None)
                 else:
                     gen_files.append(None)
-                    gen_energies[-1] = PENALTY
+                    gen_energies[-1] = penalty
                     evaluated_manipulators.append(None)
 
             return gen_energies, gen_files, evaluated_manipulators
@@ -471,7 +615,7 @@ class GeneticAlgorithmMinimizer:
                     f"GA_{unique_id}_g{gen}_c{idx}",
                 )
             except Exception:
-                gen_energies.append(PENALTY)
+                gen_energies.append(penalty)
                 gen_files.append(None)
                 evaluated_manipulators.append(None)
                 continue
@@ -484,11 +628,11 @@ class GeneticAlgorithmMinimizer:
                         self._make_manipulator_from_file(dump_file_name))
                 except Exception:
                     gen_files[-1] = None
-                    gen_energies[-1] = PENALTY
+                    gen_energies[-1] = penalty
                     evaluated_manipulators.append(None)
             else:
                 gen_files.append(None)
-                gen_energies[-1] = PENALTY
+                gen_energies[-1] = penalty
                 evaluated_manipulators.append(None)
 
         return gen_energies, gen_files, evaluated_manipulators
