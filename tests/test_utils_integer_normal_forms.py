@@ -7,8 +7,8 @@ import math
 import numpy as np
 import pytest
 
-from GBOpt.Utils.integer_linalg import adjugate3_int, cross_int3, det3_int, dot_int
-from GBOpt.Utils.integer_normal_forms import (
+from GBOpt.utils.integer_linalg import adjugate3_int, cross_int3, det3_int, dot_int
+from GBOpt.utils.integer_normal_forms import (
     ExactNormalFormError,
     SmithNormalForm,
     column_hnf_3x3,

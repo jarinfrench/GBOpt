@@ -14,7 +14,7 @@ import math
 
 import numpy as np
 
-from GBOpt.Utils.integer_normal_forms import (
+from GBOpt.utils.integer_normal_forms import (
     ExactNormalFormError,
     column_hnf_3x3,
     smith_normal_form_3x3,

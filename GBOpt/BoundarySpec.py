@@ -15,7 +15,7 @@ from typing import Literal, Sequence
 
 import numpy as np
 
-from GBOpt.Utils import integer_linalg as ilinalg
+from GBOpt.utils import integer_linalg as ilinalg
 
 _BOUNDARY_EMBEDDING_SOURCES = ("pq", "csl", "five_dof")
 

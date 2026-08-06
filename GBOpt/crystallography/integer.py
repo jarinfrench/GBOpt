@@ -17,8 +17,8 @@ from typing import TypeVar
 import numpy as np
 from numpy.typing import ArrayLike
 
-import GBOpt.Utils.integer_linalg as ilinalg
-from GBOpt.Utils.integer_linalg import ExactIntegerError
+import GBOpt.utils.integer_linalg as ilinalg
+from GBOpt.utils.integer_linalg import ExactIntegerError
 
 from .types import CrystallographyValueError
 

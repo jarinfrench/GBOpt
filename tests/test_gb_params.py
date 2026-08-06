@@ -16,7 +16,7 @@ from scipy.spatial.transform import Rotation
 from GBOpt.BoundarySpec import CSLApproxSpec, CSLExactSpec, FiveDOFSpec, PQSpec
 from GBOpt.crystallography.boundary import csl_exact_spec_to_embedding
 from GBOpt.crystallography.pq import canonicalize_pq_paired
-from GBOpt.Utils import gb_params
+from GBOpt.utils import gb_params
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GB_PARAMS_SCRIPT = REPO_ROOT / "GBOpt" / "Utils" / "gb_params.py"

@@ -20,7 +20,7 @@ from GBOpt.crystallography.types import (
     CrystallographyNotImplementedError,
     CrystallographyValueError,
 )
-from GBOpt.Utils.integer_normal_forms import ExactNormalFormError
+from GBOpt.utils.integer_normal_forms import ExactNormalFormError
 
 # --------------------------------------------------------------------------------------
 # Shared scenarios

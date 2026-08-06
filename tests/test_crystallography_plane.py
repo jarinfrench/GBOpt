@@ -14,7 +14,7 @@ from GBOpt.crystallography.types import (
     CrystallographyNotImplementedError,
     CrystallographyValueError,
 )
-from GBOpt.Utils.integer_linalg import cross_int3
+from GBOpt.utils.integer_linalg import cross_int3
 
 # Sigma5 [001] 53.13 deg -- quat [2, 0, 0, 1], N=5
 # Rotation preserves [0, 0, 1] plane but not [1, 0, 0]

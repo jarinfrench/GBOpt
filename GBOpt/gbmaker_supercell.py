@@ -29,7 +29,7 @@ from GBOpt.crystallography.integer import (
     row_gcd_reduce,
 )
 from GBOpt.crystallography.types import CrystallographyValueError
-from GBOpt.Utils.integer_normal_forms import ExactNormalFormError, smith_normal_form_3x3
+from GBOpt.utils.integer_normal_forms import ExactNormalFormError, smith_normal_form_3x3
 
 if TYPE_CHECKING:
     from GBOpt.UnitCell import RationalBasis

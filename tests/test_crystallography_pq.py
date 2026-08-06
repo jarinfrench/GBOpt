@@ -11,7 +11,7 @@ from GBOpt.crystallography.pq import (
 )
 from GBOpt.crystallography.rotation import assert_scaled_rotation
 from GBOpt.crystallography.types import CrystallographyValueError
-from GBOpt.Utils.integer_linalg import det3_int
+from GBOpt.utils.integer_linalg import det3_int
 
 IDENTITY_PQ = np.eye(3, dtype=float)
 

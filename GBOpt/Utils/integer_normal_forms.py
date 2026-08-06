@@ -15,7 +15,7 @@ from typing import TypeVar
 import numpy as np
 from numpy.typing import ArrayLike
 
-from GBOpt.Utils.integer_linalg import (
+from GBOpt.utils.integer_linalg import (
     ExactIntegerError,
     as_int_array,
     cross_int3,

@@ -7,7 +7,7 @@ import math
 import numpy as np
 import pytest
 
-from GBOpt.Utils.integer_linalg import (
+from GBOpt.utils.integer_linalg import (
     ExactIntegerError,
     ExactIntegerShapeError,
     ExactIntegerTypeError,

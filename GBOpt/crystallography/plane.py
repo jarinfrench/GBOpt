@@ -16,7 +16,7 @@ import math
 import numpy as np
 from numpy.typing import ArrayLike
 
-from GBOpt.Utils.integer_normal_forms import (
+from GBOpt.utils.integer_normal_forms import (
     ExactNormalFormError,
     primitive_integer_null_basis_3d,
 )
