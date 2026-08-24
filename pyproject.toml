@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "GBOpt"
+dynamic = ["version"]
+description = "A package for grain boundary optimization"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Chaitanya Bhave", email = "chaitanya.bhave@inl.gov" },
+    { name = "Jarin French", email = "jarin.french@inl.gov" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy<=2.1",
+    "scipy",
+    "numba",
+    "pandas",
+    "matplotlib",
+    "spglib",
+]
+requires-python = ">=3.12"
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[project.urls]
+Homepage = "https://github.com/IdahoLabResearch/GBOpt"
+
+[tool.setuptools.packages.find]
+include = ["GBOpt*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "GBOpt._version.__version__" }

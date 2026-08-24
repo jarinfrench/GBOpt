@@ -1,7 +1,6 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
-__version__ = "0.2.0"
-
+from GBOpt._version import __version__
 from GBOpt.Atom import Atom
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import GBManipulator
