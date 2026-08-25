@@ -3441,6 +3441,7 @@ class GeneticAlgorithmMinimizer:
                 )
 
         population_snapshots: list[dict] = []
+        materializable_records: dict[str, CandidateEvaluation] = {}
         if state is not None:
             try:
                 if not isinstance(state, dict):
@@ -3717,6 +3718,8 @@ class GeneticAlgorithmMinimizer:
                 self.artifact_store.replace_pin(
                     ArtifactPin.BEST_RESULT, initial_record.candidate_id
                 )
+                if checkpoint.enabled:
+                    materializable_records[initial_record.candidate_id] = initial_record
 
             population_manipulators = []
             population_structures = []
@@ -3878,6 +3881,8 @@ class GeneticAlgorithmMinimizer:
                         self._register_owned_retention_candidate(
                             record, generation=gen, lineage=lineage
                         )
+                        if checkpoint.enabled:
+                            materializable_records[record.candidate_id] = record
                         if gen_checkpoint is not None and record.candidate_id == (
                             f"GA_{unique_id}_g{gen}_c{record.input_index}"
                         ):
@@ -4011,11 +4016,7 @@ class GeneticAlgorithmMinimizer:
                         self.artifact_store.release_pin(
                             artifact.candidate_id, ArtifactPin.CANDIDATE_CHECKPOINT
                         )
-                    records_by_id = {
-                        record.candidate_id: record
-                        for record in records
-                        if record.success
-                    }
+                    records_by_id = dict(materializable_records)
                     records_by_id[best_record.candidate_id] = best_record
                     archive_root = self._owned_archive_root(
                         checkpoint_file, str(unique_id)
@@ -4048,6 +4049,7 @@ class GeneticAlgorithmMinimizer:
                     checkpoint.save_final(_build_owned_state(gen))
                 except CheckpointError as exc:
                     raise GBMinimizerError(str(exc)) from exc
+                materializable_records.clear()
                 for path in current_pending:
                     try:
                         Path(path).unlink(missing_ok=True)

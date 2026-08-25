@@ -2590,6 +2590,105 @@ def test_owned_retention_prunes_sources_only_after_checkpoint_commit(owned_ga, t
             assert Path(archive_path).is_file()
 
 
+def test_owned_retention_materializes_initial_candidate_when_still_top_n(
+    owned_ga,
+    tmp_path,
+):
+    checkpoint = tmp_path / "initial-top-n.json"
+
+    def energy(GB, manipulator, atom_positions, unique_id):
+        output = tmp_path / f"{unique_id}.data"
+        _write_owned_evaluator_output(
+            output,
+            atom_positions,
+            manipulator.parents[0].box_dims,
+        )
+        candidate_id = str(unique_id)
+        if candidate_id.startswith("GA_initial"):
+            value = 1.0
+        elif candidate_id.endswith("_c0"):
+            value = 0.0
+        else:
+            value = 2.0
+        return value, str(output)
+
+    minimizer = _make_owned_checkpoint_minimizer(
+        owned_ga,
+        energy,
+        generations=1,
+        population_size=2,
+        keep_top_pct=50,
+        retention_policy=_objective_retention_policy(count=2),
+    )
+
+    best_energy, best_path = minimizer.run_GA(
+        unique_id=316,
+        checkpoint_file=checkpoint,
+    )
+
+    assert best_energy == pytest.approx(0.0)
+    assert Path(best_path).name == "GA_316_g0_c0.data"
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))["state"]
+    records = {
+        record["candidate"]["candidate_id"]: record
+        for record in state["artifact_store"]["records"]
+    }
+    initial = records["GA_initial316"]
+    assert initial["retention_reasons"]
+    assert initial["archive_path"] is not None
+    assert Path(initial["archive_path"]).is_file()
+
+
+def test_owned_retention_materializes_prior_generation_candidate_at_later_checkpoint(
+    owned_ga,
+    tmp_path,
+):
+    checkpoint = tmp_path / "prior-generation-top-n.json"
+
+    def energy(GB, manipulator, atom_positions, unique_id):
+        output = tmp_path / f"{unique_id}.data"
+        _write_owned_evaluator_output(
+            output,
+            atom_positions,
+            manipulator.parents[0].box_dims,
+        )
+        candidate_id = str(unique_id)
+        values = {
+            "GA_initial317": 10.0,
+            "GA_317_g0_c0": 0.0,
+            "GA_317_g0_c1": 1.0,
+            "GA_317_g1_c0": 2.0,
+            "GA_317_g1_c1": 3.0,
+        }
+        return values[candidate_id], str(output)
+
+    minimizer = _make_owned_checkpoint_minimizer(
+        owned_ga,
+        energy,
+        generations=2,
+        population_size=2,
+        keep_top_pct=50,
+        slice_and_merge_pct=0.0,
+        retention_policy=_objective_retention_policy(count=2),
+    )
+
+    minimizer.run_GA(
+        unique_id=317,
+        checkpoint_file=checkpoint,
+        checkpoint_interval=2,
+    )
+
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))["state"]
+    records = {
+        record["candidate"]["candidate_id"]: record
+        for record in state["artifact_store"]["records"]
+    }
+    prior = records["GA_317_g0_c1"]
+    assert prior["retention_reasons"]
+    assert prior["archive_path"] is not None
+    assert Path(prior["archive_path"]).is_file()
+
+
 def test_owned_retention_writes_manifest_and_lifecycle_history(owned_ga, tmp_path):
     checkpoint = tmp_path / "provenance.json"
     minimizer = _make_owned_checkpoint_minimizer(
