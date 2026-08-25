@@ -12,8 +12,9 @@ import numpy as np
 import pytest
 
 from GBOpt.artifacts import ArtifactRetentionPolicy, KeepBest, remove_managed_path
+from GBOpt.artifacts.provenance import ArtifactProvenanceError, _ArtifactProvenance
 from GBOpt.BoundarySpec import CSLExactSpec
-from GBOpt.Checkpoint import CheckpointStore
+from GBOpt.Checkpoint import CandidateCheckpoint, CheckpointStore
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import (
     CompositionAwareCrossoverError,
@@ -90,11 +91,7 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
         minimizer.run_GA(unique_id=10, checkpoint_file=cp)
         self.assertTrue(cp.exists())
 
-    def test_run_ga_checkpoint_file_is_valid_json(self):
-        """After a simulated crash (via mock), the checkpoint file is valid JSON."""
-        from unittest.mock import patch
-
-        from GBOpt.Checkpoint import CheckpointStore
+    def test_run_ga_checkpoint_file_is_valid_json_after_crash(self):
         cp = Path(self.tmpdir.name) / "ga.json"
         minimizer = self._make_minimizer(generations=3)
 
@@ -123,9 +120,6 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
         self.assertEqual(state["minimizer"], "GeneticAlgorithmMinimizer")
 
     def test_run_ga_checkpoint_format_pickle(self):
-        from unittest.mock import patch
-
-        from GBOpt.Checkpoint import CheckpointStore
         cp = Path(self.tmpdir.name) / "ga.pkl"
         minimizer = self._make_minimizer(generations=3)
 
@@ -225,8 +219,6 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         )
 
     def test_single_eval_resumes_skips_completed_candidates(self):
-        """Crash after k candidates are checkpointed in gen-0; resume evaluates only N-k."""
-        from GBOpt.Checkpoint import CandidateCheckpoint
         cp = Path(self.tmpdir.name) / "ga_intra.json"
         crash_after = 2
 
@@ -274,8 +266,6 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
                          minimizer2.population_size - crash_after)
 
     def test_gen_checkpoint_deleted_after_generation_completes(self):
-        """The per-iteration checkpoint file is absent after the generation finishes."""
-        from GBOpt.Checkpoint import CandidateCheckpoint
         cp = Path(self.tmpdir.name) / "ga_gencp.json"
         minimizer = self._make_minimizer()
         minimizer.run_GA(unique_id=21, checkpoint_file=cp)
@@ -286,8 +276,6 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         self.assertFalse(iter1_path.exists())
 
     def test_gbe_vals_not_duplicated_after_intra_gen_resume(self):
-        """Crash mid-gen via checkpoint record and resume; GBE_vals stays at generations+1."""
-        from GBOpt.Checkpoint import CandidateCheckpoint
         cp = Path(self.tmpdir.name) / "ga_nodup.json"
 
         # Crash after the 2nd candidate in gen-0 is recorded to the iter checkpoint.
@@ -313,7 +301,6 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         self.assertEqual(len(minimizer2.GBE_vals), minimizer2.generations + 1)
 
     def test_batch_func_without_checkpoint_kwarg_auto_wrapped(self):
-        """Batch func without checkpoint kwarg triggers UserWarning and still runs."""
         def batch_no_checkpoint(GB, manips, structs, lineages, unique_ids):
             results = []
             for manip, struct, uid in zip(manips, structs, unique_ids):
@@ -347,8 +334,6 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         self.assertIsInstance(best_energy, float)
 
     def test_batch_func_with_checkpoint_kwarg_not_wrapped(self):
-        """Batch func that declares checkpoint= receives a CandidateCheckpoint instance."""
-        from GBOpt.Checkpoint import CandidateCheckpoint
         received_checkpoints = []
 
         def batch_with_checkpoint(GB, manips, structs, lineages, unique_ids,
@@ -383,10 +368,6 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         self.assertIsInstance(received_checkpoints[0], CandidateCheckpoint)
 
     def test_orphaned_gen_checkpoint_cleaned_up_on_resume(self):
-        """A stale iter checkpoint for a completed generation is removed when resuming."""
-        from unittest.mock import patch
-
-        from GBOpt.Checkpoint import CandidateCheckpoint, CheckpointStore
         cp = Path(self.tmpdir.name) / "ga_orphan.json"
         minimizer = self._make_minimizer(generations=2)
 
@@ -414,7 +395,6 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         self.assertFalse(stale.exists())
 
     def test_no_checkpoint_file_when_not_specified(self):
-        """No checkpoint file is created when checkpoint_file is not provided."""
         minimizer = self._make_minimizer(generations=1)
         uid = 9999
         cp_path = Path(f"ga_checkpoint_{uid}.json")
@@ -427,11 +407,6 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         self.assertFalse(cp_path.exists())
 
     def test_pending_paths_in_checkpoint_after_generation(self):
-        """
-        Gen-0 checkpoint must record .pending paths in population_checkpoint_paths (not
-        population_lineages), and those files must exist on disk so a resume can load
-        them.
-        """
         cp = Path(self.tmpdir.name) / "ga_pending.json"
         call_count = [0]
         original_save = CheckpointStore._save
@@ -475,9 +450,6 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
             )
 
     def test_candidate_reconstruction_matches_continuous_run(self):
-        """
-        Resumed run produces identical GBE_vals as an uninterrupted run with the same seed
-        """
         TOTAL_GENS = 3
         UID_CONT = 30
         UID_INTR = 31
@@ -527,9 +499,6 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
                 )
 
     def test_normal_completion_then_extension_matches_continuous_run(self):
-        """A run completed cleanly (generations=1), then extended to generations=3
-        via its checkpoint, must produce the same GBE_vals as an uninterrupted
-        3-generation run."""
         TOTAL_GENS = 3
         UID_CONT = 33
         UID_EXT = 34
@@ -568,8 +537,6 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
                 )
 
     def test_resume_fails_loudly_on_missing_pending_file(self):
-        """GA resume raises GBMinimizerError when a population_checkpoint_paths
-        entry is missing, rather than silently substituting best_dump."""
         cp = Path(self.tmpdir.name) / "ga_missing.json"
         original_save = CheckpointStore._save
 
@@ -948,7 +915,7 @@ def test_reuse_carryover_evaluations_requires_boolean(ga_gb):
             ga_gb,
             lambda *_args: (0.0, None),
             ["translate_right_grain"],
-            reuse_carryover_evaluations=1,
+            reuse_carryover_evaluations=1,  # ty: ignore[invalid-argument-type]
         )
 
 
@@ -1090,7 +1057,7 @@ def test_initial_ownership_requires_file_backed_structure(owned_ga):
             lambda *_args: (0.0, str(seed_path)),
             ["translate_right_grain"],
             initial_structure=str(seed_path),
-            initial_ownership=object(),
+            initial_ownership=object(),  # ty: ignore[invalid-argument-type]
         )
 
 
@@ -1112,7 +1079,7 @@ def test_variable_cell_requires_explicit_ownership_and_boolean(owned_ga):
             ["translate_right_grain"],
             initial_structure=str(seed_path),
             initial_ownership=ownership,
-            allow_variable_cell=1,
+            allow_variable_cell=1,  # ty: ignore[invalid-argument-type]
         )
 
 
@@ -2102,8 +2069,6 @@ def test_owned_scalar_intra_generation_resume_skips_completed_candidates(
     owned_ga,
     tmp_path,
 ):
-    from GBOpt.Checkpoint import CandidateCheckpoint
-
     energy = _owned_checkpoint_energy(tmp_path)
     checkpoint = tmp_path / "intra.json"
     original_record = CandidateCheckpoint.record
@@ -2734,11 +2699,6 @@ def test_owned_provenance_failure_does_not_invalidate_checkpoint(
     tmp_path,
     monkeypatch,
 ):
-    from GBOpt.artifacts.provenance import (
-        ArtifactProvenanceError,
-        _ArtifactProvenance,
-    )
-
     checkpoint = tmp_path / "provenance-failure.json"
     minimizer = _make_owned_checkpoint_minimizer(
         owned_ga,
@@ -2753,8 +2713,21 @@ def test_owned_provenance_failure_does_not_invalidate_checkpoint(
         raise ArtifactProvenanceError("simulated manifest failure")
 
     monkeypatch.setattr(_ArtifactProvenance, "write_manifest", fail_manifest)
-    with pytest.warns(RuntimeWarning, match="Artifact provenance update failed"):
+
+    with pytest.warns(RuntimeWarning) as warnings:
         minimizer.run_GA(unique_id=314, checkpoint_file=checkpoint)
+
+    warning_messages = [str(warning.message) for warning in warnings]
+
+    assert any(
+        "Artifact provenance update failed" in message
+        for message in warning_messages
+    )
+    assert any(
+        "Artifact cleanup deferred because required calculation provenance "
+        "could not be persisted" in message
+        for message in warning_messages
+    )
 
     assert checkpoint.is_file()
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
@@ -2769,10 +2742,7 @@ def test_owned_provenance_failure_does_not_invalidate_checkpoint(
     assert all(Path(path).exists() for path in source_paths)
 
 
-def test_owned_failed_evaluations_use_bounded_diagnostic_lifecycle(
-    owned_ga,
-    tmp_path,
-):
+def test_owned_failed_evaluations_use_bounded_diagnostic_lifecycle(owned_ga, tmp_path):
     def scalar_energy(GB, manipulator, atom_positions, unique_id):
         output = tmp_path / f"{unique_id}.data"
         _write_owned_evaluator_output(
