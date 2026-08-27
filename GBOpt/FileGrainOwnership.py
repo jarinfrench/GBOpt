@@ -267,8 +267,9 @@ def read_lammps_data_file(
 ) -> LammpsAtomData:
     """Read the orthogonal LAMMPS data format emitted by ``GBMaker``.
 
-    Both the five-column atomic form and the six-column charge form are supported. File
-    row order is preserved so callers can align ownership by atom ID.
+    Both the atomic and charge forms are supported, with or without the optional three
+    trailing LAMMPS image flags. File row order is preserved so callers can align
+    ownership by atom ID.
 
     :param path: Path to the LAMMPS data file.
     :param type_dict: Keyword argument, optional, defaults to ``None``. Mapping in
@@ -373,20 +374,27 @@ def read_lammps_data_file(
         if not stripped:
             continue
         parts = stripped.split()
-        if len(parts) not in (5, 6):
+        if len(parts) not in (5, 6, 8, 9):
             raise LammpsDataError(
-                "Atoms rows must use 'id type x y z' or 'id type charge x y z'"
+                "Atoms rows must use 'id type x y z' or 'id type charge x y z', "
+                "optionally followed by integer image flags 'nx ny nz'"
             )
+        has_charge = len(parts) in (6, 9)
+        has_image_flags = len(parts) in (8, 9)
         atom_id = _strict_id_token(parts[0])
         type_token = parts[1]
-        coordinate_start = 2 if len(parts) == 5 else 3
-        if len(parts) == 6:
+        coordinate_start = 3 if has_charge else 2
+        if has_charge:
             try:
                 charge = float(parts[2])
             except ValueError as exc:
                 raise LammpsDataError("atom charge must be numeric") from exc
             if not np.isfinite(charge):
                 raise LammpsDataError("atom charge must be finite")
+        if has_image_flags and not all(
+            _INTEGER_TOKEN.fullmatch(token) for token in parts[-3:]
+        ):
+            raise LammpsDataError("atom image flags must be integers")
         if _INTEGER_TOKEN.fullmatch(type_token):
             type_id = _strict_type_id(int(type_token))
             if type_id > n_types:

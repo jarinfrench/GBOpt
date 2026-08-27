@@ -470,6 +470,71 @@ def test_lammps_data_reader_preserves_file_row_ids_and_charge_coordinates(
     assert np.array_equal(parsed.atom_ids, np.array([2, 1]))
 
 
+
+
+@pytest.mark.parametrize(
+    ("row", "expected_species", "expected_coordinates"),
+    [
+        pytest.param(
+            "1 1 3.0 4.0 5.0 -1 0 2",
+            "U",
+            (3.0, 4.0, 5.0),
+            id="atomic",
+        ),
+        pytest.param(
+            "1 2 -1.2 3.0 4.0 5.0 -1 0 2",
+            "O",
+            (3.0, 4.0, 5.0),
+            id="charge",
+        ),
+    ],
+)
+def test_lammps_data_reader_accepts_optional_image_flags(
+    tmp_path: Path,
+    row: str,
+    expected_species: str,
+    expected_coordinates: tuple[float, float, float],
+) -> None:
+    data = tmp_path / "image_flags.data"
+    data.write_text(
+        "Image flags\n\n"
+        "1 atoms\n"
+        "2 atom types\n"
+        "0.0 10.0 xlo xhi\n"
+        "0.0 10.0 ylo yhi\n"
+        "0.0 10.0 zlo zhi\n"
+        "\nAtoms\n\n"
+        f"{row}\n",
+        encoding="utf-8",
+    )
+
+    parsed = read_lammps_data_file(data, type_dict={"U": 1, "O": 2})
+
+    assert parsed.atoms[0]["name"] == expected_species
+    np.testing.assert_allclose(
+        [parsed.atoms[0][axis] for axis in "xyz"],
+        expected_coordinates,
+    )
+
+
+def test_lammps_data_reader_rejects_noninteger_image_flags(tmp_path: Path) -> None:
+    data = tmp_path / "bad_image_flags.data"
+    data.write_text(
+        "Bad image flags\n\n"
+        "1 atoms\n"
+        "1 atom types\n"
+        "0.0 10.0 xlo xhi\n"
+        "0.0 10.0 ylo yhi\n"
+        "0.0 10.0 zlo zhi\n"
+        "\nAtoms\n\n"
+        "1 1 3.0 4.0 5.0 0 1.5 0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LammpsDataError, match="image flags must be integers"):
+        read_lammps_data_file(data, type_dict={"U": 1})
+
+
 def test_named_data_rows_allow_file_local_type_labels_to_differ_from_type_dict(
     tmp_path: Path,
 ) -> None:
