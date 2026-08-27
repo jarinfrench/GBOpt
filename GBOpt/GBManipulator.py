@@ -2736,7 +2736,7 @@ class GBManipulator:
         parent = self.__parents[0]
         atoms = Atom.as_array(parent.whole_system, type_map=parent.unit_cell.type_map)
         gb_atoms = Atom.as_array(parent.gb_atoms, type_map=parent.unit_cell.type_map)
-        gb_atom_indices = parent.gb_indices
+        gb_atom_indices = np.asarray(parent.gb_indices, dtype=np.intp)
         type_map = parent.unit_cell.type_map
         positions = atoms[:, 1:]
 
@@ -2844,7 +2844,7 @@ class GBManipulator:
                 for idx in selected_central_indices
             }
             for central_idx in selected_central_indices:
-                neighbors = neighbor_list[central_idx]
+                neighbors = np.asarray(neighbor_list[central_idx], dtype=np.intp)
                 gb_neighbors = np.intersect1d(neighbors, gb_atom_indices)
                 mask = np.isin(neighbors, gb_neighbors)
                 distances[central_idx][mask] = np.linalg.norm(
@@ -2858,9 +2858,11 @@ class GBManipulator:
                 # type_mask = atoms[gb_atom_indices][:, 0] == atom_type
                 # type_indices = gb_atom_indices[type_mask]
                 for idx, dists in distances.items():
-                    neighbor_indices = np.asarray(neighbor_list[idx])
+                    neighbor_indices = np.asarray(neighbor_list[idx], dtype=np.intp)
                     gb_neighbor_indices = np.intersect1d(
-                        neighbor_indices, gb_atom_indices)
+                        neighbor_indices,
+                        gb_atom_indices
+                    )
                     mask = np.isin(neighbor_indices, gb_neighbor_indices)
                     type_mask = atoms[gb_neighbor_indices][:, 0] == atom_type
                     type_indices = neighbor_indices[mask][type_mask]

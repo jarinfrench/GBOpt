@@ -1,5 +1,6 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
+from GBOpt.UnitCell import UnitCell
 import copy
 import filecmp
 import importlib
@@ -35,12 +36,10 @@ from GBOpt.GBManipulator import (
 )
 from GBOpt.GrainOwnership import LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL, GrainOwnership
 
-
 pytestmark = pytest.mark.filterwarnings(
     "ignore:File-backed Parent initialization without explicit grain ownership is "
     "deprecated.*:DeprecationWarning"
 )
-from GBOpt.UnitCell import UnitCell
 
 _TEST_DIR = Path(__file__).resolve().parent
 _INPUT_DIR = _TEST_DIR / "inputs"
@@ -234,14 +233,18 @@ def test_local_order_is_higher_for_ideal_crystal_neighborhoods(structure, atoms)
     assert ideal_order > distorted_order + 1e-8
 
 
-def _synthetic_manipulator(unit_cell, atoms, seed=100):
-    # Bypass full GBMaker construction so stoichiometric mutator tests can
-    # isolate selection logic with a tiny deterministic parent.
+def _synthetic_manipulator(
+    unit_cell,
+    atoms,
+    seed=100,
+    *,
+    gb_index_dtype=np.intp,
+):
     parent = SimpleNamespace(
         unit_cell=unit_cell,
         whole_system=atoms,
         gb_atoms=atoms,
-        gb_indices=np.arange(len(atoms)),
+        gb_indices=np.arange(len(atoms), dtype=gb_index_dtype),
     )
 
     manipulator = object.__new__(GBManipulator)
@@ -1660,6 +1663,45 @@ def test_explicit_ownership_parent_proxy_replacement_resets_candidate_labels(tmp
         manipulator.candidate_grain_labels,
         replacement_labels,
     )
+
+
+def test_remove_atoms_preserves_stoichiometry_with_unsigned_gb_indices():
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("rocksalt", 1.0, ("Na", "Cl"))
+
+    atoms = np.array(
+        [
+            ("Na", 0.0, 0.0, 0.0),
+            ("Cl", 0.5, 0.0, 0.0),
+            ("Na", 0.0, 0.5, 0.0),
+            ("Cl", 0.5, 0.5, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    original_atoms = atoms.copy()
+
+    manipulator = _synthetic_manipulator(
+        unit_cell,
+        atoms,
+        gb_index_dtype=np.uint64,
+    )
+
+    with patch(
+        "GBOpt.GBManipulator._calculate_local_order",
+        return_value=1.0,
+    ):
+        new_system = manipulator.remove_atoms(
+            num_to_remove=1,
+            keep_ratio=True,
+        )
+
+    np.testing.assert_array_equal(atoms, original_atoms)
+
+    names, counts = np.unique(new_system["name"], return_counts=True)
+    composition = dict(zip(names.tolist(), counts.tolist()))
+
+    assert len(new_system) == len(atoms) - 2
+    assert composition == {"Cl": 1, "Na": 1}
 
 
 if __name__ == '__main__':
