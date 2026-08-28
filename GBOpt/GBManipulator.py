@@ -1912,23 +1912,48 @@ def _calculate_bond_hardness(parent, neighbor_list, ideal_bonds):
 
 
 @jit(nopython=True, cache=True)
-def _calculate_dynamical_matrix(hardness, positions, gb_atom_indices, neighbor_list, q_vec):
+def _calculate_dynamical_matrix(
+    hardness,
+    positions,
+    gb_atom_indices,
+    neighbor_list,
+    q_vec,
+):
     num_gb_atoms = len(gb_atom_indices)
     Dij = np.zeros((3 * num_gb_atoms, 3 * num_gb_atoms), dtype=np.complex128)
 
-    for d_i in prange(len(gb_atom_indices)):
+    for d_i in prange(num_gb_atoms):
         id1 = gb_atom_indices[d_i]
+
         for id2 in neighbor_list[id1]:
+            bond_hardness = hardness[id1, id2]
+
+            # Every bond connected to a movable GB atom contributes to that atom's
+            # onsite restoring term, including bonds to atoms outside the movable GB
+            # region.
+            for aa in range(3):
+                Dij[
+                    3 * d_i + aa,
+                    3 * d_i + aa,
+                ] += bond_hardness
+
+            # Atoms outside gb_atom_indices are treated as fixed, so they have no
+            # corresponding degrees of freedom in this matrix.
             if id2 not in gb_atom_indices:
                 continue
+
             d_j = np.where(gb_atom_indices == id2)[0][0]
             rij = positions[id2] - positions[id1]
             exp_term = np.exp(1j * np.dot(q_vec, rij))
+
+            # The bond-hardness model couples corresponding Cartesian components;
+            # cross-coordinate terms are zero.
             for aa in range(3):
-                for bb in range(3):
-                    Dij[3 * d_i + aa, 3 * d_j + bb] = -hardness[id1, id2] * exp_term
-                    if d_i == d_j:
-                        Dij[3 * d_i + aa, 3 * d_j + bb] += hardness[id1, id2] * exp_term
+                Dij[
+                    3 * d_i + aa,
+                    3 * d_j + aa,
+                ] -= bond_hardness * exp_term
+
     return Dij
 
 

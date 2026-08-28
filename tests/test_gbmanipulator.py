@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+from numba.typed import List
 
 from GBOpt.Atom import Atom
 from GBOpt.BoundarySpec import CSLExactSpec, FiveDOFSpec, PQSpec
@@ -30,6 +31,7 @@ from GBOpt.GBManipulator import (
     ParentsProxyTypeError,
     ParentsProxyValueError,
     ParentValueError,
+    _calculate_dynamical_matrix,
     _calculate_local_order,
     _ParentsProxy,
 )
@@ -1882,6 +1884,120 @@ def test_displace_along_soft_modes_uses_three_dimensional_neighbor_positions(
 
     assert captured_positions["distance"] == pytest.approx(10.0)
     assert captured_positions["distance"] > captured_positions["cutoff"]
+
+
+def _typed_neighbor_list(neighbors):
+    result = List()
+    for neighbor in neighbors:
+        result.append(List(neighbor))
+    return result
+
+
+def test_dynamical_matrix_two_atom_bond_has_laplacian_structure():
+    hardness = np.array([[0.0, 2.0], [2.0, 0.0]])
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    gb_indices = np.array([0, 1], dtype=np.intp)
+
+    neighbor_list = List()
+    neighbor_list.append(List([1]))
+    neighbor_list.append(List([0]))
+
+    q_vec = np.zeros(3)
+
+    actual = _calculate_dynamical_matrix(
+        hardness,
+        positions,
+        gb_indices,
+        neighbor_list,
+        q_vec,
+    )
+
+    identity = np.eye(3)
+    expected = np.block(
+        [
+            [2.0 * identity, -2.0 * identity],
+            [-2.0 * identity, 2.0 * identity],
+        ]
+    )
+
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_dynamical_matrix_two_atom_bond_has_three_translation_modes():
+    hardness = np.array([[0.0, 2.0], [2.0, 0.0]])
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    gb_indices = np.array([0, 1], dtype=np.intp)
+
+    neighbor_list = List()
+    neighbor_list.append(List([1]))
+    neighbor_list.append(List([0]))
+
+    matrix = _calculate_dynamical_matrix(
+        hardness,
+        positions,
+        gb_indices,
+        neighbor_list,
+        np.zeros(3),
+    )
+
+    eigenvalues = np.linalg.eigvalsh(matrix)
+
+    np.testing.assert_allclose(
+        eigenvalues,
+        [0.0, 0.0, 0.0, 4.0, 4.0, 4.0],
+        atol=1e-12,
+    )
+
+
+def test_dynamical_matrix_fixed_neighbor_contributes_to_diagonal():
+    hardness = np.array([[0.0, 3.0], [3.0, 0.0]])
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+    # Only atom 0 is movable.
+    gb_indices = np.array([0], dtype=np.intp)
+    neighbor_list = _typed_neighbor_list([[1], [0]])
+
+    actual = _calculate_dynamical_matrix(
+        hardness,
+        positions,
+        gb_indices,
+        neighbor_list,
+        np.zeros(3),
+    )
+
+    np.testing.assert_allclose(
+        actual,
+        3.0 * np.eye(3),
+    )
+
+
+def test_dynamical_matrix_is_hermitian_at_nonzero_q():
+    hardness = np.array([[0.0, 2.0], [2.0, 0.0]])
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    gb_indices = np.array([0, 1], dtype=np.intp)
+    neighbor_list = _typed_neighbor_list([[1], [0]])
+    q_vec = np.array([0.7, 0.0, 0.0])
+
+    actual = _calculate_dynamical_matrix(
+        hardness,
+        positions,
+        gb_indices,
+        neighbor_list,
+        q_vec,
+    )
+
+    phase = np.exp(1j * 0.7)
+    identity = np.eye(3)
+
+    expected = np.block(
+        [
+            [2.0 * identity, -2.0 * phase * identity],
+            [-2.0 * phase.conjugate() * identity, 2.0 * identity],
+        ]
+    )
+
+    np.testing.assert_allclose(actual, expected, atol=1e-12)
+    np.testing.assert_allclose(actual, actual.conj().T, atol=1e-12)
 
 
 if __name__ == '__main__':
