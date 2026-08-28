@@ -1745,6 +1745,100 @@ def _create_neighbor_list(rcut: float, pos: np.ndarray) -> list:
     return neighbor_list
 
 
+def _soft_mode_q_points(unit_cell: UnitCell, mesh_size: int) -> np.ndarray:
+    """Return irreducible q points in Cartesian reciprocal-space coordinates.
+
+    A self-consistent spglib cell is constructed from the conventional lattice and
+    basis. spglib is then used to reduce that cell to a primitive cell and identify the
+    irreducible reciprocal-mesh representatives.
+
+    The returned q vectors are expressed in Cartesian reciprocal coordinates with units
+    of inverse Angstroms so they can be combined directly with Cartesian interatomic
+    displacement vectors.
+
+    :param unit_cell: Nominal bulk unit cell used to determine crystal symmetry.
+    :param mesh_size: Uniform reciprocal-space mesh size along each primitive reciprocal
+        axis.
+    :return: Irreducible q vectors sorted by increasing physical magnitude.
+    :raises GBManipulatorValueError: If spglib cannot identify a primitive cell.
+    """
+    conventional_lattice = np.asarray(
+        unit_cell.conventional,
+        dtype=np.float64,
+    )
+    cartesian_positions = np.asarray(
+        unit_cell.positions(),
+        dtype=np.float64,
+    )
+
+    # spglib expects scaled positions relative to the supplied lattice.
+    scaled_positions = np.linalg.solve(
+        conventional_lattice.T,
+        cartesian_positions.T,
+    ).T
+    scaled_positions = np.mod(scaled_positions, 1.0)
+
+    # Normalize numerical noise at periodic boundaries.
+    close_to_zero = np.isclose(
+        scaled_positions,
+        0.0,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    close_to_one = np.isclose(
+        scaled_positions,
+        1.0,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    scaled_positions[close_to_zero | close_to_one] = 0.0
+
+    conventional_cell = (
+        conventional_lattice,
+        scaled_positions,
+        unit_cell.types(),
+    )
+
+    primitive_cell = spg.find_primitive(conventional_cell)
+    if primitive_cell is None:
+        raise GBManipulatorValueError(
+            "Could not identify a primitive cell for soft-mode q-point generation."
+        )
+
+    mesh = np.full(3, mesh_size, dtype=np.intc)
+
+    mapping, grid = spg.get_ir_reciprocal_mesh(
+        mesh,
+        primitive_cell,
+    )
+
+    # The grid contains every mesh point. The unique values in mapping are indices of
+    # the irreducible representatives.
+    ir_indices = np.unique(mapping)
+    q_fractional = (
+        np.asarray(grid[ir_indices], dtype=np.float64)
+        / mesh.astype(np.float64)
+    )
+
+    primitive_lattice = np.asarray(
+        primitive_cell[0],
+        dtype=np.float64,
+    )
+
+    # Lattice vectors are stored as rows. The reciprocal basis is therefore 2*pi*A^(-T),
+    # giving Cartesian q vectors in inverse Angstroms.
+    reciprocal_lattice = (
+        2.0
+        * np.pi
+        * np.linalg.inv(primitive_lattice).T
+    )
+    q_cartesian = q_fractional @ reciprocal_lattice
+
+    magnitudes = np.linalg.norm(q_cartesian, axis=1)
+    order = np.argsort(magnitudes, kind="stable")
+    return q_cartesian[order]
+
+
 # @jit(nopython=True, cache=True)
 def _calculate_bond_hardness(parent, neighbor_list, ideal_bonds):
     atoms = parent.whole_system
@@ -3314,30 +3408,16 @@ class GBManipulator:
         for neighbor in neighbor_list:
             neighbor_list_typed.append(List(neighbor))
         hardness = _calculate_bond_hardness(parent, neighbor_list, ideal_bonds)
-        # spglib defines a structure by a tuple of (basis_vectors, atom_positions,
-        # atom_types). basis_vectors is a 3x3 array of the basis vectors of the crystal,
-        # atom_positions is the positions of the atoms in the unit cell in fractional
-        # coordinates, and atom_types is the type of each atom indicated in
-        # atom_positions.
-        structure = (
-            parent.unit_cell.primitive,
-            parent.unit_cell.positions(),
-            parent.unit_cell.types()
+        q_points = _soft_mode_q_points(
+            parent.unit_cell,
+            mesh_size,
         )
-        mesh = [mesh_size, mesh_size, mesh_size]  # mesh of q vectors
-        # Gets all symmetrically distinct q vectors, including time reversal symmetry
-        _, grid = spg.get_ir_reciprocal_mesh(mesh, structure)
-        unique_q_points = grid / np.array(mesh, dtype=float)
 
-        # sort the q vectors by magnitude
-        q_magnitudes = np.linalg.norm(unique_q_points, axis=1)
-        sorted_indices = np.argsort(q_magnitudes)
-        unique_q_points = unique_q_points[sorted_indices]
-
-        if len(unique_q_points) < num_q:
+        if len(q_points) < num_q:
             warnings.warn(
-                f"Fewer q_points generated than desired: {len(unique_q_points)} < "
-                f"{num_q}. Recommended to increase mesh size.")
+                f"Fewer q_points generated than desired: {len(q_points)} < {num_q}. "
+                "Recommended to increase mesh size."
+            )
 
         n_atoms = len(parent.gb_indices)
 
@@ -3350,7 +3430,7 @@ class GBManipulator:
 
         # For each unique q point, calculate the dynamical matrix and the associated
         # eigenvalues and eigenvectors.
-        for i, q_vec in enumerate(unique_q_points[:num_q]):
+        for i, q_vec in enumerate(q_points[:num_q]):
             dynamical_matrix = _calculate_dynamical_matrix(
                 hardness, positions, parent.gb_indices, neighbor_list_typed, q_vec)
             if 3 * n_atoms <= sparse_threshold:
@@ -3379,7 +3459,7 @@ class GBManipulator:
         # create the N child structures. We first filter out the frequencies at or near
         # 0, as these are associated with translational or rotational (acoustic) modes
 
-        # TODO: Look into combining the eigenvectors of the multiple q points. AiVA suggests that weighted averages or using principle component analysis might work well in this regard.
+        # TODO: Look into combining the eigenvectors of the multiple q points. Weighted averages or using principle component analysis might work well in this regard.
         non_acoustic_indices = np.where(~np.isclose(freqs, 0))
 
         # TODO: Look into further filtering this so we only consider unique displacements. Do equivalent eigenvalues results in the same eigenvectors for different q values? What about within the same q vector?

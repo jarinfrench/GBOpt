@@ -34,13 +34,12 @@ from GBOpt.GBManipulator import (
     _ParentsProxy,
 )
 from GBOpt.GrainOwnership import LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL, GrainOwnership
-
+from GBOpt.UnitCell import UnitCell
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:File-backed Parent initialization without explicit grain ownership is "
     "deprecated.*:DeprecationWarning"
 )
-from GBOpt.UnitCell import UnitCell
 
 _TEST_DIR = Path(__file__).resolve().parent
 _INPUT_DIR = _TEST_DIR / "inputs"
@@ -1659,6 +1658,175 @@ def test_explicit_ownership_parent_proxy_replacement_resets_candidate_labels(tmp
     assert np.array_equal(
         manipulator.candidate_grain_labels,
         replacement_labels,
+    )
+
+
+def test_displace_along_soft_modes_uses_irreducible_cartesian_q_points(monkeypatch):
+    a0 = 4.81
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure(
+        "rocksalt",
+        a0,
+        ("Na", "Cl"),
+    )
+
+    atoms = np.array(
+        [
+            ("Na", 0.0, 0.0, 0.0),
+            ("Cl", a0 / 2.0, 0.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+
+    parent = SimpleNamespace(
+        unit_cell=unit_cell,
+        whole_system=atoms,
+        gb_atoms=atoms,
+        gb_indices=np.array([0, 1], dtype=np.intp),
+        box_dims=np.array(
+            [
+                [0.0, a0],
+                [0.0, a0],
+                [0.0, a0],
+            ]
+        ),
+        gb_thickness=a0,
+    )
+
+    manipulator = object.__new__(GBManipulator)
+    manipulator._GBManipulator__one_parent = True
+    manipulator._GBManipulator__parents = [parent, None]
+
+    gbmanipulator_module = importlib.import_module(
+        "GBOpt.GBManipulator"
+    )
+
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_create_neighbor_list",
+        lambda _cutoff, _positions: [[1], [0]],
+    )
+
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_calculate_bond_hardness",
+        lambda _parent, _neighbors, _bonds: np.ones((2, 2)),
+    )
+
+    captured_q = []
+
+    def capture_q(
+        _hardness,
+        _positions,
+        _gb_indices,
+        _neighbor_list,
+        q_vec,
+    ):
+        captured_q.append(np.asarray(q_vec, dtype=float).copy())
+
+        # Give the displacement machinery a deterministic nonzero spectrum.
+        return np.diag(
+            np.arange(-6.0, 0.0)
+        ).astype(np.complex128)
+
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_calculate_dynamical_matrix",
+        capture_q,
+    )
+
+    # A 2x2x2 primitive rocksalt mesh has three irreducible q-point
+    # representatives with time reversal enabled.
+    with pytest.warns(UserWarning, match="Fewer q_points"):
+        manipulator.displace_along_soft_modes(
+            mesh_size=2,
+            num_q=4,
+            num_children=1,
+        )
+
+    assert len(captured_q) == 3
+
+    q_magnitudes = np.linalg.norm(
+        np.asarray(captured_q),
+        axis=1,
+    )
+
+    np.testing.assert_allclose(
+        q_magnitudes,
+        [
+            0.0,
+            np.sqrt(3.0) * np.pi / a0,
+            2.0 * np.pi / a0,
+        ],
+    )
+
+
+def test_soft_mode_q_points_sort_by_cartesian_reciprocal_magnitude(monkeypatch):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure(
+        "sc",
+        1.0,
+        "H",
+    )
+
+    gbmanipulator_module = importlib.import_module(
+        "GBOpt.GBManipulator"
+    )
+
+    primitive_cell = (
+        np.diag([10.0, 1.0, 1.0]),
+        np.array([[0.0, 0.0, 0.0]]),
+        np.array([1]),
+    )
+
+    # Fractional magnitudes:
+    #
+    # [0, 1/4, 0] -> 0.25
+    # [1/2, 0, 0] -> 0.50
+    #
+    # Physical magnitudes for this anisotropic lattice:
+    #
+    # [1/2, 0, 0] -> pi / 10
+    # [0, 1/4, 0] -> pi / 2
+    #
+    # Thus sorting fractional coordinates gives the opposite ordering
+    # from sorting physical reciprocal vectors.
+    mapping = np.array([0, 1, 2], dtype=np.intc)
+    grid = np.array(
+        [
+            [0, 0, 0],
+            [0, 1, 0],
+            [2, 0, 0],
+        ],
+        dtype=np.intc,
+    )
+
+    monkeypatch.setattr(
+        gbmanipulator_module.spg,
+        "find_primitive",
+        lambda _cell: primitive_cell,
+    )
+
+    monkeypatch.setattr(
+        gbmanipulator_module.spg,
+        "get_ir_reciprocal_mesh",
+        lambda _mesh, _cell: (mapping, grid),
+    )
+
+    q_points = gbmanipulator_module._soft_mode_q_points(
+        unit_cell,
+        mesh_size=4,
+    )
+
+    np.testing.assert_allclose(
+        q_points,
+        np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [np.pi / 10.0, 0.0, 0.0],
+                [0.0, np.pi / 2.0, 0.0],
+            ]
+        ),
     )
 
 
