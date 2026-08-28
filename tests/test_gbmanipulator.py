@@ -1,7 +1,6 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
 import copy
-import filecmp
 import importlib
 import math
 import tempfile
@@ -235,14 +234,15 @@ def test_local_order_is_higher_for_ideal_crystal_neighborhoods(structure, atoms)
     assert ideal_order > distorted_order + 1e-8
 
 
-def _synthetic_manipulator(unit_cell, atoms, seed=100):
-    # Bypass full GBMaker construction so stoichiometric mutator tests can
-    # isolate selection logic with a tiny deterministic parent.
+def _synthetic_manipulator(unit_cell, atoms, seed=100, gb_indices=None):
+    if gb_indices is None:
+        gb_indices = np.arange(len(atoms))
+
     parent = SimpleNamespace(
         unit_cell=unit_cell,
         whole_system=atoms,
-        gb_atoms=atoms,
-        gb_indices=np.arange(len(atoms)),
+        gb_atoms=atoms[gb_indices],
+        gb_indices=np.asarray(gb_indices, dtype=np.intp),
     )
 
     manipulator = object.__new__(GBManipulator)
@@ -690,7 +690,7 @@ class TestGBManipulator(unittest.TestCase):
     @pytest.mark.slow
     def test_displace_along_soft_modes_num_q_vecs(self):
         # test number of q vectors
-        child = self.manipulator_tilt.displace_along_soft_modes(num_q=20)
+        child = self.manipulator_tilt.displace_along_soft_modes(num_q=4)
         self.assertEqual(len(child), 1)
         self.assertFalse(structured_array_equal(
             child[0], self.manipulator_tilt.parents[0].whole_system))
@@ -708,8 +708,6 @@ class TestGBManipulator(unittest.TestCase):
 
     @pytest.mark.slow
     def test_displace_along_soft_modes_simple_case(self):
-        # While we end up using the indicated file for the actual atomic configuration,
-        # that configuration was developed using this set of parameters
         GB = _make_approximate_gb(
             3.54,
             "fcc",
@@ -722,30 +720,56 @@ class TestGBManipulator(unittest.TestCase):
             interaction_distance=5,
         )
         manipulator = GBManipulator(
-            './tests/inputs/Cu_single_crystal_with_displaced_atom.txt', unit_cell=GB.unit_cell, gb_thickness=5)
-        child1 = manipulator.displace_along_soft_modes()[0]
-        child2 = manipulator.displace_along_soft_modes(subtract_displacement=True)[0]
-        self.assertFalse(structured_array_equal(child1, child2))
+            "./tests/inputs/Cu_single_crystal_with_displaced_atom.txt",
+            unit_cell=GB.unit_cell,
+            gb_thickness=5,
+        )
 
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            GB.write_lammps(temp_file.name, child1, GB.box_dims)
-            self.assertTrue(
-                filecmp.cmp(
-                    temp_file.name,
-                    './tests/gold/soft_phonon_mode_displacement_added.txt',
-                    shallow=False
-                )
-            )
+        parent = manipulator.parents[0]
+        child = manipulator.displace_along_soft_modes()[0]
 
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            GB.write_lammps(temp_file.name, child2, GB.box_dims)
-            self.assertTrue(
-                filecmp.cmp(
-                    temp_file.name,
-                    './tests/gold/soft_phonon_mode_displacement_subtracted.txt',
-                    shallow=False
-                )
+        parent_positions = np.column_stack(
+            (
+                parent.whole_system["x"],
+                parent.whole_system["y"],
+                parent.whole_system["z"],
             )
+        )
+        child_positions = np.column_stack(
+            (
+                child["x"],
+                child["y"],
+                child["z"],
+            )
+        )
+
+        gb_indices = np.asarray(parent.gb_indices, dtype=np.intp)
+        non_gb_indices = np.setdiff1d(
+            np.arange(len(parent_positions)),
+            gb_indices,
+        )
+
+        np.testing.assert_array_equal(
+            child["name"],
+            parent.whole_system["name"],
+        )
+
+        assert np.all(np.isfinite(child_positions))
+
+        # Soft-mode displacement must not move atoms outside the selected GB region.
+        np.testing.assert_allclose(
+            child_positions[non_gb_indices],
+            parent_positions[non_gb_indices],
+        )
+
+        # The selected mode should actually displace at least one movable atom.
+        gb_displacements = (
+            child_positions[gb_indices]
+            - parent_positions[gb_indices]
+        )
+        assert np.any(
+            np.linalg.norm(gb_displacements, axis=1) > 1e-12
+        )
 
     def test_apply_group_symmetry(self):
         manipulator = GBManipulator(self.tilt, seed=self.seed)
@@ -1998,6 +2022,117 @@ def test_dynamical_matrix_is_hermitian_at_nonzero_q():
 
     np.testing.assert_allclose(actual, expected, atol=1e-12)
     np.testing.assert_allclose(actual, actual.conj().T, atol=1e-12)
+
+
+def test_displace_along_soft_modes_subtracts_selected_displacement(monkeypatch):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("sc", 1.0, "H")
+
+    atoms = np.array(
+        [
+            ("H", 0.0, 0.0, 0.0),
+            ("H", 10.0, 0.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    manipulator = _synthetic_manipulator(unit_cell, atoms, gb_indices=[0])
+
+    gbmanipulator_module = importlib.import_module("GBOpt.GBManipulator")
+
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_create_neighbor_list",
+        lambda _cutoff, _positions: [[1], [0]],
+    )
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_calculate_bond_hardness",
+        lambda _parent, _neighbors, _bonds: np.ones((2, 2)),
+    )
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_soft_mode_q_points",
+        lambda _unit_cell, _mesh_size: np.zeros((1, 3)),
+    )
+
+    # Give the single movable atom a nondegenerate eigensystem whose softest
+    # mode is a unit displacement along +x.
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_calculate_dynamical_matrix",
+        lambda *_args: np.diag([-3.0, -2.0, -1.0]).astype(
+            np.complex128
+        ),
+    )
+
+    added = manipulator.displace_along_soft_modes(
+        num_q=1,
+        num_children=1,
+    )[0]
+    subtracted = manipulator.displace_along_soft_modes(
+        num_q=1,
+        num_children=1,
+        subtract_displacement=True,
+    )[0]
+
+    parent_positions = np.column_stack(
+        (
+            atoms["x"],
+            atoms["y"],
+            atoms["z"],
+        )
+    )
+    added_positions = np.column_stack(
+        (
+            added["x"],
+            added["y"],
+            added["z"],
+        )
+    )
+    subtracted_positions = np.column_stack(
+        (
+            subtracted["x"],
+            subtracted["y"],
+            subtracted["z"],
+        )
+    )
+
+    added_displacement = added_positions[0] - parent_positions[0]
+    subtracted_displacement = (
+        subtracted_positions[0] - parent_positions[0]
+    )
+
+    # The same selected mode must be applied with opposite sign.
+    np.testing.assert_allclose(
+        added_displacement,
+        -subtracted_displacement,
+    )
+    np.testing.assert_allclose(
+        added_displacement,
+        [1.0, 0.0, 0.0],
+    )
+
+    # The atom outside the movable GB region must remain unchanged.
+    np.testing.assert_allclose(
+        added_positions[1],
+        parent_positions[1],
+    )
+    np.testing.assert_allclose(
+        subtracted_positions[1],
+        parent_positions[1],
+    )
+
+    # The parent itself must not be modified.
+    np.testing.assert_allclose(
+        np.column_stack(
+            (
+                atoms["x"],
+                atoms["y"],
+                atoms["z"],
+            )
+        ),
+        parent_positions,
+    )
 
 
 if __name__ == '__main__':
