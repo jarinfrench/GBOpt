@@ -488,8 +488,6 @@ class UnitCell:
                 "the validated rational-basis specification has no matching structure "
                 f"initialization branch: {structure!r}"
             )
-        for i in range(len(unit_cell)):
-            unit_cell[i]["position"] *= a0
         self.__radius *= self.__a0
         self.__primitive *= self.__a0 / 2.0
         self.__conventional *= self.__a0
@@ -696,10 +694,17 @@ class UnitCell:
 
     def asarray(self) -> np.ndarray:
         """UnitCell as a structured numpy array with the atom type and position."""
-        return np.array(
-            [tuple(atom["name", "x", "y", "z"]) for atom in self.__unit_cell],
-            dtype=Atom.atom_dtype
+        array = np.array(
+            [
+                tuple(atom["name", "x", "y", "z"])
+                for atom in self.__unit_cell
+            ],
+            dtype=Atom.atom_dtype,
         )
+        array["x"] *= self.__a0
+        array["y"] *= self.__a0
+        array["z"] *= self.__a0
+        return array
 
     @property
     def ideal_bond_lengths(self) -> dict:
@@ -728,7 +733,8 @@ class UnitCell:
         if not isinstance(self.__ratio, dict) or not self.__ratio:
             raise UnitCellValueError("unit-cell formula ratio must be nonempty")
 
-        inverse = {int(type_id): species for species, type_id in self.__type_map.items()}
+        inverse = {int(type_id): species for species,
+                   type_id in self.__type_map.items()}
         values: list[tuple[str, int]] = []
         divisor = 0
         for type_id, coefficient in self.__ratio.items():
