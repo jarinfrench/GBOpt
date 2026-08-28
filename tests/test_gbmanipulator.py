@@ -1830,5 +1830,59 @@ def test_soft_mode_q_points_sort_by_cartesian_reciprocal_magnitude(monkeypatch):
     )
 
 
+def test_displace_along_soft_modes_uses_three_dimensional_neighbor_positions(
+    monkeypatch,
+):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("rocksalt", 4.0, ("Na", "Cl"))
+
+    atoms = np.array(
+        [
+            ("Na", 0.0, 0.0, 0.0),
+            ("Cl", 10.0, 0.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    manipulator = _synthetic_manipulator(unit_cell, atoms)
+
+    gbmanipulator_module = importlib.import_module("GBOpt.GBManipulator")
+
+    captured_positions = {}
+
+    class NeighborListCaptured(Exception):
+        pass
+
+    def capture_neighbor_positions(cutoff, positions):
+        positions = np.asarray(positions, dtype=float)
+        captured_positions["positions"] = positions
+        captured_positions["distance"] = np.linalg.norm(
+            positions[1] - positions[0]
+        )
+        captured_positions["cutoff"] = cutoff
+        raise NeighborListCaptured
+
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_create_neighbor_list",
+        capture_neighbor_positions,
+    )
+
+    with pytest.raises(NeighborListCaptured):
+        manipulator.displace_along_soft_modes()
+
+    np.testing.assert_allclose(
+        captured_positions["positions"],
+        np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+            ]
+        ),
+    )
+
+    assert captured_positions["distance"] == pytest.approx(10.0)
+    assert captured_positions["distance"] > captured_positions["cutoff"]
+
+
 if __name__ == '__main__':
     unittest.main()

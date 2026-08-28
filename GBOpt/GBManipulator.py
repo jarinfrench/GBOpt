@@ -3403,7 +3403,7 @@ class GBManipulator:
         if not threshold:
             threshold = 1.5 * max(ideal_bonds.values())
         cutoff = 1.5 * max(ideal_bonds.values())
-        neighbor_list = _create_neighbor_list(cutoff, positions[:, 1:])
+        neighbor_list = _create_neighbor_list(cutoff, positions)
         neighbor_list_typed = List()
         for neighbor in neighbor_list:
             neighbor_list_typed.append(List(neighbor))
