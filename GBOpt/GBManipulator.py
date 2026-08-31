@@ -6,6 +6,8 @@ This module owns in-memory structural transformations. External file ownership,
 calculator evaluation, and optimizer policy do not belong here.
 """
 
+from __future__ import annotations
+
 import copy as copy_module
 import multiprocessing as mp
 import warnings
@@ -19,7 +21,7 @@ import scipy.sparse as sps
 import spglib as spg
 from numba import float64, jit, prange
 from numba.typed import List
-from scipy.spatial import ConvexHull, Delaunay, KDTree
+from scipy.spatial import Delaunay, KDTree, QhullError
 
 from GBOpt._candidate_admissibility import (
     CandidateAdmissibilityError,
@@ -1979,6 +1981,357 @@ def _create_periodic_neighbor_list(
     return neighbor_indices, neighbor_distances
 
 
+def _tile_periodic_positions_once(
+    positions: np.ndarray,
+    box_dims: np.ndarray,
+    periodic: tuple[bool, bool, bool],
+) -> np.ndarray:
+    """Tile positions by one adjacent image along each periodic axis.
+
+    :param positions: Cartesian positions with shape ``(N, 3)``.
+    :param box_dims: Simulation-box bounds with shape ``(3, 2)``.
+    :param periodic: Periodicity along x, y, and z.
+    :return: Positions in the primary cell and its required adjacent images.
+    """
+    positions = np.asarray(positions, dtype=float)
+    box_dims = np.asarray(box_dims, dtype=float)
+    widths = box_dims[:, 1] - box_dims[:, 0]
+
+    image_ranges = [(-1, 0, 1) if is_periodic else (0,) for is_periodic in periodic]
+    offsets = np.asarray(list(product(*image_ranges)), dtype=np.intp)
+    translations = offsets * widths
+
+    return (
+        positions[np.newaxis, :, :] + translations[:, np.newaxis, :]
+    ).reshape(-1, 3)
+
+
+def _wrap_periodic_positions(
+    positions: np.ndarray,
+    box_dims: np.ndarray,
+    periodic: tuple[bool, bool, bool],
+    tolerance: float,
+) -> np.ndarray:
+    """Wrap Cartesian positions into the primary cell along periodic axes.
+
+    :param positions: Cartesian positions with shape ``(N, 3)``.
+    :param box_dims: Simulation-box bounds with shape ``(3, 2)``.
+    :param periodic: Periodicity along x, y, and z.
+    :param tolerance: Coordinate tolerance in angstroms.
+    :return: A wrapped copy of the positions.
+    """
+    wrapped = np.array(positions, dtype=float, copy=True)
+    box_dims = np.asarray(box_dims, dtype=float)
+
+    for axis, is_periodic in enumerate(periodic):
+        if not is_periodic:
+            continue
+
+        lower, upper = box_dims[axis]
+        width = upper - lower
+        wrapped[:, axis] = np.mod(wrapped[:, axis] - lower, width) + lower
+
+        near_upper = upper - wrapped[:, axis] <= tolerance
+        wrapped[near_upper, axis] = lower
+
+    return wrapped
+
+
+def _minimum_periodic_distances(
+    query_positions: np.ndarray,
+    reference_positions: np.ndarray,
+    box_dims: np.ndarray,
+    periodic: tuple[bool, bool, bool],
+    tolerance: float,
+) -> np.ndarray:
+    """Return minimum-image distance from each query to any reference position.
+
+    :param query_positions: Cartesian query positions with shape ``(N, 3)``.
+    :param reference_positions: Cartesian reference positions with shape ``(M, 3)``.
+    :param box_dims: Simulation-box bounds with shape ``(3, 2)``.
+    :param periodic: Periodicity along x, y, and z.
+    :param tolerance: Coordinate tolerance in angstroms.
+    :return: Minimum distance for each query position.
+    """
+    query_positions = np.asarray(query_positions, dtype=float)
+    reference_positions = np.asarray(reference_positions, dtype=float)
+
+    if len(query_positions) == 0:
+        return np.empty(0, dtype=float)
+
+    wrapped_queries = _wrap_periodic_positions(
+        query_positions, box_dims, periodic, tolerance
+    )
+    wrapped_references = _wrap_periodic_positions(
+        reference_positions, box_dims, periodic, tolerance
+    )
+    tiled_references = _tile_periodic_positions_once(
+        wrapped_references, box_dims, periodic
+    )
+
+    distances, _ = KDTree(tiled_references).query(wrapped_queries, k=1)
+    return np.asarray(distances, dtype=float)
+
+
+def _deduplicate_positions(positions: np.ndarray, tolerance: float) -> np.ndarray:
+    """Return deterministically ordered positions unique within a tolerance.
+
+    :param positions: Cartesian positions with shape ``(N, 3)``.
+    :param tolerance: Coordinate equivalence tolerance in angstroms.
+    :return: Deterministically ordered unique positions.
+    """
+    positions = np.asarray(positions, dtype=float)
+
+    if len(positions) == 0:
+        return positions.copy()
+
+    order = np.lexsort((positions[:, 2], positions[:, 1], positions[:, 0]))
+    positions = positions[order]
+
+    if tolerance <= 0.0:
+        return np.unique(positions, axis=0)
+
+    keys = np.rint(positions / tolerance)
+    _, first_indices = np.unique(keys, axis=0, return_index=True)
+
+    return positions[np.sort(first_indices)]
+
+
+def _tetrahedron_circumcenters(tetrahedra: np.ndarray) -> np.ndarray:
+    """Calculate Cartesian circumcenters of nondegenerate tetrahedra.
+
+    :param tetrahedra: Tetrahedron vertices with shape ``(N, 4, 3)``.
+    :return: Cartesian circumcenters with shape ``(N, 3)``.
+    :raises np.linalg.LinAlgError: If a tetrahedron is singular.
+    """
+    tetrahedra = np.asarray(tetrahedra, dtype=float)
+
+    origins = tetrahedra[:, 0]
+    edges = tetrahedra[:, 1:] - origins[:, np.newaxis, :]
+    rhs = np.einsum("ijk,ijk->ij", edges, edges)
+
+    relative_centers = np.linalg.solve(2.0 * edges, rhs[..., np.newaxis])[..., 0]
+
+    return origins + relative_centers
+
+
+def _delaunay_insertion_sites(
+    gb_positions: np.ndarray,
+    reference_positions: np.ndarray,
+    atom_radius: float,
+    box_dims: np.ndarray,
+    periodic: tuple[bool, bool, bool],
+    coordinate_tolerance: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate insertion sites from periodic Delaunay tetrahedra.
+
+    Candidate sites are circumcenters of nondegenerate tetrahedra. Only circumcenters
+    lying in the primary GB insertion domain are retained, and candidates must have
+    sufficient minimum-image clearance from every atom in the full structure.
+
+    :param gb_positions: Positions used to construct the GB triangulation.
+    :param reference_positions: Positions of all atoms used for clearance checking.
+    :param atom_radius: Required minimum atom-site distance in angstroms.
+    :param box_dims: Simulation-box bounds with shape ``(3, 2)``.
+    :param periodic: Periodicity along x, y, and z.
+    :param coordinate_tolerance: Coordinate tolerance in angstroms.
+    :return: Candidate insertion sites and their normalized probabilities.
+    :raises GBManipulatorValueError: If no valid insertion sites can be generated.
+    """
+    gb_positions = np.asarray(gb_positions, dtype=float)
+    box_dims = np.asarray(box_dims, dtype=float)
+
+    tiled_positions = _tile_periodic_positions_once(
+        gb_positions, box_dims, periodic
+    )
+
+    try:
+        triangulation = Delaunay(tiled_positions)
+    except QhullError as exc:
+        raise GBManipulatorValueError(
+            "Unable to construct Delaunay insertion-site triangulation."
+        ) from exc
+
+    tetrahedra = tiled_positions[triangulation.simplices]
+
+    origins = tetrahedra[:, 0]
+    edges = tetrahedra[:, 1:] - origins[:, np.newaxis, :]
+    volumes = np.abs(np.linalg.det(edges)) / 6.0
+
+    positive_volumes = volumes[volumes > 0.0]
+    if len(positive_volumes) == 0:
+        raise GBManipulatorValueError(
+            "Delaunay triangulation contains no nondegenerate tetrahedra."
+        )
+
+    # Retain the existing relative small-volume rejection policy, but calculate
+    # volumes from the actual periodic-image tetrahedra.
+    volume_threshold = 1e-3 * np.median(positive_volumes)
+    valid_tetrahedra = tetrahedra[volumes > volume_threshold]
+
+    try:
+        circumcenters = _tetrahedron_circumcenters(valid_tetrahedra)
+    except np.linalg.LinAlgError as exc:
+        raise GBManipulatorValueError(
+            "Unable to calculate Delaunay circumcenters."
+        ) from exc
+
+    finite_mask = np.all(np.isfinite(circumcenters), axis=1)
+    circumcenters = circumcenters[finite_mask]
+
+    if len(circumcenters) == 0:
+        raise GBManipulatorValueError(
+            "Delaunay triangulation produced no finite circumcenters."
+        )
+
+    # The GB atom extent defines the nonperiodic insertion domain. Explicit box bounds
+    # define periodic dimensions.
+    site_bounds = np.column_stack(
+        (np.min(gb_positions, axis=0), np.max(gb_positions, axis=0))
+    )
+    for axis, is_periodic in enumerate(periodic):
+        if is_periodic:
+            site_bounds[axis] = box_dims[axis]
+
+    # Select the representative whose unwrapped circumcenter lies in the primary domain.
+    # Do this before wrapping so outer tiled-hull tetrahedra do not map back into the
+    # primary cell as artificial candidates.
+    in_bounds = np.ones(len(circumcenters), dtype=bool)
+
+    for axis, is_periodic in enumerate(periodic):
+        lower, upper = site_bounds[axis]
+
+        if is_periodic:
+            in_bounds &= circumcenters[:, axis] >= lower - coordinate_tolerance
+            in_bounds &= circumcenters[:, axis] < upper + coordinate_tolerance
+        else:
+            in_bounds &= circumcenters[:, axis] >= lower - coordinate_tolerance
+            in_bounds &= circumcenters[:, axis] <= upper + coordinate_tolerance
+
+    circumcenters = circumcenters[in_bounds]
+    circumcenters = _wrap_periodic_positions(
+        circumcenters, box_dims, periodic, coordinate_tolerance
+    )
+    circumcenters = _deduplicate_positions(
+        circumcenters, coordinate_tolerance
+    )
+
+    if len(circumcenters) == 0:
+        raise GBManipulatorValueError(
+            "Delaunay triangulation produced no insertion sites in the GB region."
+        )
+
+    distances = _minimum_periodic_distances(
+        circumcenters,
+        reference_positions,
+        box_dims,
+        periodic,
+        coordinate_tolerance,
+    )
+
+    clearances = distances - atom_radius
+    valid_sites = clearances > coordinate_tolerance
+
+    sites = circumcenters[valid_sites]
+    clearances = clearances[valid_sites]
+
+    if len(sites) == 0:
+        raise GBManipulatorValueError(
+            "No Delaunay insertion sites have sufficient atomic clearance."
+        )
+
+    weight_sum = np.sum(clearances)
+    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+        raise GBManipulatorValueError(
+            "Unable to construct Delaunay insertion-site probabilities."
+        )
+
+    probabilities = clearances / weight_sum
+    return sites, probabilities
+
+
+def _grid_insertion_sites(
+    gb_positions: np.ndarray,
+    reference_positions: np.ndarray,
+    atom_radius: float,
+    box_dims: np.ndarray,
+    periodic: tuple[bool, bool, bool],
+    coordinate_tolerance: float,
+    spacing: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate insertion sites on a regular Cartesian grid.
+
+    :param gb_positions: Positions defining the GB insertion region.
+    :param reference_positions: Positions of all atoms used for clearance checking.
+    :param atom_radius: Required minimum atom-site distance in angstroms.
+    :param box_dims: Simulation-box bounds with shape ``(3, 2)``.
+    :param periodic: Periodicity along x, y, and z.
+    :param coordinate_tolerance: Coordinate tolerance in angstroms.
+    :param spacing: Grid spacing in angstroms.
+    :return: Candidate insertion sites and their normalized probabilities.
+    :raises GBManipulatorValueError: If no valid insertion sites can be generated.
+    """
+    gb_positions = np.asarray(gb_positions, dtype=float)
+    box_dims = np.asarray(box_dims, dtype=float)
+
+    site_bounds = np.column_stack(
+        (np.min(gb_positions, axis=0), np.max(gb_positions, axis=0))
+    )
+    for axis, is_periodic in enumerate(periodic):
+        if is_periodic:
+            site_bounds[axis] = box_dims[axis]
+
+    axes = []
+
+    for axis, is_periodic in enumerate(periodic):
+        lower, upper = site_bounds[axis]
+        width = upper - lower
+
+        count = int(np.floor(width / spacing))
+        values = lower + spacing * np.arange(count + 1, dtype=float)
+
+        if is_periodic:
+            values = values[values < upper - coordinate_tolerance]
+        else:
+            values = values[values <= upper + coordinate_tolerance]
+
+        axes.append(values)
+
+    if any(len(values) == 0 for values in axes):
+        raise GBManipulatorValueError(
+            "GB insertion region is too small for the configured grid spacing."
+        )
+
+    X, Y, Z = np.meshgrid(*axes, indexing="ij")
+    sites = np.column_stack((X.ravel(), Y.ravel(), Z.ravel()))
+
+    distances = _minimum_periodic_distances(
+        sites,
+        reference_positions,
+        box_dims,
+        periodic,
+        coordinate_tolerance,
+    )
+
+    valid_sites = distances >= atom_radius - coordinate_tolerance
+    sites = sites[valid_sites]
+    distances = distances[valid_sites]
+
+    if len(sites) == 0:
+        raise GBManipulatorValueError(
+            "No grid insertion sites have sufficient atomic clearance."
+        )
+
+    weight_sum = np.sum(distances)
+    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+        raise GBManipulatorValueError(
+            "Unable to construct grid insertion-site probabilities."
+        )
+
+    probabilities = distances / weight_sum
+    return sites, probabilities
+
+
 # @jit(nopython=True, cache=True)
 def _calculate_bond_hardness(parent, neighbor_list, ideal_bonds):
     atoms = parent.whole_system
@@ -3252,160 +3605,6 @@ class GBManipulator:
             specified.
         :return: Atom positions after atom insertion.
         """
-        def Delaunay_approach(
-            gb_atoms: np.ndarray,
-            atom_radius: float,
-            num_to_insert: int
-        ) -> np.ndarray:
-            """
-            Delaunay triangulation approach for inserting atoms. Potential insertion
-            sites are the circumcenters of the tetrahedra.
-
-            :param gb_atoms: Array of atom positions where we are considering inserting
-                new atoms.
-            :param atom_radius: The radius of an atom.
-            :param num_to_insert: The number of atoms to insert.
-            :return: The sites at which new atoms are inserted.
-            """
-            # First we need to duplicate the gb_atoms in the y and z directions to
-            # account for PBCs.
-            min_bounds = np.min(gb_atoms, axis=0)
-            max_bounds = np.max(gb_atoms, axis=0)
-            Lx, Ly, Lz = max_bounds - min_bounds
-            tiles = [(dy, dz) for dy in [-1, 0, 1] for dz in [-1, 0, 1]]
-            replicas = []
-            original_indices = []
-            for dy, dz in tiles:
-                shift = np.zeros_like(gb_atoms)
-                shift[:, 1] = dy * Ly
-                shift[:, 2] = dz * Lz
-                replicas.append(gb_atoms + shift)
-                original_indices.extend(np.arange(len(gb_atoms)))
-            tiled = np.vstack(replicas)
-            original_indices = np.array(original_indices)
-
-            # Delaunay triangulation approach
-            tri = Delaunay(tiled)
-            # ijk is for the 3x3 transformation matrix triangulation.transform[:, :3, :]
-            # ik is for the offset vector triangulation.transform[:, 3, :], and ij is
-            # the resulting circumcenter coordinates
-            circumcenters = -np.einsum(
-                "ijk,ik->ij",
-                tri.transform[:, :3, :],
-                tri.transform[:, 3, :]
-            )
-            # Wrap circumcenters back into the original bounds
-            circumcenters[:, 1] = np.mod(
-                circumcenters[:, 1] - min_bounds[1], Ly) + min_bounds[1]
-            circumcenters[:, 2] = np.mod(
-                circumcenters[:, 2] - min_bounds[2], Lz) + min_bounds[2]
-
-            original_indices_simplices = original_indices[tri.simplices]
-
-            # Bounds check
-            in_bounds = np.all((circumcenters >= min_bounds) & (
-                circumcenters <= max_bounds), axis=1)
-            mask = in_bounds
-
-            # Volume check
-            # Calculating the volume may occasionally fail if the points are collinear,
-            # so we catch the warning so users are not concerned.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                simplices = gb_atoms[original_indices_simplices]
-                A, B, C, D = simplices[:, 0], simplices[:,
-                                                        1], simplices[:, 2], simplices[:, 3]
-                volumes = np.abs(
-                    np.einsum("ij,ij->i", np.cross(B - A, C - A), D - A)) / 6.0
-            volume_threshold = 1e-3
-            volume_mask = (volumes > volume_threshold * np.median(volumes)) & ~np.isnan(
-                circumcenters).any(axis=1)
-            mask &= volume_mask
-
-            # Convex hull check
-            hull_vertices = set(ConvexHull(gb_atoms).vertices)
-            simplex_mask = ~np.any(np.isin(tri.simplices, list(hull_vertices)), axis=1)
-            mask &= simplex_mask
-
-            valid_circumcenters = circumcenters[mask]
-            valid_simplices = original_indices_simplices[mask, 0]
-            sphere_radii = np.linalg.norm(
-                gb_atoms[valid_simplices] - valid_circumcenters, axis=1)
-            interstitial_radii = sphere_radii - atom_radius
-            interstitial_radii -= np.min(interstitial_radii)  # make everything >= 0
-            probabilities = interstitial_radii / np.sum(interstitial_radii)
-            probabilities = probabilities / np.sum(probabilities)  # normalize
-            assert abs(1 - np.sum(probabilities)
-                       ) < 1e-8, "Probabilities are not normalized!"
-            num_sites = len(circumcenters)
-
-            if num_to_insert is None:
-                num_to_insert = int(fill_fraction * num_sites)
-
-            if num_to_insert == 0:
-                warnings.warn("Calculated fraction of atoms to insert is 0: "
-                              f"int({fill_fraction}*{len(gb_atoms)}) = 0"
-                              )
-
-            return valid_circumcenters, probabilities
-
-        def grid_approach(
-            gb_atoms: np.ndarray,
-            atom_radius: float,
-            num_to_insert: int,
-        ) -> np.ndarray:
-            """
-            Grid approach for inserting atoms. Potential insertion sites are on a 1x1x1
-            Angstrom grid where sites must be at least *atom_radius* away.
-
-            :param gb_atoms: Array of atom positions where we are considering inserting
-                new atoms.
-            :param atom_radius: The radius of an atom.
-            :param num_to_insert: The number of atoms to insert.
-
-            :return: The sites at which new atoms are inserted.
-            """
-            # Grid approach
-            max_x, max_y, max_z = gb_atoms.max(axis=0)
-            min_x, min_y, min_z = gb_atoms.min(axis=0)
-            X, Y, Z = np.meshgrid(
-                np.arange(np.floor(min_x), np.ceil(max_x) + 1),
-                np.arange(np.floor(min_y), np.ceil(max_y) + 1),
-                np.arange(np.floor(min_z), np.ceil(max_z) + 1),
-                indexing="ij"
-            )
-            sites = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
-            GB_tree = KDTree(gb_atoms)
-            sites_tree = KDTree(sites)
-            indices_to_remove = GB_tree.query_ball_tree(sites_tree, atom_radius)
-            indices_to_remove = list(set(
-                [i for sublist in indices_to_remove for i in sublist]))
-            filtered_sites = np.delete(sites, indices_to_remove, axis=0)
-
-            distances, _ = GB_tree.query(filtered_sites, k=1)
-            probabilities = distances / np.sum(distances)
-            probabilities = probabilities / np.sum(probabilities)  # normalize
-            assert abs(1 - np.sum(probabilities)
-                       ) < 1e-8, "Probabilities are not normalized!"
-            num_sites = len(filtered_sites)
-
-            if num_to_insert is None:
-                num_to_insert = int(fill_fraction * num_sites)
-
-            if num_to_insert == 0:
-                warnings.warn("Calculated fraction of atoms to insert is 0: "
-                              f"int({fill_fraction}*{len(gb_atoms)}) = 0"
-                              )
-
-            return filtered_sites, probabilities
-
-            indices = self.__rng.choice(num_sites,
-                                        num_to_insert,
-                                        replace=False,
-                                        p=probabilities
-                                        )
-            return filtered_sites[indices]
-
             raise GBManipulatorValueError(
                 "fill_fraction or num_to_insert must be specified.")
 
@@ -3437,15 +3636,30 @@ class GBManipulator:
         if num_to_insert is None:
             num_to_insert = int(fill_fraction * len(gb_atoms))
 
-        if num_to_insert == 0:
-            warnings.warn(
-                "Calculated fraction of atoms to insert is 0 "
-                f"(int({fill_fraction}*{len(gb_atoms)}) = 0)"
+        periodic = (False, *parent.inplane_periodic)
+
+        # Calculate the insertion sites using the specified approach.
+        if method == "delaunay":
+            possible_sites, probabilities = _delaunay_insertion_sites(
+                gb_atoms[:, 1:],
+                atoms[:, 1:],
+                parent.unit_cell.radius,
+                parent.box_dims,
+                periodic,
+                parent.coordinate_tolerance,
             )
-            self.__set_candidate_labels(
-                getattr(parent, "grain_labels", None), len(parent.whole_system)
+        elif method == "grid":
+            possible_sites, probabilities = _grid_insertion_sites(
+                gb_atoms[:, 1:],
+                atoms[:, 1:],
+                parent.unit_cell.radius,
+                parent.box_dims,
+                periodic,
+                parent.coordinate_tolerance,
             )
-            return atoms
+        else:
+            raise GBManipulatorValueError(f"Unrecognized insert_atoms method: {method}")
+
 
         if len(type_map) == 1:
             num_to_insert_dict = {1: num_to_insert}
@@ -3466,16 +3680,6 @@ class GBManipulator:
             num_to_insert_dict = {
                 i + 1: int(values[i]) for i in range(len(type_map))
             }
-
-        # Calculate the insertion sites using the specified approach.
-        if method == "delaunay":
-            possible_sites, probabilities = Delaunay_approach(
-                gb_atoms[:, 1:], parent.unit_cell.radius, num_to_insert)
-        elif method == "grid":
-            possible_sites, probabilities = grid_approach(
-                gb_atoms[:, 1:], parent.unit_cell.radius, num_to_insert)
-        else:
-            raise GBManipulatorValueError(f"Unrecognized insert_atoms method: {method}")
 
         if keep_ratio and len(type_map) > 1:
             central_num_to_insert = num_to_insert_dict[central_type]

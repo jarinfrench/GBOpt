@@ -33,7 +33,12 @@ from GBOpt.GBManipulator import (
     _calculate_local_order,
     _create_periodic_image_neighborhoods,
     _create_periodic_neighbor_list,
+    _delaunay_insertion_sites,
+    _grid_insertion_sites,
+    _minimum_periodic_distances,
     _ParentsProxy,
+    _tetrahedron_circumcenters,
+    _tile_periodic_positions_once,
 )
 from GBOpt.GrainOwnership import LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL
 from GBOpt.UnitCell import UnitCell
@@ -242,9 +247,10 @@ def _synthetic_manipulator(
     *,
     box_dims=None,
     inplane_periodic=(False, False),
+    coordinate_tolerance=1e-8,
 ):
-    # Bypass full GBMaker construction so stoichiometric mutator tests can isolate
-    # selection logic with a tiny deterministic parent.
+    # Bypass full GBMaker construction so stoichiometric mutator tests can
+    # isolate selection logic with a tiny deterministic parent.
     if box_dims is None:
         box_dims = np.asarray(
             [
@@ -262,12 +268,13 @@ def _synthetic_manipulator(
         gb_indices=np.arange(len(atoms), dtype=np.intp),
         box_dims=np.asarray(box_dims, dtype=float),
         inplane_periodic=tuple(inplane_periodic),
+        coordinate_tolerance=float(coordinate_tolerance),
     )
 
     manipulator = object.__new__(GBManipulator)
     manipulator._GBManipulator__one_parent = True
     manipulator._GBManipulator__parents = [parent, None]
-    manipulator.rng = (np.random.default_rng(seed))
+    manipulator.rng = np.random.default_rng(seed)
 
     return manipulator
 
@@ -304,18 +311,6 @@ def test_insert_atoms_with_stoichiometry_uses_selected_neighbor_site_ids(monkeyp
             assert np.all(np.isin(result, choices))
             return result
 
-    class FakeKDTree:
-        def __init__(self, data):
-            self.data = np.asarray(data, dtype=float)
-
-        def query_ball_tree(self, other, _radius):
-            del other
-            return [[] for _ in range(len(self.data))]
-
-        def query(self, points, k=1):
-            del k
-            return np.ones(len(points)), np.zeros(len(points), dtype=int)
-
     recorded_sites = {}
 
     def sparse_site_neighbors(_cutoff, positions, center_indices, _box_dims, periodic):
@@ -325,9 +320,27 @@ def test_insert_atoms_with_stoichiometry_uses_selected_neighbor_site_ids(monkeyp
         return ([np.array([5, 7], dtype=np.intp)], [np.array([1.0, 1.0])])
 
     manipulator.rng = FixedChoiceRng()
+    possible_sites = np.array(
+        [
+            [0.0, 0.0, 0.5],
+            [0.0, 0.5, 0.5],
+            [0.0, 1.0, 0.5],
+            [0.0, 1.5, 0.5],
+            [0.0, 2.0, 0.5],
+            [0.0, 2.5, 0.5],
+            [0.0, 3.0, 0.5],
+            [0.0, 3.5, 0.5],
+        ],
+        dtype=float,
+    )
+    probabilities = np.full(len(possible_sites), 1.0 / len(possible_sites))
     module = importlib.import_module("GBOpt.GBManipulator")
 
-    monkeypatch.setattr(module, "KDTree", FakeKDTree)
+    monkeypatch.setattr(
+        module,
+        "_grid_insertion_sites",
+        lambda *_args, **_kwargs: (possible_sites, probabilities),
+    )
     monkeypatch.setattr(module, "_create_periodic_neighbor_list", sparse_site_neighbors)
 
     _, new_atoms = manipulator.insert_atoms(
@@ -1831,6 +1844,95 @@ def test_remove_atoms_partner_selection_uses_periodic_minimum_image(monkeypatch)
     # The selected Na is at y=0.1. Its Cl partner at y=9.9 is only 0.2 Angstrom away
     # through the periodic y boundary.
     assert np.any((removed["name"] == "Cl") & np.isclose(removed["y"], 9.9))
+
+
+def test_tetrahedron_circumcenter_is_equidistant_from_vertices():
+    tetrahedra = np.array(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0],
+                [0.0, 0.0, 2.0],
+            ]
+        ]
+    )
+
+    centers = _tetrahedron_circumcenters(tetrahedra)
+
+    np.testing.assert_allclose(centers, [[1.0, 1.0, 1.0]])
+
+    distances = np.linalg.norm(tetrahedra[0] - centers[0], axis=1)
+    np.testing.assert_allclose(distances, np.full(4, np.sqrt(3.0)))
+
+
+def test_periodic_tiling_uses_box_width_not_atom_extent():
+    positions = np.array([[0.0, 2.0, 0.0], [0.0, 8.0, 0.0]])
+    box_dims = np.array([[-1.0, 1.0], [0.0, 10.0], [-1.0, 1.0]])
+
+    tiled = _tile_periodic_positions_once(positions, box_dims, (False, True, False))
+
+    np.testing.assert_allclose(
+        np.unique(tiled[:, 1]),
+        [-8.0, -2.0, 2.0, 8.0, 12.0, 18.0],
+    )
+
+
+def test_minimum_periodic_distance_crosses_box_boundary():
+    queries = np.array([[0.0, 0.1, 0.0]])
+    references = np.array([[0.0, 9.9, 0.0]])
+    box_dims = np.array([[-1.0, 1.0], [0.0, 10.0], [-1.0, 1.0]])
+
+    distances = _minimum_periodic_distances(
+        queries,
+        references,
+        box_dims,
+        (False, True, False),
+        1e-8,
+    )
+
+    np.testing.assert_allclose(distances, [0.2])
+
+
+def test_delaunay_insertion_site_is_tetrahedron_circumcenter():
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [0.0, 0.0, 2.0],
+        ]
+    )
+    box_dims = np.array([[0.0, 2.0], [0.0, 2.0], [0.0, 2.0]])
+
+    sites, probabilities = _delaunay_insertion_sites(
+        positions,
+        positions,
+        atom_radius=1.0,
+        box_dims=box_dims,
+        periodic=(False, False, False),
+        coordinate_tolerance=1e-8,
+    )
+
+    assert len(sites) == 1
+    np.testing.assert_allclose(sites[0], [1.0, 1.0, 1.0])
+    np.testing.assert_allclose(probabilities, [1.0])
+
+
+def test_grid_insertion_rejects_site_too_close_across_periodic_boundary():
+    gb_positions = np.array([[0.0, 9.9, 0.0], [1.0, 5.0, 1.0]])
+    box_dims = np.array([[0.0, 1.0], [0.0, 10.0], [0.0, 1.0]])
+
+    sites, _ = _grid_insertion_sites(
+        gb_positions,
+        gb_positions,
+        atom_radius=0.25,
+        box_dims=box_dims,
+        periodic=(False, True, False),
+        coordinate_tolerance=1e-8,
+    )
+
+    assert not np.any(np.all(np.isclose(sites, [0.0, 0.0, 0.0]), axis=1))
 
 
 if __name__ == '__main__':
