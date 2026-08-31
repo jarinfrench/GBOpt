@@ -2425,22 +2425,49 @@ def _calculate_dynamical_matrix(hardness, positions, gb_atom_indices, neighbor_l
     return Dij
 
 
-def _get_stoichiometric_change(n_units: int, ratio: dict[int, int]) -> dict[int, int]:
-    """_summary_
+def _stoichiometric_unit_size(ratio: dict[int, int]) -> int:
+    """Return the number of atoms in one stoichiometric unit.
 
-    Args:
-        n_units: The number of atom units (defined as the sum of the values in the ratio
-            dict) that will be modified. For example, given a ratio of
-            {1: 1, 2: 2, 3: 3, 4: 1}, this number would indicate how many of type 1
-            (and type 4) would be affected by the operation.
-        ratio: The ratio of each atom type in the unit cell. Must be a dict where the
-            keys and values are positive integers.
-
-    Returns:
-        dict[int, int]: The number of atoms of each type that will be changed.
+    :param ratio: Number of atoms of each type in one stoichiometric unit.
+    :return: Total number of atoms in one stoichiometric unit.
     """
+    return sum(ratio.values())
 
-    return {atom_type: num * n_units for atom_type, num in ratio.items()}
+
+def _floor_stoichiometric_count(n_atoms: int, ratio: dict[int, int]) -> int:
+    """Round an atom count down to one compatible with a stoichiometric ratio.
+
+    :param n_atoms: Maximum number of atoms to modify.
+    :param ratio: Number of atoms of each type in one stoichiometric unit.
+    :return: Largest compatible atom count not greater than *n_atoms*.
+    """
+    unit_size = _stoichiometric_unit_size(ratio)
+    return n_atoms - n_atoms % unit_size
+
+
+def _get_stoichiometric_change(
+    n_atoms: int,
+    ratio: dict[int, int],
+) -> dict[int, int]:
+    """Return per-type counts for an exact stoichiometric atom change.
+
+    :param n_atoms: Total number of atoms to modify.
+    :param ratio: Number of atoms of each type in one stoichiometric unit.
+    :return: Number of atoms of each type to modify.
+    :raises GBManipulatorValueError: If ``n_atoms`` cannot preserve the requested
+        stoichiometric ratio.
+    """
+    unit_size = _stoichiometric_unit_size(ratio)
+
+    if n_atoms % unit_size != 0:
+        raise GBManipulatorValueError(
+            f"Cannot modify exactly {n_atoms} atoms while preserving the "
+            f"stoichiometric ratio {ratio}. The atom count must be a multiple of "
+            f"{unit_size}."
+        )
+
+    n_units = n_atoms // unit_size
+    return {atom_type: count * n_units for atom_type, count in ratio.items()}
 
 
 class GBManipulator:
@@ -3298,27 +3325,35 @@ class GBManipulator:
         keep_ratio: bool = True,
         return_positions: bool = False,
     ) -> np.ndarray:
-        """
-        Removes ``gb_fraction`` of atoms or ``num_to_remove`` atom(s) in the GB region.
-        Uses the local order parameter method of Lyakhov *et al.*, Computer Phys. Comm.
-        181 (2010) 1623-1632.
+        """Remove atoms from the grain boundary region.
 
-        One of the following parameters must be specified:
-        :param gb_fraction: Keyword argument. The fraction of atoms in the GB plane to
-            remove. Must be less than 25% of the total number of atoms in the GB region.
-        :param num_to_remove: Keyword argument. The specific number of atoms to remove.
-            Maximum is 25% of the total number of atoms in the GB region.
+        Atom-removal probabilities are based on the local order parameter method of
+        Lyakhov *et al.*, Computer Phys. Comm. 181 (2010) 1623-1632.
 
-        Other keyword arguments:
-        :param keep_ratio: Keyword argument. Whether or not to maintain stoichiometric
-            ratios. Default: True.
-        :param return_positions: Keyword argument, optional, defaults to False. Flag to
-            include the positions of the atoms removed into the array.
-        :return: Atom positions after atom removal.
+        Exactly one of ``gb_fraction`` and ``num_to_remove`` should be specified. Both
+        parameters describe the total number of atoms removed, not the number of
+        stoichiometric formula units.
+
+        When ``keep_ratio`` is true, an explicit ``num_to_remove`` must be compatible
+        with the unit-cell stoichiometric ratio. A count calculated from ``gb_fraction``
+        is rounded down to the nearest compatible atom count.
+
+        :param gb_fraction: Keyword argument. Fraction of atoms in the GB region to
+            remove. Must satisfy ``0 < gb_fraction <= 0.25``.
+        :param num_to_remove: Keyword argument. Total number of atoms to remove. Must be
+            at least one and no greater than 25% of the atoms in the GB region. When
+            ``keep_ratio`` is ``True``, this count must permit exact preservation of the
+            unit cell stoichiometry.
+        :param keep_ratio: Keyword argument, defaults to ``True``. Whether to preserve
+            the unit cell stoichiometric ratio.
+        :param return_positions: Keyword argument, optional, defaults to False. Whether
+            to return the removed atoms together with the modified structure.
+        :return: Atom positions after atom removal, optionally together with the removed
+            atoms.
         """
-        if not gb_fraction and not num_to_remove:
+        if (gb_fraction is None) == (num_to_remove is None):
             raise GBManipulatorValueError(
-                "gb_fraction or num_to_remove must be specified."
+                "Exactly one of gb_fraction and num_to_remove must be specified."
             )
 
         if not self.__one_parent:
@@ -3338,22 +3373,42 @@ class GBManipulator:
                 "gb_fraction <= 0.25"
             )
 
+        max_atoms_to_remove = int(0.25 * len(gb_atoms))
+
         if num_to_remove is not None and (
-            num_to_remove < 1
-            or num_to_remove > int(0.25 * len(gb_atoms))
+            num_to_remove < 1 or num_to_remove > max_atoms_to_remove
         ):
             raise GBManipulatorValueError(
-                "Invalid num_to_remove value. Must be >= 1, and must be less than or "
-                "equal to 25% of the total number of atoms in the GB region."
+                "Invalid num_to_remove value. Must be >= 1, and no greater than 25% of "
+                "the total number of atoms in the GB region."
             )
 
-        if num_to_remove is None:
+        fractional_request = num_to_remove is None
+
+        if fractional_request:
             num_to_remove = int(gb_fraction * len(gb_atoms))
+
+            if keep_ratio and len(type_map) > 1:
+                requested_count = num_to_remove
+                num_to_remove = _floor_stoichiometric_count(
+                    requested_count,
+                    parent.unit_cell.ratio,
+                )
+
+                if num_to_remove != requested_count and num_to_remove > 0:
+                    warnings.warn(
+                        f"gb_fraction corresponds to {requested_count} atoms, but "
+                        "preserving stoichiometry requires a multiple of "
+                        f"{_stoichiometric_unit_size(parent.unit_cell.ratio)}. "
+                        f"Removing {num_to_remove} atoms instead.",
+                        stacklevel=2,
+                    )
 
         if num_to_remove == 0:
             warnings.warn(
-                "Calculated fraction of atoms to remove is 0 "
-                f"(int({gb_fraction}*{len(gb_atoms)}) = 0)"
+                "The requested removal corresponds to zero atoms after applying "
+                "stoichiometric constraints.",
+                stacklevel=2,
             )
             self.__set_candidate_labels(
                 getattr(parent, "grain_labels", None),
@@ -3369,9 +3424,6 @@ class GBManipulator:
                 num_to_remove,
                 parent.unit_cell.ratio,
             )
-
-            num_to_remove = sum(num_to_remove_dict.values())
-
             central_type = min(num_to_remove_dict, key=num_to_remove_dict.get)
 
             # The Lyakhov fingerprint uses the complete radial neighborhood out to Rmax.
@@ -3417,8 +3469,8 @@ class GBManipulator:
             probabilities = probabilities / np.sum(probabilities, dtype=float)
 
         else:
-            # If we aren't worried about keeping the ratio, randomly assign atoms
-            # to be removed to each type, summing up to num_to_remove.
+            # If we aren't worried about keeping the ratio, randomly assign atoms to be
+            # removed to each type, summing up to num_to_remove.
             breaks = np.sort(
                 self.__rng.choice(
                     range(1, num_to_remove),
@@ -3577,40 +3629,45 @@ class GBManipulator:
     def insert_atoms(
         self,
         *,
-        fill_fraction: float = None,
-        num_to_insert: int = None,
+        fill_fraction: float | None = None,
+        num_to_insert: int | None = None,
         method: str = "delaunay",
         keep_ratio: bool = True,
         return_positions: bool = False,
     ) -> np.ndarray:
-        """
-        Inserts **fraction** atoms in the GB at empty lattice sites. "Empty" sites are
-        determined through Delaunay triangulation (method="Delaunay") or through a grid
-        with a resolution of 1 angstrom (method="grid").
+        """Insert atoms at available sites in the grain boundary region.
 
-        One of the following parameters must be specified.
-        :param fill_fraction: Keyword argument. The fraction of empty lattice sites to
-            fill. Must be less than or equal to 25% of the total number of atoms in the
-            GB slab.
-        :param num_to_insert: Keyword argument. The number of atoms to insert. Must be
-            less than or equal to 25% of the total number of atoms in the GB slab.
-        :param method: Keyword argument, optional, defaults to "delaunay". The method to
-            use. Must be either "delaunay" or "grid."
-        :param keep_ratio: Keyword argument, optional, defaults to True. Flag
-            specifying whether or not to keep stoichiometric ratios in the system with
-            the added atoms. If true, atoms are inserted at neighboring.
-        :param return_positions: Keyword argument, optional, defaults to False. Flag to
-            include the positions of the new atoms inserted into the array.
+        Candidate insertion sites are generated using Delaunay tetrahedral circumcenters
+        or a regular Cartesian grid.
+
+        Exactly one of ``fill_fraction`` and ``num_to_insert`` should be specified.
+        ``num_to_insert`` always refers to the total number of atoms inserted.
+        ``fill_fraction`` refers to the fraction of valid generated insertion sites to
+        occupy. When ``keep_ratio`` is true, the resulting atom count is rounded down to
+        the nearest count compatible with the unit cell stoichiometric ratio.
+
+        :param fill_fraction: Keyword argument, defaults to ``None``. Fraction of valid
+            generated insertion sites to occupy, subject to the maximum insertion limit
+            of 25% of the original GB atom population. Must satisfy ``0 < fill_fraction
+            <= 0.25``.
+        :param num_to_insert: Keyword argument, defaults to ``None``. Total number of
+            atoms to insert. Must be at least one and no greater than 25% of the atoms
+            in the original GB region. When ``keep_ratio`` is ``True``, this count must
+            permit exact preservation of the unit cell stoichiometry.
+        :param method: Keyword argument, optional, defaults to "delaunay". Method used
+            to generate candidate sites. Must be either "delaunay" or "grid."
+        :param keep_ratio: Keyword argument, optional, defaults to True. Whether to
+            preserve the unit cell stoichiometric ratio.
+        :param return_positions: Keyword argument, optional, defaults to False. Whether
+            to return the inserted atoms together with the modified structure.
         :raises GBManipulatorValueError: Exception raised if an invalid method is
             specified.
-        :return: Atom positions after atom insertion.
+        :return: Atom positions after atom insertion, optionally together with the
+            inserted atoms.
         """
+        if (fill_fraction is None) == (num_to_insert is None):
             raise GBManipulatorValueError(
-                "fill_fraction or num_to_insert must be specified.")
-
-        if not fill_fraction and not num_to_insert:
-            raise GBManipulatorValueError(
-                "fill_fraction or num_to_insert must be specified."
+                "Exactly one of fill_fraction and num_to_insert must be specified."
             )
         if not self.__one_parent:
             warnings.warn("Atom insertion only occurring based on parent 1.")
@@ -3621,20 +3678,23 @@ class GBManipulator:
         type_map_inverse = {v: k for k, v in type_map.items()}
 
         if fill_fraction is not None and (fill_fraction <= 0 or fill_fraction > 0.25):
-            raise GBManipulatorValueError
-            (f"Invalid value for fill_fraction ({fill_fraction=}). Must be 0 < "
-             "fill_fraction <= 0.25"
-             )
+            raise GBManipulatorValueError(
+                f"Invalid value for fill_fraction ({fill_fraction=}). Must be 0 < "
+                "fill_fraction <= 0.25"
+            )
+
+        max_atoms_to_insert = int(0.25 * len(gb_atoms))
 
         if num_to_insert is not None and (
-            num_to_insert < 1 or num_to_insert > int(0.25 * len(gb_atoms))
+            num_to_insert < 1 or num_to_insert > max_atoms_to_insert
         ):
             raise GBManipulatorValueError(
-                "Invalid num_to_insert value. Must be >= 1, and must be less than or "
-                "equal to 25% of the total number of atoms in the GB region.")
+                "Invalid num_to_insert value. Must be >= 1, and no greater than 25% of "
+                "the atoms in the GB region.")
 
-        if num_to_insert is None:
-            num_to_insert = int(fill_fraction * len(gb_atoms))
+        if num_to_insert is not None and keep_ratio and len(type_map) > 1:
+            # Validate before doing the potentially expensive site generation.
+            _get_stoichiometric_change(num_to_insert, parent.unit_cell.ratio)
 
         periodic = (False, *parent.inplane_periodic)
 
@@ -3660,25 +3720,81 @@ class GBManipulator:
         else:
             raise GBManipulatorValueError(f"Unrecognized insert_atoms method: {method}")
 
+        fractional_request = num_to_insert is None
+
+        if fractional_request:
+            requested_count = int(fill_fraction * len(possible_sites))
+            num_to_insert = min(requested_count, max_atoms_to_insert)
+
+            if num_to_insert != requested_count and num_to_insert > 0:
+                warnings.warn(
+                    f"fill_fraction corresponds to {requested_count} insertion sites, but "
+                    f"the 25% GB-region limit permits at most {max_atoms_to_insert} atoms. "
+                    f"Inserting {num_to_insert} atoms instead.",
+                    stacklevel=2,
+                )
+
+            if keep_ratio and len(type_map) > 1:
+                pre_stoichiometry_count = num_to_insert
+                num_to_insert = _floor_stoichiometric_count(
+                    requested_count,
+                    parent.unit_cell.ratio
+                )
+
+                if num_to_insert != pre_stoichiometry_count and num_to_insert > 0:
+                    warnings.warn(
+                        f"Inserting {pre_stoichiometry_count} atoms would not preserve "
+                        "stoichiometry, which requires a multiple of "
+                        f"{_stoichiometry_unit_size(parent.unit_cell.ratio)}. Inserting "
+                        f"{num_to_insert} atoms instead.",
+                        stacklavel=2
+                    )
+
+        if num_to_insert == 0:
+            warnings.warn(
+                (
+                    "The requested insertion corresponds to zero atoms after applying "
+                    "fraction and stoichiometric constraints."
+                ),
+                stacklevel=2,
+            )
+            self.__set_candidate_labels(
+                getattr(parent, "grain_labels", None),
+                len(parent.whole_system),
+            )
+            return atoms
+
+        if num_to_insert > max_atoms_to_insert:
+            raise GBManipulatorValueError(
+                "Calculated insertion count exceeds 25% of the atoms in the GB region."
+            )
+
+        if num_to_insert > len(possible_sites):
+            raise GBManipulatorValueError(
+                "Not enough valid insertion sites for the requested atom count."
+            )
 
         if len(type_map) == 1:
             num_to_insert_dict = {1: num_to_insert}
         elif keep_ratio:
             num_to_insert_dict = _get_stoichiometric_change(
-                num_to_insert, parent.unit_cell.ratio
+                num_to_insert,
+                parent.unit_cell.ratio
             )
-            num_to_insert = sum(list(num_to_insert_dict.values()))
             central_type = min(num_to_insert_dict, key=num_to_insert_dict.get)
         else:  # random insertion of random types
             breaks = np.sort(
-                np.random.choice(
-                    range(1, num_to_insert), len(type_map) - 1, replace=False
+                self.__rng.choice(
+                    range(1, num_to_insert),
+                    len(type_map) - 1,
+                    replace=False
                 )
             )
             breaks = np.concatenate([[0], breaks, [num_to_insert]])
             values = np.diff(breaks)
             num_to_insert_dict = {
-                i + 1: int(values[i]) for i in range(len(type_map))
+                i + 1: int(values[i])
+                for i in range(len(type_map))
             }
 
         if keep_ratio and len(type_map) > 1:

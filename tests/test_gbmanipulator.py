@@ -34,13 +34,15 @@ from GBOpt.GBManipulator import (
     _create_periodic_image_neighborhoods,
     _create_periodic_neighbor_list,
     _delaunay_insertion_sites,
+    _floor_stoichiometric_count,
+    _get_stoichiometric_change,
     _grid_insertion_sites,
     _minimum_periodic_distances,
     _ParentsProxy,
     _tetrahedron_circumcenters,
     _tile_periodic_positions_once,
 )
-from GBOpt.GrainOwnership import LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL
+from GBOpt.GrainOwnership import LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL, GrainOwnership
 from GBOpt.UnitCell import UnitCell
 
 pytestmark = pytest.mark.filterwarnings(
@@ -285,9 +287,17 @@ def test_insert_atoms_with_stoichiometry_uses_selected_neighbor_site_ids(monkeyp
     atoms = np.array(
         [
             ("U", 0.0, 0.0, 0.0),
-            ("O", 2.0, 0.0, 0.0),
             ("O", 0.0, 2.0, 0.0),
-            ("U", 0.0, 0.0, 2.0),
+            ("O", 0.0, 0.0, 2.0),
+            ("U", 0.0, 0.0, 1.0),
+            ("U", 0.0, 1.0, 1.0),
+            ("U", 0.0, 3.0, 1.0),
+            ("O", 0.0, 1.0, 0.5),
+            ("O", 0.0, 1.0, 1.5),
+            ("O", 0.0, 2.0, 0.5),
+            ("O", 0.0, 2.0, 1.5),
+            ("O", 0.0, 3.0, 0.5),
+            ("O", 0.0, 3.0, 1.5),
         ],
         dtype=Atom.atom_dtype,
     )
@@ -344,7 +354,7 @@ def test_insert_atoms_with_stoichiometry_uses_selected_neighbor_site_ids(monkeyp
     monkeypatch.setattr(module, "_create_periodic_neighbor_list", sparse_site_neighbors)
 
     _, new_atoms = manipulator.insert_atoms(
-        num_to_insert=1,
+        num_to_insert=3,
         method="grid",
         keep_ratio=True,
         return_positions=True,
@@ -529,10 +539,7 @@ class TestGBManipulator(unittest.TestCase):
             _ = manipulator.remove_atoms(gb_fraction=0.10)
 
     def test_remove_atoms_calculated_fraction_warning(self):
-        with self.assertWarnsRegex(
-            UserWarning,
-            "Calculated fraction of atoms to remove is 0",
-        ):
+        with self.assertWarnsRegex(UserWarning, "zero atoms"):
             _ = self.manipulator_tilt.remove_atoms(gb_fraction=1e-7)
 
     def test_remove_atoms_with_specific_number(self):
@@ -547,7 +554,15 @@ class TestGBManipulator(unittest.TestCase):
                 ("U", 0.0, 0.0, 0.0),
                 ("O", 0.1, 0.0, 0.0),
                 ("O", 0.0, 0.1, 0.0),
-                ("U", 0.0, 0.0, 0.1),
+                ("U", 4.0, 0.0, 0.0),
+                ("O", 4.1, 0.0, 0.0),
+                ("O", 4.0, 0.1, 0.0),
+                ("U", 8.0, 0.0, 0.0),
+                ("O", 8.1, 0.0, 0.0),
+                ("O", 8.0, 0.1, 0.0),
+                ("U", 12.0, 0.0, 0.0),
+                ("O", 12.1, 0.0, 0.0),
+                ("O", 12.0, 0.1, 0.0),
             ],
             dtype=Atom.atom_dtype,
         )
@@ -556,16 +571,21 @@ class TestGBManipulator(unittest.TestCase):
         manipulator = _synthetic_manipulator(unit_cell, atoms, seed=self.seed)
 
         with patch("GBOpt.GBManipulator._calculate_local_order", return_value=1.0):
-            new_system = manipulator.remove_atoms(num_to_remove=1, keep_ratio=True)
+            new_system, removed = manipulator.remove_atoms(
+                num_to_remove=3,
+                keep_ratio=True,
+                return_positions=True,
+            )
 
         np.testing.assert_array_equal(atoms, original_atoms)
-        self.assertEqual(len(atoms) - 3, len(new_system))
-        names, counts = np.unique(new_system["name"], return_counts=True)
-        self.assertEqual(dict(zip(names, counts)), {"U": 1})
+        self.assertEqual(len(new_system), len(atoms) - 3)
+
+        names, counts = np.unique(removed["name"], return_counts=True)
+        self.assertEqual(dict(zip(names, counts)), {"O": 2, "U": 1})
 
     def test_insert_atoms(self):
         new_system_delaunay = self.manipulator_tilt.insert_atoms(
-            fill_fraction=0.10, method='delaunay')
+            fill_fraction=0.05, method='delaunay')
         self.assertGreater(len(new_system_delaunay), len(self.tilt.whole_system))
         new_system_grid = self.manipulator_tilt.insert_atoms(
             fill_fraction=0.10, method='grid')
@@ -582,20 +602,14 @@ class TestGBManipulator(unittest.TestCase):
             UserWarning,
             "Atom insertion only occurring based on parent 1",
         ):
-            _ = manipulator.insert_atoms(fill_fraction=0.10, method='delaunay')
+            _ = manipulator.insert_atoms(fill_fraction=0.05, method='delaunay')
 
     def test_insert_atoms_calculated_fraction_warning(self):
-        with self.assertWarnsRegex(
-            UserWarning,
-            "Calculated fraction of atoms to insert is 0",
-        ):
+        with self.assertWarnsRegex(UserWarning, "zero atoms"):
             _ = self.manipulator_tilt.insert_atoms(
                 fill_fraction=1e-7, method='delaunay')
 
-        with self.assertWarnsRegex(
-            UserWarning,
-            "Calculated fraction of atoms to insert is 0",
-        ):
+        with self.assertWarnsRegex(UserWarning, "zero atoms"):
             _ = self.manipulator_tilt.insert_atoms(
                 fill_fraction=1e-7, method='grid')
 
@@ -610,40 +624,6 @@ class TestGBManipulator(unittest.TestCase):
         new_system_grid = self.manipulator_tilt.insert_atoms(
             method='grid', num_to_insert=1)
         self.assertEqual(len(self.tilt.whole_system) + 1, len(new_system_grid))
-
-    def test_insert_atoms_with_stoichiometry_adds_one_fluorite_formula_unit(self):
-        unit_cell = UnitCell()
-        unit_cell.init_by_structure("fluorite", 5.454, ("U", "O"))
-        atoms = np.array(
-            [
-                ("U", 0.0, 0.0, 0.0),
-                ("O", 3.0, 0.0, 0.0),
-                ("O", 0.0, 3.0, 0.0),
-                ("U", 0.0, 0.0, 3.0),
-            ],
-            dtype=Atom.atom_dtype,
-        )
-
-        manipulator = _synthetic_manipulator(unit_cell, atoms, seed=self.seed)
-
-        def all_sites_are_neighbors(_cutoff, positions):
-            return [
-                [idx for idx in range(len(positions)) if idx != site_idx]
-                for site_idx in range(len(positions))
-            ]
-
-        with patch("GBOpt.GBManipulator._create_neighbor_list",
-                   side_effect=all_sites_are_neighbors):
-            new_system = manipulator.insert_atoms(
-                num_to_insert=1,
-                method="grid",
-                keep_ratio=True,
-            )
-
-        self.assertEqual(len(atoms) + 3, len(new_system))
-        np.testing.assert_array_equal(new_system[:len(atoms)], atoms)
-        names, counts = np.unique(new_system["name"][len(atoms):], return_counts=True)
-        self.assertEqual(dict(zip(names, counts)), {"O": 2, "U": 1})
 
     def test_type_preservation_with_numeric_roundtrip(self):
         gb = _make_exact_gb(
@@ -683,11 +663,11 @@ class TestGBManipulator(unittest.TestCase):
         self.assertEqual(set(roundtrip_names(translated)), expected_types)
 
         with patch("GBOpt.GBManipulator._calculate_local_order", return_value=1.0):
-            removed = manipulator.remove_atoms(num_to_remove=1, keep_ratio=True)
+            removed = manipulator.remove_atoms(num_to_remove=2, keep_ratio=True)
         self.assertEqual(set(roundtrip_names(removed)), expected_types)
 
         inserted = manipulator.insert_atoms(
-            num_to_insert=1,
+            num_to_insert=2,
             method="grid",
             keep_ratio=True,
         )
@@ -816,7 +796,7 @@ class TestGBManipulator(unittest.TestCase):
         manipulator2 = GBManipulator(self.tilt, self.tilt)
         p1 = manipulator1.translate_right_grain(1, 1)
         p2 = manipulator2.slice_and_merge()
-        p3 = manipulator1.insert_atoms(fill_fraction=0.2, method='delaunay')
+        p3 = manipulator1.insert_atoms(fill_fraction=0.05, method='delaunay')
         # p4 = manipulator1.remove_atoms(0.2)
         with tempfile.NamedTemporaryFile(delete=True) as temp_file:
             self.tilt.write_lammps(temp_file.name, p1, self.tilt.box_dims)
@@ -1320,37 +1300,16 @@ def test_explicit_ownership_removal_deletes_same_label_row(tmp_path):
 
 def test_explicit_ownership_insertion_assigns_new_label_once(monkeypatch, tmp_path):
     manipulator, atoms, labels, _box = _owned_test_manipulator(tmp_path)
-    recorded = {}
 
-    class FakeKDTree:
-        def __init__(self, data):
-            self.data = np.asarray(data, dtype=float)
-
-        def query_ball_tree(self, other, radius):
-            recorded["sites"] = other.data
-            return [[] for _ in range(len(self.data))]
-
-        def query(self, points, k=1):
-            points = np.asarray(points)
-            return (np.ones(len(points)), np.zeros(len(points), dtype=int))
-
-    class SiteChoice:
-        def choice(self, choices, size=None, replace=False, p=None):
-            choices = np.asarray(choices, dtype=int)
-            sites = recorded["sites"]
-
-            matches = [index for index in choices if np.isclose(sites[index, 0], 3.0)]
-            result = matches[0]
-
-            if size is None:
-                return result
-
-            return np.asarray([result])
+    possible_sites = np.array([[3.0, 1.0, 1.0]], dtype=float)
+    probabilities = np.array([1.0])
 
     module = importlib.import_module("GBOpt.GBManipulator")
-    monkeypatch.setattr(module, "KDTree", FakeKDTree)
-
-    manipulator.rng = SiteChoice()
+    monkeypatch.setattr(
+        module,
+        "_grid_insertion_sites",
+        lambda *_args, **_kwargs: (possible_sites, probabilities),
+    )
 
     inserted, new_atoms = manipulator.insert_atoms(
         num_to_insert=1,
@@ -1360,6 +1319,7 @@ def test_explicit_ownership_insertion_assigns_new_label_once(monkeypatch, tmp_pa
     )
 
     assert len(inserted) == len(atoms) + 1
+    assert len(new_atoms) == 1
     assert new_atoms[0]["x"] == pytest.approx(3.0)
 
     assert np.array_equal(manipulator.candidate_grain_labels[:-1], labels)
@@ -1758,6 +1718,10 @@ def test_remove_atoms_local_order_uses_atoms_beyond_partner_cutoff(monkeypatch):
             ("Cl", 0.0, 1.0, 0.0),
             ("Cl", 0.0, 5.0, 0.0),
             ("Na", 0.0, 8.0, 0.0),
+            ("Na", 19.0, 19.0, 19.0),
+            ("Cl", 18.0, 19.0, 19.0),
+            ("Na", -19.0, -19.0, -19.0),
+            ("Cl", -18.0, -19.0, -19.0),
         ],
         dtype=Atom.atom_dtype,
     )
@@ -1780,7 +1744,7 @@ def test_remove_atoms_local_order_uses_atoms_beyond_partner_cutoff(monkeypatch):
     module = importlib.import_module("GBOpt.GBManipulator")
     monkeypatch.setattr(module, "_calculate_local_order", record_local_order)
     manipulator.rng = FirstChoiceRng()
-    reduced = manipulator.remove_atoms(num_to_remove=1, keep_ratio=True)
+    reduced = manipulator.remove_atoms(num_to_remove=2, keep_ratio=True)
     local_neighbors = recorded["neighbors"]
 
     # This Cl is well beyond the short stoichiometric-partner cutoff, but inside Rmax
@@ -1806,6 +1770,10 @@ def test_remove_atoms_partner_selection_uses_periodic_minimum_image(monkeypatch)
             ("Cl", 0.0, 9.9, 0.0),
             ("Na", 0.0, 5.0, 0.0),
             ("Cl", 0.0, 5.5, 0.0),
+            ("Na", 0.9, 3.0, 0.9),
+            ("Cl", 0.9, 3.5, 0.9),
+            ("Na", 0.9, 6.0, 0.9),
+            ("Cl", 0.9, 6.5, 0.9),
         ],
         dtype=Atom.atom_dtype,
     )
@@ -1833,7 +1801,7 @@ def test_remove_atoms_partner_selection_uses_periodic_minimum_image(monkeypatch)
 
     _, removed = (
         manipulator.remove_atoms(
-            num_to_remove=1,
+            num_to_remove=2,
             keep_ratio=True,
             return_positions=True,
         )
@@ -1933,6 +1901,249 @@ def test_grid_insertion_rejects_site_too_close_across_periodic_boundary():
     )
 
     assert not np.any(np.all(np.isclose(sites, [0.0, 0.0, 0.0]), axis=1))
+
+
+def test_stoichiometric_change_uses_total_atom_count():
+    assert _get_stoichiometric_change(6, {1: 1, 2: 2}) == {1: 2, 2: 4}
+
+
+def test_stoichiometric_change_rejects_incompatible_atom_count():
+    with pytest.raises(
+        GBManipulatorValueError,
+        match="must be a multiple of 3",
+    ):
+        _get_stoichiometric_change(5, {1: 1, 2: 2})
+
+
+def test_floor_stoichiometric_count_rounds_down():
+    assert _floor_stoichiometric_count(8, {1: 1, 2: 2}) == 6
+    assert _floor_stoichiometric_count(2, {1: 1, 2: 2}) == 0
+
+
+def test_insert_atoms_with_stoichiometry_inserts_requested_fluorite_atom_count(
+    monkeypatch
+):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("fluorite", 5.454, ("U", "O"))
+
+    atoms = np.array(
+        [
+            ("U", 0.0, 0.0, 0.0),
+            ("U", 0.0, 1.0, 0.0),
+            ("U", 0.0, 2.0, 0.0),
+            ("U", 0.0, 3.0, 0.0),
+            ("O", 0.0, 0.0, 1.0),
+            ("O", 0.0, 1.0, 1.0),
+            ("O", 0.0, 2.0, 1.0),
+            ("O", 0.0, 3.0, 1.0),
+            ("O", 0.0, 0.0, 2.0),
+            ("O", 0.0, 1.0, 2.0),
+            ("O", 0.0, 2.0, 2.0),
+            ("O", 0.0, 3.0, 2.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+
+    manipulator = _synthetic_manipulator(unit_cell, atoms)
+
+    possible_sites = np.array(
+        [
+            [0.0, 0.0, 0.5],
+            [0.0, 0.5, 0.5],
+            [0.0, 1.0, 0.5],
+        ]
+    )
+    probabilities = np.full(3, 1.0 / 3.0)
+
+    module = importlib.import_module("GBOpt.GBManipulator")
+
+    monkeypatch.setattr(
+        module,
+        "_grid_insertion_sites",
+        lambda *_args, **_kwargs: (possible_sites, probabilities),
+    )
+
+    monkeypatch.setattr(
+        module,
+        "_create_periodic_neighbor_list",
+        lambda *_args, **_kwargs: (
+            [np.array([1, 2], dtype=np.intp)],
+            [np.array([0.5, 1.0])],
+        ),
+    )
+
+    class FirstChoiceRng:
+        @staticmethod
+        def choice(choices, size, replace=False, p=None):
+            del replace, p
+            return np.asarray(choices)[:size]
+
+    manipulator.rng = FirstChoiceRng()
+
+    _, inserted = manipulator.insert_atoms(
+        num_to_insert=3,
+        method="grid",
+        keep_ratio=True,
+        return_positions=True,
+    )
+
+    assert len(inserted) == 3
+    assert np.count_nonzero(inserted["name"] == "U") == 1
+    assert np.count_nonzero(inserted["name"] == "O") == 2
+
+
+def test_insert_atoms_fill_fraction_uses_valid_insertion_site_count(monkeypatch):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("fluorite", 5.454, ("U", "O"))
+
+    atoms = np.array(
+        [
+            ("U", 0.0, 0.0, 0.0),
+            ("U", 0.0, 1.0, 0.0),
+            ("U", 0.0, 2.0, 0.0),
+            ("U", 0.0, 3.0, 0.0),
+            ("U", 0.0, 4.0, 0.0),
+            ("U", 0.0, 5.0, 0.0),
+            ("U", 0.0, 6.0, 0.0),
+            ("U", 0.0, 7.0, 0.0),
+            ("O", 0.0, 0.0, 1.0),
+            ("O", 0.0, 1.0, 1.0),
+            ("O", 0.0, 2.0, 1.0),
+            ("O", 0.0, 3.0, 1.0),
+            ("O", 0.0, 4.0, 1.0),
+            ("O", 0.0, 5.0, 1.0),
+            ("O", 0.0, 6.0, 1.0),
+            ("O", 0.0, 7.0, 1.0),
+            ("O", 0.0, 0.0, 2.0),
+            ("O", 0.0, 1.0, 2.0),
+            ("O", 0.0, 2.0, 2.0),
+            ("O", 0.0, 3.0, 2.0),
+            ("O", 0.0, 4.0, 2.0),
+            ("O", 0.0, 5.0, 2.0),
+            ("O", 0.0, 6.0, 2.0),
+            ("O", 0.0, 7.0, 2.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+
+    manipulator = _synthetic_manipulator(unit_cell, atoms)
+
+    possible_sites = np.column_stack(
+        (
+            np.zeros(24),
+            np.arange(24, dtype=float),
+            np.zeros(24),
+        )
+    )
+    probabilities = np.full(24, 1.0 / 24.0)
+
+    module = importlib.import_module("GBOpt.GBManipulator")
+
+    monkeypatch.setattr(
+        module,
+        "_grid_insertion_sites",
+        lambda *_args, **_kwargs: (possible_sites, probabilities),
+    )
+
+    # Three U centers, each with sufficient O partner sites.
+    monkeypatch.setattr(
+        module,
+        "_create_periodic_neighbor_list",
+        lambda *_args, **_kwargs: (
+            [
+                np.array([3, 4], dtype=np.intp),
+                np.array([5, 6], dtype=np.intp),
+            ],
+            [
+                np.array([1.0, 1.0]),
+                np.array([1.0, 1.0]),
+            ],
+        ),
+    )
+
+    class FirstChoiceRng:
+        @staticmethod
+        def choice(choices, size, replace=False, p=None):
+            del replace, p
+            return np.asarray(choices)[:size]
+
+    manipulator.rng = FirstChoiceRng()
+
+    _, inserted = manipulator.insert_atoms(
+        fill_fraction=0.25,
+        method="grid",
+        keep_ratio=True,
+        return_positions=True,
+    )
+
+    assert len(inserted) == 6
+    assert np.count_nonzero(inserted["name"] == "U") == 2
+    assert np.count_nonzero(inserted["name"] == "O") == 4
+
+
+def test_insert_atoms_fill_fraction_is_capped_at_gb_limit(monkeypatch):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("fcc", 3.52, "Ni")
+
+    atoms = np.array(
+        [
+            ("Ni", 0.0, 0.0, 0.0),
+            ("Ni", 1.0, 0.0, 0.0),
+            ("Ni", 2.0, 0.0, 0.0),
+            ("Ni", 3.0, 0.0, 0.0),
+            ("Ni", 4.0, 0.0, 0.0),
+            ("Ni", 5.0, 0.0, 0.0),
+            ("Ni", 6.0, 0.0, 0.0),
+            ("Ni", 7.0, 0.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+
+    manipulator = _synthetic_manipulator(unit_cell, atoms, seed=17)
+
+    possible_sites = np.array(
+        [
+            [0.5, 1.0, 1.0],
+            [1.5, 1.0, 1.0],
+            [2.5, 1.0, 1.0],
+            [3.5, 1.0, 1.0],
+            [4.5, 1.0, 1.0],
+            [5.5, 1.0, 1.0],
+            [6.5, 1.0, 1.0],
+            [7.5, 1.0, 1.0],
+            [0.5, 2.0, 1.0],
+            [1.5, 2.0, 1.0],
+            [2.5, 2.0, 1.0],
+            [3.5, 2.0, 1.0],
+        ],
+        dtype=float,
+    )
+    probabilities = np.full(
+        len(possible_sites),
+        1.0 / len(possible_sites),
+    )
+
+    module = importlib.import_module("GBOpt.GBManipulator")
+    monkeypatch.setattr(
+        module,
+        "_delaunay_insertion_sites",
+        lambda *_args, **_kwargs: (possible_sites, probabilities),
+    )
+
+    with pytest.warns(
+        UserWarning,
+        match="25% GB-region limit permits at most 2 atoms",
+    ):
+        new_system, inserted_atoms = manipulator.insert_atoms(
+            fill_fraction=0.25,
+            method="delaunay",
+            return_positions=True,
+        )
+
+    assert len(possible_sites) == 12
+    assert int(0.25 * len(possible_sites)) == 3
+    assert len(inserted_atoms) == 2
+    assert len(new_system) == len(atoms) + 2
 
 
 if __name__ == '__main__':
