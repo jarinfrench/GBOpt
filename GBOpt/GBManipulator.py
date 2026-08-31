@@ -10,7 +10,7 @@ import copy as copy_module
 import multiprocessing as mp
 import warnings
 from dataclasses import dataclass
-from itertools import combinations_with_replacement
+from itertools import combinations_with_replacement, product
 from numbers import Real
 from os.path import isfile
 
@@ -1675,7 +1675,7 @@ def _calculate_fingerprint_vector(atom, neighs, NB, V, Btype, Delta, Rmax):
 
     :param np.ndarray atom: The atom we are calculating the fingerprint for.
     :param np.ndarray neighs: list of Atom containing the neighbors to **atom**.
-    :param int NB: The number of atoms of type B neighbor to **atom**.
+    :param int NB: Number of atoms of type B in the nominal unit cell.
     :param float V: The volume of the unit cell in angstroms**3.
     :param int Btype: The type of neighbors we are interested in.
     :param float Delta: The discretization length for Rs in angstroms.
@@ -1701,24 +1701,24 @@ def _calculate_fingerprint_vector(atom, neighs, NB, V, Btype, Delta, Rmax):
     return fingerprint_vector
 
 
-@jit(nopython=True, cache=True, parallel=True)
+@jit(nopython=True, cache=True)
 def _calculate_local_order(atom, neighs, unit_cell_types, unit_cell_a0, N, Delta, Rmax):
     """
     Calculates the local order parameter following Lyakhov *et al.*, Computer Phys.
     Comm. 181 (2010) 1623-1632 (Eq. 5).
 
     :param np.ndarray atom: Atom we are calculating the local order for.
-    :param np.ndarray neighs: Neighbors of *atom*.
+    :param np.ndarray neighs: Neighbors of ``atom``.
     :param np.ndarray unit_cell_types: The types of the atoms in the unit cell.
     :param float unit_cell_a0: The lattice parameter.
     :param int N: The number of atoms in the unit cell.
     :param float Delta: Bin size to calculate the fingerprint vector.
-    :param float Rmax: Maximum distance from *atom* to consider as a neighbor to
-        *atom* in angstroms.
-    :return: The local order parameter for *atom* based on its neighbors.
+    :param float Rmax: Maximum distance from ``atom`` to consider as a neighbor to
+        ``atom`` in angstroms.
+    :return: The local order parameter for ``atom`` based on its neighbors.
     """
     local_sum = 0
-    atom_types = np.unique(neighs[:, 0])
+    atom_types = np.unique(unit_cell_types)
     V = unit_cell_a0 ** 3
     prefactor = Delta / (N * (V / N) ** (1 / 3))
     for Btype in atom_types:
@@ -1743,6 +1743,240 @@ def _create_neighbor_list(rcut: float, pos: np.ndarray) -> list:
     for i, neighbor in enumerate(neighbor_list):
         neighbor.remove(i)
     return neighbor_list
+
+
+def _create_periodic_image_cloud(
+    rcut: float,
+    positions: np.ndarray,
+    box_dims: np.ndarray,
+    periodic: tuple[bool, bool, bool],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return periodic images and their source metadata for a neighbor cutoff.
+
+    Periodic axes are replicated far enough that every image which could lie within
+    ``rcut`` of a position in the primary box is represented. Nonperiodic axes are not
+    replicated.
+
+    :param rcut: Maximum neighbor distance in angstroms.
+    :param positions: Cartesian atom or site positions with shape ``(N, 3)``.
+    :param box_dims: Simulation-box bounds with shape ``(3, 2)``.
+    :param periodic: Periodicity along x, y, and z.
+    :return: Image positions, source indices, and integer image offsets.
+    :raises GBManipulatorValueError: If the cutoff or periodic box geometry is invalid.
+    """
+    rcut = _validate_finite_real("rcut", rcut)
+    if rcut <= 0.0:
+        raise GBManipulatorValueError("rcut must be greater than zero")
+
+    positions = np.asarray(positions, dtype=float)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise GBManipulatorValueError("positions must have shape (N, 3)")
+    if not np.all(np.isfinite(positions)):
+        raise GBManipulatorValueError("positions must contain only finite values")
+
+    box_dims = np.asarray(box_dims, dtype=float)
+    if box_dims.shape != (3, 2) or not np.all(np.isfinite(box_dims)):
+        raise GBManipulatorValueError(
+            "box_dims must be a finite array with shape (3, 2)"
+        )
+
+    if len(periodic) != 3 or not all(
+        isinstance(flag, (bool, np.bool_))
+        for flag in periodic
+    ):
+        raise GBManipulatorValueError(
+            "periodic must contain exactly three Boolean values"
+        )
+
+    widths = box_dims[:, 1] - box_dims[:, 0]
+
+    image_ranges = []
+    for axis, (width, is_periodic) in enumerate(zip(widths, periodic, strict=True)):
+        if is_periodic:
+            if width <= 0.0:
+                raise GBManipulatorValueError(
+                    f"periodic box width for axis {axis} must be greater than zero"
+                )
+
+            num_images = int(np.ceil(rcut / width))
+            image_ranges.append(
+                range(-num_images, num_images + 1)
+            )
+        else:
+            image_ranges.append(range(1))
+
+    offsets = np.asarray(list(product(*image_ranges)), dtype=np.intp)
+    translations = offsets * widths
+
+    num_positions = len(positions)
+
+    image_positions = (
+        positions[np.newaxis, :, :]
+        + translations[:, np.newaxis, :]
+    ).reshape(-1, 3)
+
+    source_indices = np.tile(np.arange(num_positions, dtype=np.intp), len(offsets))
+
+    image_offsets = np.repeat(offsets, num_positions, axis=0)
+
+    return image_positions, source_indices, image_offsets
+
+
+def _create_periodic_image_neighborhoods(
+    rcut: float,
+    atoms: np.ndarray,
+    center_indices: np.ndarray,
+    box_dims: np.ndarray,
+    periodic: tuple[bool, bool, bool],
+) -> list[np.ndarray]:
+    """Return periodic-image neighborhoods for selected atoms.
+
+    The returned arrays contain ``type, x, y, z`` rows for every periodic image within
+    ``rcut``. Only the center atom in the unshifted image is excluded. Translated images
+    of the same physical atom remain because each image contributes separately to a
+    radial fingerprint.
+
+    :param rcut: Maximum neighbor distance in angstroms.
+    :param atoms: Numeric atom array with columns ``type, x, y, z``.
+    :param center_indices: Indices of atoms whose neighborhoods are required.
+    :param box_dims: Simulation-box bounds with shape ``(3, 2)``.
+    :param periodic: Periodicity along x, y, and z.
+    :return: One periodic-image neighborhood array for each requested center.
+    :raises GBManipulatorValueError: If atom data or center indices are invalid.
+    """
+    atoms = np.asarray(atoms)
+    if atoms.ndim != 2 or atoms.shape[1] != 4:
+        raise GBManipulatorValueError("atoms must have shape (N, 4)")
+
+    positions = np.asarray(atoms[:, 1:], dtype=float)
+    atom_types = np.asarray(atoms[:, 0])
+
+    center_indices = np.asarray(center_indices, dtype=np.intp)
+
+    if np.any(center_indices < 0) or np.any(center_indices >= len(atoms)):
+        raise GBManipulatorValueError("center_indices contains an out-of-range index")
+
+    image_positions, source_indices, image_offsets = _create_periodic_image_cloud(
+        rcut,
+        positions,
+        box_dims,
+        periodic,
+    )
+
+    image_types = np.tile(atom_types, len(image_positions) // len(atoms))
+
+    tree = KDTree(image_positions)
+
+    neighborhoods = []
+
+    for center_idx in center_indices:
+        matches = np.asarray(
+            tree.query_ball_point(positions[center_idx], r=rcut),
+            dtype=np.intp,
+        )
+
+        # Exclude only the unshifted center. Translated images of the same physical atom
+        # are legitimate radial neighbors.
+        central_self = (
+            (source_indices[matches] == center_idx)
+            & np.all(image_offsets[matches] == 0, axis=1,)
+        )
+
+        matches = matches[~central_self]
+
+        neighborhoods.append(
+            np.column_stack((image_types[matches], image_positions[matches]))
+        )
+
+    return neighborhoods
+
+
+def _create_periodic_neighbor_list(
+    rcut: float,
+    positions: np.ndarray,
+    center_indices: np.ndarray,
+    box_dims: np.ndarray,
+    periodic: tuple[bool, bool, bool],
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Return unique physical neighbors and minimum-image distances.
+
+    Unlike :func:`_create_periodic_image_neighborhoods`, this helper collapses all
+    periodic images of the same source position to one physical neighbor and retains its
+    shortest image distance. Every image of the center itself is excluded.
+
+    :param rcut: Maximum neighbor distance in angstroms.
+    :param positions: Cartesian atom or candidate-site positions with shape ``(N, 3)``.
+    :param center_indices: Indices of positions whose neighbors are required.
+    :param box_dims: Simulation-box bounds with shape ``(3, 2)``.
+    :param periodic: Periodicity along x, y, and z.
+    :return: Parallel lists of neighbor source-index arrays and distance arrays. Within
+        each pair, ``indices[k]`` corresponds to ``distances[k]``.
+    :raises GBManipulatorValueError: If center indices are invalid.
+    """
+    positions = np.asarray(positions, dtype=float)
+
+    center_indices = np.asarray(center_indices, dtype=np.intp)
+
+    if np.any(center_indices < 0) or np.any(center_indices >= len(positions)):
+        raise GBManipulatorValueError(
+            "center_indices contains an out-of-range index"
+        )
+
+    image_positions, source_indices, _ = _create_periodic_image_cloud(
+        rcut,
+        positions,
+        box_dims,
+        periodic,
+    )
+
+    tree = KDTree(image_positions)
+
+    neighbor_indices = []
+    neighbor_distances = []
+
+    for center_idx in center_indices:
+        matches = np.asarray(
+            tree.query_ball_point(positions[center_idx], r=rcut),
+            dtype=np.intp,
+        )
+
+        sources = source_indices[matches]
+
+        # A translated image of the center is still the same physical atom, so all
+        # center-source images are excluded for physical-neighbor selection.
+        keep = sources != center_idx
+        matches = matches[keep]
+        sources = sources[keep]
+
+        if len(matches) == 0:
+            neighbor_indices.append(np.empty(0, dtype=np.intp))
+            neighbor_distances.append(np.empty(0, dtype=float))
+            continue
+
+        distances = np.linalg.norm(
+            image_positions[matches] - positions[center_idx],
+            axis=1,
+        )
+
+        # Sort first by source index and then by distance. The first entry for each
+        # source is therefore its minimum-image representative.
+        order = np.lexsort((distances, sources))
+
+        sorted_sources = sources[order]
+        sorted_distances = distances[order]
+
+        first_for_source = np.concatenate(
+            (
+                np.array([True]),
+                sorted_sources[1:]
+                != sorted_sources[:-1],
+            )
+        )
+
+        neighbor_indices.append(sorted_sources[first_for_source])
+        neighbor_distances.append(sorted_distances[first_for_source])
+
+    return neighbor_indices, neighbor_distances
 
 
 # @jit(nopython=True, cache=True)
@@ -2712,16 +2946,18 @@ class GBManipulator:
         return_positions: bool = False,
     ) -> np.ndarray:
         """
-        Removes *gb_fraction* of atoms or *num_to_remove* atom(s) in the GB region. Uses
-        the local order parameter method of Lyakhov *et al.*, Computer Phys. Comm. 181
-        (2010) 1623-1632.
+        Removes ``gb_fraction`` of atoms or ``num_to_remove`` atom(s) in the GB region.
+        Uses the local order parameter method of Lyakhov *et al.*, Computer Phys. Comm.
+        181 (2010) 1623-1632.
 
-        One of the following parameters must be specified.
+        One of the following parameters must be specified:
         :param gb_fraction: Keyword argument. The fraction of atoms in the GB plane to
             remove. Must be less than 25% of the total number of atoms in the GB region.
         :param num_to_remove: Keyword argument. The specific number of atoms to remove.
             Maximum is 25% of the total number of atoms in the GB region.
-        :param keep_ratio: Keyword argument. Whether or not to maintain stochiometric
+
+        Other keyword arguments:
+        :param keep_ratio: Keyword argument. Whether or not to maintain stoichiometric
             ratios. Default: True.
         :param return_positions: Keyword argument, optional, defaults to False. Flag to
             include the positions of the atoms removed into the array.
@@ -2731,28 +2967,33 @@ class GBManipulator:
             raise GBManipulatorValueError(
                 "gb_fraction or num_to_remove must be specified."
             )
+
         if not self.__one_parent:
             warnings.warn("Atom removal only occurring based on parent 1.")
+
         parent = self.__parents[0]
+
         atoms = Atom.as_array(parent.whole_system, type_map=parent.unit_cell.type_map)
         gb_atoms = Atom.as_array(parent.gb_atoms, type_map=parent.unit_cell.type_map)
-        gb_atom_indices = parent.gb_indices
+        gb_atom_indices = np.asarray(parent.gb_indices, dtype=np.intp)
         type_map = parent.unit_cell.type_map
         positions = atoms[:, 1:]
 
         if gb_fraction is not None and (gb_fraction <= 0 or gb_fraction > 0.25):
             raise GBManipulatorValueError(
-                f"Invalid value for gb_fraction ({gb_fraction=}). Must be "
-                "0 < gb_fraction <= 0.25"
+                f"Invalid value for gb_fraction ({gb_fraction=}). Must be 0 < "
+                "gb_fraction <= 0.25"
             )
 
         if num_to_remove is not None and (
-            num_to_remove < 1 or num_to_remove > int(0.25 * len(gb_atoms))
+            num_to_remove < 1
+            or num_to_remove > int(0.25 * len(gb_atoms))
         ):
             raise GBManipulatorValueError(
                 "Invalid num_to_remove value. Must be >= 1, and must be less than or "
                 "equal to 25% of the total number of atoms in the GB region."
             )
+
         if num_to_remove is None:
             num_to_remove = int(gb_fraction * len(gb_atoms))
 
@@ -2762,30 +3003,47 @@ class GBManipulator:
                 f"(int({gb_fraction}*{len(gb_atoms)}) = 0)"
             )
             self.__set_candidate_labels(
-                getattr(parent, "grain_labels", None), len(parent.whole_system)
+                getattr(parent, "grain_labels", None),
+                len(parent.whole_system),
             )
             return atoms
 
         if len(type_map) == 1:
             num_to_remove_dict = {1: num_to_remove}
-        # determine both the number to remove of each type, and the probability of
-        # removal
+
         elif keep_ratio:
             num_to_remove_dict = _get_stoichiometric_change(
-                num_to_remove, parent.unit_cell.ratio
+                num_to_remove,
+                parent.unit_cell.ratio,
             )
-            num_to_remove = sum(list(num_to_remove_dict.values()))
+
+            num_to_remove = sum(num_to_remove_dict.values())
+
             central_type = min(num_to_remove_dict, key=num_to_remove_dict.get)
-            cutoff = (
-                parent.unit_cell.nn_distance(2) + parent.unit_cell.nn_distance(1)
-            ) / 2
-            neighbor_list = _create_neighbor_list(cutoff, positions)
-            Delta = 0.05  # Bin size to calculate the fingerprint vector.
-            Rmax = 15  # Max distance allowed to be a neighbor
+
+            # The Lyakhov fingerprint uses the complete radial neighborhood out to Rmax.
+            # This neighborhood is deliberately distinct from the short-range chemical
+            # partner neighborhood below.
+            Delta = 0.05
+            Rmax = 15.0
+
+            local_order_neighborhoods = (
+                _create_periodic_image_neighborhoods(
+                    Rmax,
+                    atoms,
+                    gb_atom_indices,
+                    parent.box_dims,
+                    periodic=(
+                        False,
+                        *parent.inplane_periodic,
+                    ),
+                )
+            )
+
             args_list = [
                 (
                     atoms[atom_idx],
-                    atoms[neighbor_list[atom_idx]],
+                    local_order_neighborhoods[idx],
                     parent.unit_cell.names(asint=True),
                     parent.unit_cell.a0,
                     len(parent.unit_cell.unit_cell),
@@ -2794,123 +3052,174 @@ class GBManipulator:
                 )
                 for idx, atom_idx in enumerate(gb_atom_indices)
             ]
-            order = np.zeros(len(args_list))
-            for i, args in enumerate(args_list):
-                order[i] = _calculate_local_order(*args)
 
-            # We want the probabilities to be inversely proportional to the order parameter.
-            # Higher order parameters should be more "stable" against removal than low order
-            # parameters. We give small probabilities to the higher order values just to
-            # allow for variety in the calculations.
-            probabilities = max(order) - order + min(order)
+            order = np.empty(len(args_list))
+
+            for i, args in enumerate(args_list):
+                order[i] = (_calculate_local_order(*args))
+
+            # Higher-order environments should be more resistant to removal, while
+            # retaining a small probability of selection.
+            probabilities = (max(order) - order + min(order))
             probabilities = probabilities / np.sum(probabilities, dtype=float)
+
         else:
-            # If we aren't worried about keeping the ratio, randomly assign atoms to be
-            # removed to each type, summing up to num_to_remove.
+            # If we aren't worried about keeping the ratio, randomly assign atoms
+            # to be removed to each type, summing up to num_to_remove.
             breaks = np.sort(
-                np.random.choice(
-                    range(1, num_to_remove), len(type_map) - 1, replace=False
+                self.__rng.choice(
+                    range(1, num_to_remove),
+                    len(type_map) - 1,
+                    replace=False,
                 )
             )
+
             breaks = np.concatenate(([0], breaks, [num_to_remove]))
             values = np.diff(breaks)
-            num_to_remove_dict = {
-                i + 1: int(values[i]) for i in range(len(type_map))
-            }
+            num_to_remove_dict = {i + 1: int(values[i]) for i in range(len(type_map))}
 
         if keep_ratio and len(type_map) > 1:
             type_mask = atoms[gb_atom_indices][:, 0] == central_type
+
             central_indices = gb_atom_indices[type_mask]
-            central_probabilities = probabilities[type_mask]
-            central_probabilities = (
-                central_probabilities / np.sum(central_probabilities)
-            )
 
             if len(central_indices) == 0:
                 raise GBManipulatorValueError(
                     f"No atoms found for type {central_type} in the grain boundary."
                 )
 
+            central_probabilities = probabilities[type_mask]
+            central_probabilities /= np.sum(central_probabilities)
             central_num_to_remove = num_to_remove_dict[central_type]
-            selected_central_indices = self.__rng.choice(
-                central_indices,
-                central_num_to_remove,
-                replace=False,
-                p=central_probabilities,
+
+            selected_central_indices = (
+                self.__rng.choice(
+                    central_indices,
+                    central_num_to_remove,
+                    replace=False,
+                    p=central_probabilities,
+                )
             )
 
-            distances = {
-                idx: np.full(len(neighbor_list[idx]), np.inf)
-                for idx in selected_central_indices
-            }
-            for central_idx in selected_central_indices:
-                neighbors = neighbor_list[central_idx]
-                gb_neighbors = np.intersect1d(neighbors, gb_atom_indices)
-                mask = np.isin(neighbors, gb_neighbors)
-                distances[central_idx][mask] = np.linalg.norm(
-                    positions[gb_neighbors] - positions[central_idx], axis=1
-                )
+            # This neighborhood is used only to choose atoms participating in a
+            # stoichiometrically coupled removal. Each physical atom appears once at its
+            # minimum-image distance.
+            removal_cutoff = (
+                parent.unit_cell.nn_distance(2)
+                + parent.unit_cell.nn_distance(1)
+            ) / 2
 
-            indices_to_remove = list(distances.keys())
+            (
+                removal_neighbor_indices,
+                removal_neighbor_distances,
+            ) = _create_periodic_neighbor_list(
+                removal_cutoff,
+                positions,
+                selected_central_indices,
+                parent.box_dims,
+                periodic=(
+                    False,
+                    *parent.inplane_periodic,
+                ),
+            )
+
+            indices_to_remove = list(
+                np.asarray(selected_central_indices, dtype=np.intp)
+            )
+
             for atom_type, ratio in parent.unit_cell.ratio.items():
                 if atom_type == central_type:
                     continue
-                # type_mask = atoms[gb_atom_indices][:, 0] == atom_type
-                # type_indices = gb_atom_indices[type_mask]
-                for idx, dists in distances.items():
-                    neighbor_indices = np.asarray(neighbor_list[idx])
-                    gb_neighbor_indices = np.intersect1d(
-                        neighbor_indices, gb_atom_indices)
-                    mask = np.isin(neighbor_indices, gb_neighbor_indices)
-                    type_mask = atoms[gb_neighbor_indices][:, 0] == atom_type
-                    type_indices = neighbor_indices[mask][type_mask]
-                    duplicates = [
-                        i for i, el in enumerate(type_indices)
-                        if el in indices_to_remove
-                    ]
 
-                    type_indices = list(set(type_indices) - set(duplicates))
+                for (
+                    neighbor_indices,
+                    neighbor_distances,
+                ) in zip(
+                    removal_neighbor_indices,
+                    removal_neighbor_distances,
+                    strict=True,
+                ):
+                    gb_mask = np.isin(neighbor_indices, gb_atom_indices)
+
+                    candidate_indices = neighbor_indices[gb_mask]
+                    candidate_distances = neighbor_distances[gb_mask]
+
+                    atom_type_mask = (atoms[candidate_indices][:, 0] == atom_type)
+                    candidate_indices = (candidate_indices[atom_type_mask])
+                    candidate_distances = candidate_distances[atom_type_mask]
+
+                    available_mask = ~np.isin(candidate_indices, indices_to_remove)
+                    type_indices = candidate_indices[available_mask]
+                    type_distances = candidate_distances[available_mask]
+
                     if len(type_indices) < ratio:
                         raise GBManipulatorValueError(
                             f"Not enough neighbor atoms of type {atom_type} to remove."
                         )
 
-                    # this really shouldn't happen, as this would indicate overlapping
-                    # atoms
-                    dists[dists < 1e-8] = 1e-8
-                    type_probabilities = 1 / dists[mask][type_mask]
-                    type_probabilities = type_probabilities / np.sum(type_probabilities)
-
-                    type_idx_to_remove = self.__rng.choice(
-                        type_indices, ratio, replace=False, p=type_probabilities
+                    # Distances below this tolerance would indicate overlapping atoms.
+                    type_distances = np.maximum(type_distances, 1e-8)
+                    type_probabilities = 1.0 / type_distances
+                    type_probabilities /= np.sum(type_probabilities)
+                    type_idx_to_remove = (
+                        self.__rng.choice(
+                            type_indices,
+                            ratio,
+                            replace=False,
+                            p=type_probabilities,
+                        )
                     )
 
                     indices_to_remove.extend(type_idx_to_remove)
 
-        else:  # keep_ratio == False or len(type_map) == 1
+        else:
             indices_to_remove = []
-            for atom_type, num in num_to_remove_dict.items():
-                type_indices = gb_atom_indices[
-                    atoms[gb_atom_indices][:, 0] == atom_type
-                ]
-                type_idx_to_remove = self.__rng.choice(type_indices, num, replace=False)
+
+            for atom_type, num in (num_to_remove_dict.items()):
+                type_indices = (
+                    gb_atom_indices[atoms[gb_atom_indices][:, 0] == atom_type]
+                )
+
+                type_idx_to_remove = (
+                    self.__rng.choice(
+                        type_indices,
+                        num,
+                        replace=False,
+                    )
+                )
+
                 indices_to_remove.extend(type_idx_to_remove)
 
-        if not len(indices_to_remove) == num_to_remove:
+        if len(indices_to_remove) != num_to_remove:
             raise GBManipulatorValueError("")
+
         pos = np.delete(parent.whole_system, indices_to_remove, axis=0)
+
         labels = getattr(parent, "grain_labels", None)
         retained_labels = (
             None
             if labels is None
-            else np.delete(labels, indices_to_remove, axis=0)
+            else np.delete(
+                labels,
+                indices_to_remove,
+                axis=0,
+            )
         )
-        self.__set_candidate_labels(retained_labels, len(pos))
+
+        self.__set_candidate_labels(
+            retained_labels,
+            len(pos),
+        )
 
         if return_positions:
-            return (pos, parent.whole_system[indices_to_remove])
-        else:
-            return pos
+            return (
+                pos,
+                parent.whole_system[
+                    indices_to_remove
+                ],
+            )
+
+        return pos
 
     def insert_atoms(
         self,
@@ -3170,52 +3479,95 @@ class GBManipulator:
 
         if keep_ratio and len(type_map) > 1:
             central_num_to_insert = num_to_insert_dict[central_type]
-            selected_central_indices = self.__rng.choice(
-                list(range(len(possible_sites))),
-                central_num_to_insert,
-                replace=False,
-                p=probabilities
+
+            selected_central_indices = (
+                self.__rng.choice(
+                    np.arange(len(possible_sites), dtype=np.intp),
+                    central_num_to_insert,
+                    replace=False,
+                    p=probabilities,
+                )
             )
+
             cutoff = (
-                parent.unit_cell.nn_distance(2) + parent.unit_cell.nn_distance(1)
+                parent.unit_cell.nn_distance(2)
+                + parent.unit_cell.nn_distance(1)
             ) / 2.0
-            possible_sites_neighbor_list = _create_neighbor_list(cutoff, possible_sites)
+
+            possible_sites_neighbor_list, _ = _create_periodic_neighbor_list(
+                cutoff,
+                possible_sites,
+                selected_central_indices,
+                parent.box_dims,
+                periodic=(False, *parent.inplane_periodic),
+            )
 
             atoms_to_add = {
-                type_map[i]: [] if type_map[i] != central_type else selected_central_indices for i in type_map.keys()}
+                type_map[i]: (
+                    []
+                    if type_map[i] != central_type
+                    else list(np.asarray(selected_central_indices, dtype=np.intp))
+                )
+                for i in type_map.keys()
+            }
+
             for atom_type, ratio in parent.unit_cell.ratio.items():
                 if atom_type == central_type:
                     continue
-                for idx in selected_central_indices:
-                    neighbors = possible_sites_neighbor_list[idx]
-                    already_assigned = {idx for v in atoms_to_add.values() for idx in v}
-                    # Only consider the indices that have not already been assigned
-                    available_neighbors = list(set(neighbors) - already_assigned)
+
+                for neighbors in possible_sites_neighbor_list:
+                    already_assigned = {
+                        idx
+                        for values in atoms_to_add.values()
+                        for idx in values
+                    }
+
+                    # Keep the helper's deterministic neighbor ordering while excluding
+                    # sites already assigned to another inserted atom.
+                    available_neighbors = np.asarray(
+                        [idx for idx in neighbors if idx not in already_assigned],
+                        dtype=np.intp,
+                    )
+
                     if len(available_neighbors) < ratio:
                         raise GBManipulatorValueError(
                             "Not enough sites to insert atoms into."
                         )
+
                     partial_probabilities = probabilities[available_neighbors]
-                    partial_probabilities = partial_probabilities / \
-                        np.sum(partial_probabilities)
-                    selected_neighbor_offsets = self.__rng.choice(
-                        list(range(len(available_neighbors))), ratio, replace=False,
-                        p=partial_probabilities
+                    partial_probabilities /= np.sum(partial_probabilities)
+
+                    selected_indices = (
+                        self.__rng.choice(
+                            available_neighbors,
+                            ratio,
+                            replace=False,
+                            p=partial_probabilities,
+                        )
                     )
-                    selected_indices = [
-                        available_neighbors[offset]
-                        for offset in selected_neighbor_offsets
-                    ]
+
                     atoms_to_add[atom_type].extend(selected_indices)
+
         else:
             atoms_to_add = {}
+
             site_indices = list(range(len(possible_sites)))
-            for atom_type, num in num_to_insert_dict.items():
+
+            for atom_type, num in (num_to_insert_dict.items()):
                 available_indices = list(
-                    set(site_indices) - set(np.array(atoms_to_add.values()).flatten()))
-                type_idx_to_insert = self.__rng.choice(
-                    available_indices, num, replace=False, p=probabilities
+                    set(site_indices)
+                    - set(np.array(atoms_to_add.values()).flatten())
                 )
+
+                type_idx_to_insert = (
+                    self.__rng.choice(
+                        available_indices,
+                        num,
+                        replace=False,
+                        p=probabilities,
+                    )
+                )
+
                 atoms_to_add[atom_type] = type_idx_to_insert
 
         new_atoms = np.array(

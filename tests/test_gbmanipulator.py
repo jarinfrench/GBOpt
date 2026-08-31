@@ -31,16 +31,17 @@ from GBOpt.GBManipulator import (
     ParentsProxyValueError,
     ParentValueError,
     _calculate_local_order,
+    _create_periodic_image_neighborhoods,
+    _create_periodic_neighbor_list,
     _ParentsProxy,
 )
-from GBOpt.GrainOwnership import LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL, GrainOwnership
-
+from GBOpt.GrainOwnership import LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL
+from GBOpt.UnitCell import UnitCell
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:File-backed Parent initialization without explicit grain ownership is "
     "deprecated.*:DeprecationWarning"
 )
-from GBOpt.UnitCell import UnitCell
 
 _TEST_DIR = Path(__file__).resolve().parent
 _INPUT_DIR = _TEST_DIR / "inputs"
@@ -234,20 +235,40 @@ def test_local_order_is_higher_for_ideal_crystal_neighborhoods(structure, atoms)
     assert ideal_order > distorted_order + 1e-8
 
 
-def _synthetic_manipulator(unit_cell, atoms, seed=100):
-    # Bypass full GBMaker construction so stoichiometric mutator tests can
-    # isolate selection logic with a tiny deterministic parent.
+def _synthetic_manipulator(
+    unit_cell,
+    atoms,
+    seed=100,
+    *,
+    box_dims=None,
+    inplane_periodic=(False, False),
+):
+    # Bypass full GBMaker construction so stoichiometric mutator tests can isolate
+    # selection logic with a tiny deterministic parent.
+    if box_dims is None:
+        box_dims = np.asarray(
+            [
+                [-20.0, 20.0],
+                [-20.0, 20.0],
+                [-20.0, 20.0],
+            ],
+            dtype=float,
+        )
+
     parent = SimpleNamespace(
         unit_cell=unit_cell,
         whole_system=atoms,
         gb_atoms=atoms,
-        gb_indices=np.arange(len(atoms)),
+        gb_indices=np.arange(len(atoms), dtype=np.intp),
+        box_dims=np.asarray(box_dims, dtype=float),
+        inplane_periodic=tuple(inplane_periodic),
     )
 
     manipulator = object.__new__(GBManipulator)
     manipulator._GBManipulator__one_parent = True
     manipulator._GBManipulator__parents = [parent, None]
-    manipulator.rng = np.random.default_rng(seed)
+    manipulator.rng = (np.random.default_rng(seed))
+
     return manipulator
 
 
@@ -263,18 +284,24 @@ def test_insert_atoms_with_stoichiometry_uses_selected_neighbor_site_ids(monkeyp
         ],
         dtype=Atom.atom_dtype,
     )
-    manipulator = _synthetic_manipulator(unit_cell, atoms)
+    manipulator = _synthetic_manipulator(
+        unit_cell,
+        atoms,
+        box_dims=np.array([[-1.0, 4.0], [0.0, 4.0], [-1.0, 4.0]], dtype=float),
+        inplane_periodic=(True, False)
+    )
 
     class FixedChoiceRng:
         def __init__(self):
-            self.results = iter((np.array([3]), np.array([0, 1])))
+            self.results = iter((np.array([3]), np.array([5, 7])))
 
         def choice(self, choices, size, replace=False, p=None):
+            del p
+            choices = np.asarray(choices)
             result = next(self.results)
             assert len(result) == size
             assert replace is False
-            assert np.all(result >= 0)
-            assert np.all(result < len(choices))
+            assert np.all(np.isin(result, choices))
             return result
 
     class FakeKDTree:
@@ -282,30 +309,28 @@ def test_insert_atoms_with_stoichiometry_uses_selected_neighbor_site_ids(monkeyp
             self.data = np.asarray(data, dtype=float)
 
         def query_ball_tree(self, other, _radius):
+            del other
             return [[] for _ in range(len(self.data))]
 
         def query(self, points, k=1):
+            del k
             return np.ones(len(points)), np.zeros(len(points), dtype=int)
 
     recorded_sites = {}
 
-    def sparse_site_neighbors(_cutoff, positions):
+    def sparse_site_neighbors(_cutoff, positions, center_indices, _box_dims, periodic):
         recorded_sites["positions"] = np.asarray(positions, dtype=float)
-        neighbors = [[] for _ in range(len(positions))]
-        neighbors[3] = [5, 7]
-        return neighbors
+        np.testing.assert_array_equal(center_indices, np.array([3], dtype=np.intp))
+        assert periodic == (False, True, False)
+        return ([np.array([5, 7], dtype=np.intp)], [np.array([1.0, 1.0])])
 
     manipulator.rng = FixedChoiceRng()
-    gbmanipulator_module = importlib.import_module("GBOpt.GBManipulator")
+    module = importlib.import_module("GBOpt.GBManipulator")
 
-    monkeypatch.setattr(gbmanipulator_module, "KDTree", FakeKDTree)
-    monkeypatch.setattr(
-        gbmanipulator_module,
-        "_create_neighbor_list",
-        sparse_site_neighbors,
-    )
+    monkeypatch.setattr(module, "KDTree", FakeKDTree)
+    monkeypatch.setattr(module, "_create_periodic_neighbor_list", sparse_site_neighbors)
 
-    _new_system, new_atoms = manipulator.insert_atoms(
+    _, new_atoms = manipulator.insert_atoms(
         num_to_insert=1,
         method="grid",
         keep_ratio=True,
@@ -1655,11 +1680,157 @@ def test_explicit_ownership_parent_proxy_replacement_resets_candidate_labels(tmp
     assert len(manipulator.candidate_grain_labels) == len(labels) - 1
 
     manipulator.parents[0] = replacement.parents[0]
-
     assert np.array_equal(
         manipulator.candidate_grain_labels,
         replacement_labels,
     )
+
+
+def test_periodic_image_neighborhood_retains_translated_self_images():
+    atoms = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=float)
+    box_dims = np.array([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]], dtype=float)
+    neighbors = (
+        _create_periodic_image_neighborhoods(
+            1.01,
+            atoms,
+            np.array([0], dtype=np.intp),
+            box_dims,
+            (True, True, True),
+        )[0]
+    )
+
+    assert len(neighbors) == 6
+
+    distances = np.linalg.norm(neighbors[:, 1:] - atoms[0, 1:], axis=1)
+    np.testing.assert_allclose(distances, np.ones(6))
+
+
+def test_periodic_physical_neighbors_deduplicate_images_at_minimum_distance():
+    positions = np.array([[0.0, 0.0, 0.0], [0.0, 0.4, 0.0]], dtype=float)
+    box_dims = np.array([[0.0, 10.0], [0.0, 1.0], [0.0, 10.0]], dtype=float)
+    (neighbor_indices, neighbor_distances) = _create_periodic_neighbor_list(
+        1.6,
+        positions,
+        np.array([0], dtype=np.intp),
+        box_dims,
+        (False, True, False),
+    )
+
+    np.testing.assert_array_equal(neighbor_indices[0], np.array([1], dtype=np.intp))
+    np.testing.assert_allclose(neighbor_distances[0], np.array([0.4]))
+
+
+def test_periodic_physical_neighbors_do_not_wrap_nonperiodic_x():
+    positions = np.array([[0.1, 0.0, 0.0], [0.9, 0.0, 0.0]], dtype=float)
+    box_dims = np.array([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]], dtype=float)
+    (neighbor_indices, neighbor_distances) = _create_periodic_neighbor_list(
+        0.3,
+        positions,
+        np.array([0], dtype=np.intp),
+        box_dims,
+        (False, False, False),
+    )
+
+    assert neighbor_indices[0].size == 0
+    assert neighbor_distances[0].size == 0
+
+
+def test_remove_atoms_local_order_uses_atoms_beyond_partner_cutoff(monkeypatch):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("rocksalt", 4.0, ("Na", "Cl"))
+
+    atoms = np.array(
+        [
+            ("Na", 0.0, 0.0, 0.0),
+            ("Cl", 0.0, 1.0, 0.0),
+            ("Cl", 0.0, 5.0, 0.0),
+            ("Na", 0.0, 8.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+
+    manipulator = _synthetic_manipulator(unit_cell, atoms)
+
+    recorded = {}
+
+    def record_local_order(atom, neighs, *_args):
+        if np.allclose(atom[1:], np.array([0.0, 0.0, 0.0])):
+            recorded["neighbors"] = np.array(neighs, copy=True)
+        return 1.0
+
+    class FirstChoiceRng:
+        @staticmethod
+        def choice(choices, size, replace=False, p=None):
+            del replace, p
+            return np.asarray(choices)[:size]
+
+    module = importlib.import_module("GBOpt.GBManipulator")
+    monkeypatch.setattr(module, "_calculate_local_order", record_local_order)
+    manipulator.rng = FirstChoiceRng()
+    reduced = manipulator.remove_atoms(num_to_remove=1, keep_ratio=True)
+    local_neighbors = recorded["neighbors"]
+
+    # This Cl is well beyond the short stoichiometric-partner cutoff, but inside Rmax
+    # and therefore must participate in the local-order fingerprint.
+    assert np.any(
+        np.all(
+            np.isclose(local_neighbors[:, 1:], np.array([0.0, 5.0, 0.0])),
+            axis=1,
+        )
+    )
+
+    # It must not, however, be selected as the short-range Cl partner.
+    assert np.any((reduced["name"] == "Cl") & np.isclose(reduced["y"], 5.0))
+
+
+def test_remove_atoms_partner_selection_uses_periodic_minimum_image(monkeypatch):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("rocksalt", 4.0, ("Na", "Cl"))
+
+    atoms = np.array(
+        [
+            ("Na", 0.0, 0.1, 0.0),
+            ("Cl", 0.0, 9.9, 0.0),
+            ("Na", 0.0, 5.0, 0.0),
+            ("Cl", 0.0, 5.5, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+
+    box_dims = np.array([[-1.0, 1.0], [0.0, 10.0], [-1.0, 1.0]], dtype=float)
+
+    manipulator = (
+        _synthetic_manipulator(
+            unit_cell,
+            atoms,
+            box_dims=box_dims,
+            inplane_periodic=(True, False),
+        )
+    )
+
+    class FirstChoiceRng:
+        @staticmethod
+        def choice(choices, size, replace=False, p=None):
+            del replace, p
+            return np.asarray(choices)[:size]
+
+    module = importlib.import_module("GBOpt.GBManipulator")
+    monkeypatch.setattr(module, "_calculate_local_order", lambda *_args: 1.0)
+    manipulator.rng = FirstChoiceRng()
+
+    _, removed = (
+        manipulator.remove_atoms(
+            num_to_remove=1,
+            keep_ratio=True,
+            return_positions=True,
+        )
+    )
+
+    assert set(removed["name"]) == {"Na", "Cl"}
+
+    # The selected Na is at y=0.1. Its Cl partner at y=9.9 is only 0.2 Angstrom away
+    # through the periodic y boundary.
+    assert np.any((removed["name"] == "Cl") & np.isclose(removed["y"], 9.9))
 
 
 if __name__ == '__main__':
