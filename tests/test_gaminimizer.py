@@ -33,6 +33,7 @@ from GBOpt.GrainOwnership import (
     RIGHT_GRAIN_LABEL,
     GrainOwnership,
 )
+from GBOpt.UnitCell import UnitCell
 
 _TEST_CALCULATION_CONTEXT = {"calculator": {"name": "test-evaluator"}}
 
@@ -2243,6 +2244,79 @@ def test_owned_checkpoint_pickle_resume(owned_ga, tmp_path):
     assert len(resumed.history) == 2
 
 
+@pytest.mark.parametrize(
+    ("structure", "atoms", "expected_count"),
+    [
+        pytest.param("fcc", "Ni", 1, id="monatomic"),
+        pytest.param("rocksalt", ("U", "N"), 2, id="un"),
+        pytest.param("fluorite", ("U", "O"), 3, id="uo2"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("choice", "expected_prefix"),
+    [
+        pytest.param("insert_atoms", "add", id="insert"),
+        pytest.param("remove_atoms", "remove", id="remove"),
+    ],
+)
+def test_mutator_changes_one_formula_unit(
+    structure,
+    atoms,
+    expected_count,
+    choice,
+    expected_prefix,
+):
+    """Insertion and removal mutations should change one formula unit."""
+
+    class FixedRandom:
+        def permutation(self, size):
+            assert size == 1
+            return np.array([0])
+
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure(structure, 4.0, atoms)
+
+    class Parent:
+        pass
+
+    parent = Parent()
+    parent.unit_cell = unit_cell
+
+    class Manipulator:
+        def __init__(self):
+            self.parents = [parent]
+            self.inserted = None
+            self.removed = None
+
+        def insert_atoms(self, *, method, num_to_insert):
+            assert method == "grid"
+            self.inserted = num_to_insert
+            return "inserted-system"
+
+        def remove_atoms(self, *, num_to_remove):
+            self.removed = num_to_remove
+            return "removed-system"
+
+    manipulator = Manipulator()
+    mutator = Mutator([choice], manipulator)
+
+    mutation, new_system = mutator.mutate(
+        local_random=FixedRandom(),
+        GB=object(),
+        manipulator=manipulator,
+    )
+
+    assert mutation == f"{expected_prefix}{expected_count}"
+    if choice == "insert_atoms":
+        assert manipulator.inserted == expected_count
+        assert manipulator.removed is None
+        assert new_system == "inserted-system"
+    else:
+        assert manipulator.inserted is None
+        assert manipulator.removed == expected_count
+        assert new_system == "removed-system"
+
+
 def test_mutator_retries_after_infeasible_mutation():
     """An infeasible mutation should fall through to another configured choice."""
 
@@ -2256,7 +2330,11 @@ def test_mutator_retries_after_infeasible_mutation():
             assert high == 1
             return 0.5
 
+    class UnitCellStub:
+        formula_ratio = (("Ni", 1),)
+
     class Parent:
+        unit_cell = UnitCellStub()
         box_dims = np.array(
             [
                 [0.0, 10.0],
@@ -2315,7 +2393,15 @@ def test_mutator_does_not_hide_unexpected_mutation_error():
             assert size == 2
             return np.array([0, 1])
 
+    class UnitCellStub:
+        formula_ratio = (("Ni", 1),)
+
+    class Parent:
+        unit_cell = UnitCellStub()
+
     class Manipulator:
+        parents = [Parent()]
+
         def __init__(self):
             self.calls = []
 
@@ -2360,7 +2446,11 @@ def test_mutator_fails_when_all_mutations_are_infeasible():
             assert high == 1
             return 0.5
 
+    class UnitCellStub:
+        formula_ratio = (("Ni", 1),)
+
     class Parent:
+        unit_cell = UnitCellStub()
         box_dims = np.array(
             [
                 [0.0, 10.0],

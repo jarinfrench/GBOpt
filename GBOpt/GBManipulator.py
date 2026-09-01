@@ -3497,18 +3497,11 @@ class GBManipulator:
             central_probabilities /= np.sum(central_probabilities)
             central_num_to_remove = num_to_remove_dict[central_type]
 
-            selected_central_indices = (
-                self.__rng.choice(
-                    central_indices,
-                    central_num_to_remove,
-                    replace=False,
-                    p=central_probabilities,
-                )
-            )
-
             # This neighborhood is used only to choose atoms participating in a
             # stoichiometrically coupled removal. Each physical atom appears once at its
-            # minimum-image distance.
+            # minimum-image distance. Build it for every possible central atom so a
+            # center without eligible GB-region partners can be skipped rather than
+            # causing an otherwise feasible mutation to fail.
             removal_cutoff = (
                 parent.unit_cell.nn_distance(2)
                 + parent.unit_cell.nn_distance(1)
@@ -3520,7 +3513,7 @@ class GBManipulator:
             ) = _create_periodic_neighbor_list(
                 removal_cutoff,
                 positions,
-                selected_central_indices,
+                central_indices,
                 parent.box_dims,
                 periodic=(
                     False,
@@ -3528,35 +3521,86 @@ class GBManipulator:
                 ),
             )
 
-            indices_to_remove = list(
-                np.asarray(selected_central_indices, dtype=np.intp)
-            )
+            partner_requirements = [
+                (atom_type, ratio)
+                for atom_type, ratio in parent.unit_cell.ratio.items()
+                if atom_type != central_type
+            ]
+            indices_to_remove = []
+            available_centers = np.ones(len(central_indices), dtype=bool)
 
-            for atom_type, ratio in parent.unit_cell.ratio.items():
-                if atom_type == central_type:
-                    continue
+            for _ in range(central_num_to_remove):
+                eligible_center_positions = []
 
-                for (
-                    neighbor_indices,
-                    neighbor_distances,
-                ) in zip(
-                    removal_neighbor_indices,
-                    removal_neighbor_distances,
-                    strict=True,
-                ):
+                for center_position in np.flatnonzero(available_centers):
+                    neighbor_indices = removal_neighbor_indices[center_position]
+                    center_is_eligible = True
+
+                    for atom_type, ratio in partner_requirements:
+                        gb_mask = np.isin(neighbor_indices, gb_atom_indices)
+                        candidate_indices = neighbor_indices[gb_mask]
+                        atom_type_mask = atoms[candidate_indices][:, 0] == atom_type
+                        candidate_indices = candidate_indices[atom_type_mask]
+                        available_mask = ~np.isin(
+                            candidate_indices,
+                            indices_to_remove,
+                        )
+
+                        if np.count_nonzero(available_mask) < ratio:
+                            center_is_eligible = False
+                            break
+
+                    if center_is_eligible:
+                        eligible_center_positions.append(center_position)
+
+                if not eligible_center_positions:
+                    raise GBManipulatorValueError(
+                        f"No atom of type {central_type} in the grain boundary has "
+                        "enough eligible stoichiometric neighbors to remove."
+                    )
+
+                eligible_center_positions = np.asarray(
+                    eligible_center_positions,
+                    dtype=np.intp,
+                )
+                eligible_probabilities = central_probabilities[
+                    eligible_center_positions
+                ]
+                eligible_probabilities /= np.sum(eligible_probabilities)
+                selected_center_position = int(
+                    self.__rng.choice(
+                        eligible_center_positions,
+                        1,
+                        replace=False,
+                        p=eligible_probabilities,
+                    )[0]
+                )
+                selected_central_index = int(
+                    central_indices[selected_center_position]
+                )
+                indices_to_remove.append(selected_central_index)
+                available_centers[selected_center_position] = False
+
+                neighbor_indices = removal_neighbor_indices[selected_center_position]
+                neighbor_distances = removal_neighbor_distances[
+                    selected_center_position
+                ]
+
+                for atom_type, ratio in partner_requirements:
                     gb_mask = np.isin(neighbor_indices, gb_atom_indices)
-
                     candidate_indices = neighbor_indices[gb_mask]
                     candidate_distances = neighbor_distances[gb_mask]
 
-                    atom_type_mask = (atoms[candidate_indices][:, 0] == atom_type)
-                    candidate_indices = (candidate_indices[atom_type_mask])
+                    atom_type_mask = atoms[candidate_indices][:, 0] == atom_type
+                    candidate_indices = candidate_indices[atom_type_mask]
                     candidate_distances = candidate_distances[atom_type_mask]
 
                     available_mask = ~np.isin(candidate_indices, indices_to_remove)
                     type_indices = candidate_indices[available_mask]
                     type_distances = candidate_distances[available_mask]
 
+                    # Eligibility is checked above. Keep this guard local so future
+                    # changes to partner requirements cannot silently over-select.
                     if len(type_indices) < ratio:
                         raise GBManipulatorValueError(
                             f"Not enough neighbor atoms of type {atom_type} to remove."
@@ -3566,13 +3610,11 @@ class GBManipulator:
                     type_distances = np.maximum(type_distances, 1e-8)
                     type_probabilities = 1.0 / type_distances
                     type_probabilities /= np.sum(type_probabilities)
-                    type_idx_to_remove = (
-                        self.__rng.choice(
-                            type_indices,
-                            ratio,
-                            replace=False,
-                            p=type_probabilities,
-                        )
+                    type_idx_to_remove = self.__rng.choice(
+                        type_indices,
+                        ratio,
+                        replace=False,
+                        p=type_probabilities,
                     )
 
                     indices_to_remove.extend(type_idx_to_remove)

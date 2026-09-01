@@ -1760,6 +1760,75 @@ def test_remove_atoms_local_order_uses_atoms_beyond_partner_cutoff(monkeypatch):
     assert np.any((reduced["name"] == "Cl") & np.isclose(reduced["y"], 5.0))
 
 
+def test_remove_atoms_skips_central_atom_without_stoichiometric_partner(
+    monkeypatch,
+):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("rocksalt", 4.0, ("Na", "Cl"))
+
+    atoms = np.array(
+        [
+            ("Na", 0.0, 0.0, 0.0),
+            ("Cl", 0.0, 0.5, 0.0),
+            ("Na", 0.0, 1.0, 0.0),
+            ("Cl", 0.0, 1.5, 0.0),
+            ("Na", 0.0, 2.0, 0.0),
+            ("Cl", 0.0, 2.5, 0.0),
+            ("Na", 0.0, 3.0, 0.0),
+            ("Cl", 0.0, 3.5, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    manipulator = _synthetic_manipulator(unit_cell, atoms)
+
+    def removal_neighbors(_cutoff, _positions, center_indices, _box, periodic):
+        np.testing.assert_array_equal(
+            center_indices,
+            np.array([0, 2, 4, 6], dtype=np.intp),
+        )
+        assert periodic == (False, False, False)
+        return (
+            [
+                np.empty(0, dtype=np.intp),
+                np.array([3], dtype=np.intp),
+                np.array([5], dtype=np.intp),
+                np.array([7], dtype=np.intp),
+            ],
+            [
+                np.empty(0, dtype=float),
+                np.array([0.5]),
+                np.array([0.5]),
+                np.array([0.5]),
+            ],
+        )
+
+    class FirstChoiceRng:
+        @staticmethod
+        def choice(choices, size, replace=False, p=None):
+            del replace, p
+            return np.asarray(choices)[:size]
+
+    module = importlib.import_module("GBOpt.GBManipulator")
+    monkeypatch.setattr(module, "_calculate_local_order", lambda *_args: 1.0)
+    monkeypatch.setattr(
+        module,
+        "_create_periodic_neighbor_list",
+        removal_neighbors,
+    )
+    manipulator.rng = FirstChoiceRng()
+
+    _, removed = manipulator.remove_atoms(
+        num_to_remove=2,
+        keep_ratio=True,
+        return_positions=True,
+    )
+
+    assert len(removed) == 2
+    assert set(removed["name"]) == {"Na", "Cl"}
+    assert np.any((removed["name"] == "Na") & np.isclose(removed["y"], 1.0))
+    assert np.any((removed["name"] == "Cl") & np.isclose(removed["y"], 1.5))
+
+
 def test_remove_atoms_partner_selection_uses_periodic_minimum_image(monkeypatch):
     unit_cell = UnitCell()
     unit_cell.init_by_structure("rocksalt", 4.0, ("Na", "Cl"))

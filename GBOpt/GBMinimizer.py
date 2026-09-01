@@ -64,6 +64,7 @@ from GBOpt.GBManipulator import (
     GBManipulatorValueError,
     ParentError,
 )
+from GBOpt.UnitCell import UnitCellValueError
 
 ENERGY_PENALTY: float = 1.0e30
 """Optimizer policy for ranking failed candidate evaluations."""
@@ -784,18 +785,30 @@ class Mutator:
         :return: Mutation description and resulting atom positions.
         :raises GBManipulatorValueError: If the selected mutation is infeasible.
         :raises GBMinimizerValueError: If ``choice_key`` is unsupported.
+        :raises UnitCellValueError: If parent unit-cell formula metadata is inconsistent.
         """
+        formula_unit_size = None
+        if choice_key in {"insert_atoms", "remove_atoms"}:
+            formula_unit_size = sum(
+                coefficient
+                for _, coefficient in (
+                    manipulator.parents[0].unit_cell.formula_ratio
+                )
+            )
+
         match choice_key:
             case "insert_atoms":
                 new_system = manipulator.insert_atoms(
                     method="grid",
-                    num_to_insert=1,
+                    num_to_insert=formula_unit_size,
                 )
-                mutation = "add1"
+                mutation = f"add{formula_unit_size}"
 
             case "remove_atoms":
-                new_system = manipulator.remove_atoms(num_to_remove=1)
-                mutation = "remove1"
+                new_system = manipulator.remove_atoms(
+                    num_to_remove=formula_unit_size,
+                )
+                mutation = f"remove{formula_unit_size}"
 
             case "translate_right_grain":
                 parent = manipulator.parents[0]
