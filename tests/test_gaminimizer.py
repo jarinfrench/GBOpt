@@ -690,6 +690,122 @@ def test_run_ga_returns_best_energy_and_dump(ga_gb, tmp_path):
     assert len(minimizer.GBE_vals) == minimizer.generations + 1
 
 
+def test_positive_keep_top_pct_retains_elite_for_small_population(ga_gb, tmp_path):
+    def fake_energy_func(GB, manipulator, atom_positions, unique_id):
+        dump_file = tmp_path / f"{unique_id}.data"
+        GB.write_lammps(
+            str(dump_file),
+            atom_positions,
+            manipulator.parents[0].box_dims,
+        )
+        return 0.0, str(dump_file)
+
+    minimizer = GeneticAlgorithmMinimizer(
+        ga_gb,
+        fake_energy_func,
+        ["translate_right_grain"],
+        seed=0,
+        population_size=8,
+        generations=2,
+        keep_top_pct=10,
+        intermediate_pct=100,
+        slice_and_merge_pct=0,
+    )
+
+    minimizer.run_GA(unique_id=102)
+
+    operations = [lineage[0] for lineage, _energy in minimizer.history[1]]
+    assert operations.count("carryover") == 1
+    assert len(operations) == minimizer.population_size
+
+
+def test_positive_intermediate_pct_keeps_small_parent_pool_nonempty(ga_gb, tmp_path):
+    def fake_energy_func(GB, manipulator, atom_positions, unique_id):
+        dump_file = tmp_path / f"{unique_id}.data"
+        GB.write_lammps(
+            str(dump_file),
+            atom_positions,
+            manipulator.parents[0].box_dims,
+        )
+        return 0.0, str(dump_file)
+
+    minimizer = GeneticAlgorithmMinimizer(
+        ga_gb,
+        fake_energy_func,
+        ["translate_right_grain"],
+        seed=0,
+        population_size=8,
+        generations=2,
+        keep_top_pct=0,
+        intermediate_pct=10,
+        slice_and_merge_pct=0,
+    )
+
+    minimizer.run_GA(unique_id=103)
+
+    expected_parent = tmp_path / "GA_103_g0_c0.data"
+    parent_paths = {
+        Path(lineage[1])
+        for lineage, _energy in minimizer.history[1]
+    }
+    assert parent_paths == {expected_parent}
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value", "error_type"),
+    [
+        pytest.param("keep_top_pct", True, GBMinimizerTypeError, id="elite-bool"),
+        pytest.param(
+            "keep_top_pct", 10.5, GBMinimizerTypeError, id="elite-float"
+        ),
+        pytest.param(
+            "keep_top_pct", -1, GBMinimizerValueError, id="elite-negative"
+        ),
+        pytest.param(
+            "keep_top_pct", 101, GBMinimizerValueError, id="elite-above-100"
+        ),
+        pytest.param(
+            "intermediate_pct",
+            True,
+            GBMinimizerTypeError,
+            id="parent-bool",
+        ),
+        pytest.param(
+            "intermediate_pct",
+            10.5,
+            GBMinimizerTypeError,
+            id="parent-float",
+        ),
+        pytest.param(
+            "intermediate_pct",
+            0,
+            GBMinimizerValueError,
+            id="parent-zero",
+        ),
+        pytest.param(
+            "intermediate_pct",
+            101,
+            GBMinimizerValueError,
+            id="parent-above-100",
+        ),
+    ],
+)
+def test_ga_selection_percentages_reject_invalid_values(
+    ga_gb,
+    parameter,
+    value,
+    error_type,
+):
+    """GA selection percentages should fail at the optimizer boundary."""
+    with pytest.raises(error_type, match=parameter):
+        GeneticAlgorithmMinimizer(
+            ga_gb,
+            lambda *_args: (0.0, None),
+            ["translate_right_grain"],
+            **{parameter: value},
+        )
+
+
 @pytest.mark.parametrize(
     ("slice_and_merge_pct", "expected_crossover_slots"),
     [
