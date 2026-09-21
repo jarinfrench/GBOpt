@@ -17,16 +17,16 @@ from GBOpt.BoundarySpec import CSLExactSpec
 from GBOpt.Checkpoint import CandidateCheckpoint, CheckpointStore
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import CompositionAwareCrossoverError, GBManipulator
-from GBOpt.GBMinimizer import (
-    GBMinimizerError,
-    GBMinimizerTypeError,
-    GBMinimizerValueError,
-    GeneticAlgorithmMinimizer,
-)
 from GBOpt.GrainOwnership import (
     LEFT_GRAIN_LABEL,
     RIGHT_GRAIN_LABEL,
     GrainOwnership,
+)
+from GBOpt.optimization.genetic import GeneticAlgorithmMinimizer
+from GBOpt.optimization.types import (
+    GBMinimizerError,
+    GBMinimizerTypeError,
+    GBMinimizerValueError,
 )
 
 _TEST_CALCULATION_CONTEXT = {"calculator": {"name": "test-evaluator"}}
