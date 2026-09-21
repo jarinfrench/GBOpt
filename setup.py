@@ -17,7 +17,8 @@ setup(
         "spglib",
     ],
     extras_require={
-        "test": ["pytest"]
+        "test": ["pytest"],
+        "dev": ["ruff", "mypy", "bandit", "pyscn"],
     },
     author="Chaitanya Bhave and Jarin French",
     author_email="chaitanya.bhave@inl.gov and jarin.french@inl.gov",

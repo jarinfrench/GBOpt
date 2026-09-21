@@ -1,0 +1,22 @@
+# Tool configuration only. The package itself is still defined by setup.py.
+# This file (and the "dev" extra in setup.py) is a fork-local experiment —
+# see tooling/lint-typecheck-experiment branch notes before merging upstream.
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+extend-exclude = ["examples"]
+
+[tool.ruff.lint]
+# Ruff's own defaults (E4, E7, E9, F) plus the modernization/simplification
+# families that turned up real findings in the baseline scan.
+extend-select = ["UP", "C4", "SIM", "PIE", "RUF", "B"]
+ignore = [
+    "N999", # module names like GBMaker.py, Atom.py are an intentional convention here
+]
+
+[tool.ruff.format]
+# ruff format is black-compatible by default; no overrides needed.
+
+[tool.bandit]
+exclude_dirs = ["tests", "examples"]
