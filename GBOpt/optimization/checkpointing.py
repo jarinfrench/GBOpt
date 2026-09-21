@@ -25,7 +25,7 @@ from GBOpt.artifacts.provenance import (
 )
 from GBOpt.artifacts.store import ArtifactStore, ArtifactStoreError
 from GBOpt.artifacts.types import ArtifactPin, CandidatePropertyContext
-from GBOpt.optimization.errors import (
+from GBOpt.optimization.types import (
     GBMinimizerError,
     GBMinimizerTypeError,
     GBMinimizerValueError,

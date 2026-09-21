@@ -68,18 +68,16 @@ from GBOpt.optimization.checkpointing import (
     _run_artifact_provenance,
     _write_artifact_manifest,
 )
-from GBOpt.optimization.errors import (
+from GBOpt.optimization.mutation import Mutator
+from GBOpt.optimization.types import (
     GBMinimizerError,
     GBMinimizerTypeError,
     GBMinimizerValueError,
-)
-from GBOpt.optimization.evaluation import (
     _CachedEvaluation,
     _candidate_mapping_from_state,
     _candidate_mapping_to_state,
     _FailureDiagnostic,
 )
-from GBOpt.optimization.mutation import Mutator
 
 ENERGY_PENALTY: float = 1.0e30
 """Optimizer policy for ranking failed candidate evaluations."""

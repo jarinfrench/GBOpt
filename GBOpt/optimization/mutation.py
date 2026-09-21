@@ -6,7 +6,7 @@ import numpy as np
 
 from GBOpt import GBMaker, GBManipulator
 from GBOpt.GBManipulator import GBManipulatorValueError
-from GBOpt.optimization.errors import GBMinimizerError, GBMinimizerValueError
+from GBOpt.optimization.types import GBMinimizerError, GBMinimizerValueError
 
 
 class Mutator:

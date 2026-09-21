@@ -47,12 +47,12 @@ from GBOpt.optimization.checkpointing import (
     _run_artifact_provenance,
     _write_artifact_manifest,
 )
-from GBOpt.optimization.errors import (
+from GBOpt.optimization.mutation import Mutator
+from GBOpt.optimization.types import (
     GBMinimizerError,
     GBMinimizerTypeError,
     GBMinimizerValueError,
 )
-from GBOpt.optimization.mutation import Mutator
 
 
 class MonteCarloMinimizer:

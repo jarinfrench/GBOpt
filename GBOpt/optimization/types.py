@@ -1,6 +1,13 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
-"""Candidate evaluation and checkpoint-state normalization helpers."""
+"""Shared data types, exceptions, and checkpoint-state contracts for optimization.
+
+Contains the exception hierarchy, small immutable evaluation-result values, and
+candidate/file mapping (de)serialization helpers shared across the optimization
+package. No optimizer policy, mutation dispatch, or artifact-retention orchestration
+belongs here; this module is a data-definition layer imported by other optimization
+modules.
+"""
 
 from dataclasses import dataclass
 from numbers import Integral
@@ -9,7 +16,18 @@ import numpy as np
 
 from GBOpt._explicit_ownership_evaluation import CandidateEvaluation
 from GBOpt.FileGrainOwnership import CandidateFileMapping, GrainOwnershipError
-from GBOpt.optimization.errors import GBMinimizerError, GBMinimizerValueError
+
+
+class GBMinimizerError(Exception):
+    """Base exception for the GBMinimizer module."""
+
+
+class GBMinimizerTypeError(GBMinimizerError, TypeError):
+    """Raised when an argument has an unexpected type."""
+
+
+class GBMinimizerValueError(GBMinimizerError, ValueError):
+    """Raised when an argument has an invalid value."""
 
 
 @dataclass(frozen=True, slots=True)
