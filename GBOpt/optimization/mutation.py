@@ -2,6 +2,8 @@
 
 """Random mutation selection over GBManipulator operations."""
 
+from __future__ import annotations
+
 import numpy as np
 
 from GBOpt import GBMaker, GBManipulator

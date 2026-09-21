@@ -1,5 +1,7 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
+from __future__ import annotations
+
 import copy as copy_module
 import inspect
 import math
@@ -25,6 +27,7 @@ from GBOpt._explicit_ownership_evaluation import (
 from GBOpt.artifacts.cleanup import (
     ArtifactCleanupError,
     ArtifactCleanupRequest,
+    _ArtifactCleaner,
 )
 from GBOpt.artifacts.policy import ArtifactPolicyError, ArtifactRetentionPolicy
 from GBOpt.artifacts.provenance import (
@@ -271,8 +274,8 @@ class GeneticAlgorithmMinimizer:
             raise GBMinimizerValueError(
                 "crossover_attempts must be a positive integer"
             )
-        self.GB = GB
-        self.gb_energy_func = gb_energy_func
+        self.GB: GBMaker = GB
+        self.gb_energy_func: Callable = gb_energy_func
         if gb_batch_energy_func is not None:
             try:
                 sig = inspect.signature(gb_batch_energy_func)
@@ -305,21 +308,23 @@ class GeneticAlgorithmMinimizer:
                 raise GBMinimizerTypeError(
                     "gb_batch_energy_func must be callable."
                 ) from exc
-        self.gb_batch_energy_func = gb_batch_energy_func
-        self.history = []
-        self.initial_structure = initial_structure
-        self.initial_ownership = initial_ownership
-        self.allow_variable_cell = allow_variable_cell
-        self.retention_policy = retention_policy
-        self.calculation_context = calculation_context
-        self.failure_diagnostic_count = failure_diagnostic_count
+        self.gb_batch_energy_func: Callable | None = gb_batch_energy_func
+        self.history: list = []
+        self.initial_structure: GBMaker | str | Path | None = initial_structure
+        self.initial_ownership: GrainOwnership | None = initial_ownership
+        self.allow_variable_cell: bool = allow_variable_cell
+        self.retention_policy: ArtifactRetentionPolicy | None = retention_policy
+        self.calculation_context: dict[str, object] | None = calculation_context
+        self.failure_diagnostic_count: int = failure_diagnostic_count
         self._failure_diagnostics: list[_FailureDiagnostic] = []
-        self._artifact_cleaner = artifact_cleaner
-        self.artifact_store = artifact_store
+        self._artifact_cleaner: _ArtifactCleaner = artifact_cleaner
+        self.artifact_store: ArtifactStore | None = artifact_store
         self._retention_archive_mappings: dict[str, dict] = {}
         self._artifact_provenance: _ArtifactProvenance | None = None
-        self.local_random = np.random.default_rng(int(time()) if seed is None else seed)
-        self._owned_evaluator = (
+        self.local_random: np.random.Generator = np.random.default_rng(
+            int(time()) if seed is None else seed
+        )
+        self._owned_evaluator: ExplicitOwnershipEvaluator | None = (
             ExplicitOwnershipEvaluator(
                 GB=GB,
                 scalar_energy_func=gb_energy_func,
@@ -331,7 +336,7 @@ class GeneticAlgorithmMinimizer:
             if initial_ownership is not None
             else None
         )
-        self.manipulator = self._make_initial_manipulator()
+        self.manipulator: GBManipulator = self._make_initial_manipulator()
         initial_parent = self.manipulator.parents[0]
         try:
             validate_formula_composition(
@@ -342,19 +347,21 @@ class GeneticAlgorithmMinimizer:
             raise GBMinimizerValueError(
                 f"initial candidate composition is inadmissible: {exc}"
             ) from exc
-        self.composition_policy = tuple(initial_parent.unit_cell.formula_ratio)
-        self.mutator = Mutator(choices, self.manipulator)
+        self.composition_policy: tuple[tuple[str, int], ...] = tuple(
+            initial_parent.unit_cell.formula_ratio
+        )
+        self.mutator: Mutator = Mutator(choices, self.manipulator)
         self.manipulator.rng = self.local_random
-        self.population_size = population_size
-        self.generations = generations
-        self.keep_top_pct = keep_top_pct
-        self.intermediate_pct = intermediate_pct
-        self.slice_and_merge_pct = slice_and_merge_pct
-        self.reuse_carryover_evaluations = bool(reuse_carryover_evaluations)
-        self.crossover_surface = crossover_surface
-        self.crossover_max_tilt_degrees = float(crossover_max_tilt_degrees)
-        self.crossover_attempts = int(crossover_attempts)
-        self.GBE_vals = []
+        self.population_size: int = population_size
+        self.generations: int = generations
+        self.keep_top_pct: int = keep_top_pct
+        self.intermediate_pct: int = intermediate_pct
+        self.slice_and_merge_pct: float = slice_and_merge_pct
+        self.reuse_carryover_evaluations: bool = bool(reuse_carryover_evaluations)
+        self.crossover_surface: str = crossover_surface
+        self.crossover_max_tilt_degrees: float = float(crossover_max_tilt_degrees)
+        self.crossover_attempts: int = int(crossover_attempts)
+        self.GBE_vals: list[list[float]] = []
 
     def _make_initial_manipulator(self) -> GBManipulator:
         seed = self.initial_structure
@@ -1498,9 +1505,9 @@ class GeneticAlgorithmMinimizer:
 
     def run_GA(
         self,
-        unique_id: "int | uuid.UUID | None" = None,
+        unique_id: int | uuid.UUID | None = None,
         *,
-        checkpoint_file: "str | Path | None" = None,
+        checkpoint_file: str | Path | None = None,
         checkpoint_format: str = "json",
         checkpoint_interval: int = 1
     ) -> tuple:
@@ -1781,7 +1788,6 @@ class GeneticAlgorithmMinimizer:
                 next_manipulators = []
                 next_structures = []
                 next_lineages = []
-                next_retention_lineages = []
                 next_cached_evaluations = []
                 for j in lowest_valid_idxs:
                     old_idx = valid_old_idxs[j]

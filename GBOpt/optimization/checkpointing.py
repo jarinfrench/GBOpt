@@ -2,6 +2,8 @@
 
 """Shared artifact-retention and checkpoint-runtime helpers for MC and GA."""
 
+from __future__ import annotations
+
 import os
 import shutil
 import warnings

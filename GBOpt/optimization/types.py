@@ -9,6 +9,8 @@ belongs here; this module is a data-definition layer imported by other optimizat
 modules.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from numbers import Integral
 
@@ -61,7 +63,7 @@ class _FailureDiagnostic:
         record: CandidateEvaluation,
         *,
         generation: int,
-    ) -> "_FailureDiagnostic":
+    ) -> _FailureDiagnostic:
         """Build one diagnostic record from a failed typed evaluation.
 
         :param record: Failed explicit-ownership evaluation.
@@ -100,7 +102,7 @@ class _FailureDiagnostic:
         }
 
     @classmethod
-    def from_state(cls, state: object) -> "_FailureDiagnostic":
+    def from_state(cls, state: object) -> _FailureDiagnostic:
         """Restore one diagnostic record from checkpoint state.
 
         :param state: JSON-decoded diagnostic state.

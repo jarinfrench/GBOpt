@@ -1,5 +1,7 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
+from __future__ import annotations
+
 import math
 import shutil
 import uuid
@@ -131,7 +133,7 @@ class MonteCarloMinimizer:
         self.local_random = np.random.default_rng(
             int(time()) if seed is None else seed)
         self.manipulator.rng = self.local_random
-        self.GBE_vals = []
+        self.GBE_vals: list[float] = []
 
     def _make_initial_manipulator(self) -> GBManipulator:
         """Build the starting GBManipulator from configured seed state.
@@ -383,9 +385,9 @@ class MonteCarloMinimizer:
         E_tol: float = 1e-4,
         max_rejections: int = 20,
         cooldown_rate: float = 1.0,
-        unique_id: "int | uuid.UUID | None" = None,
+        unique_id: int | uuid.UUID | None = None,
         *,
-        checkpoint_file: "str | Path | None" = None,
+        checkpoint_file: str | Path | None = None,
         checkpoint_format: str = "json",
         checkpoint_interval: int = 1,
         **kwargs,
