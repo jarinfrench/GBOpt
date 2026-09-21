@@ -468,6 +468,55 @@ def test_invalid_public_mismatch_arguments_raise(kwargs, match):
 
 
 # --------------------------------------------------------------------------------------
+# Approximate incoherent interfaces
+# --------------------------------------------------------------------------------------
+
+
+def _build_non_csl_approximate_boundary() -> GBMaker:
+    spec = CSLApproxSpec(
+        axis=[0, 0, 1],
+        plane=[1, 0, 0],
+        angle_deg=17.3,
+    )
+    return GBMaker.from_boundary_spec(
+        3.615,
+        "fcc",
+        "Cu",
+        spec,
+        mode="approximate",
+        gb_thickness=0.0,
+        repeat_factor=2,
+        x_dim_min=8.0,
+        vacuum=5.0,
+        interaction_distance=1.0,
+    )
+
+
+def test_non_csl_approximate_spec_builds_as_incoherent():
+    with pytest.warns(
+        UserWarning,
+        match=r"Gap equalization would remove all atoms from the right grain",
+    ):
+        gb = _build_non_csl_approximate_boundary()
+
+    assert gb.whole_system.size > 0
+    assert gb.inplane_periodic == (False, False)
+    assert gb._GBMaker__embedding is not None
+    assert gb._GBMaker__embedding.coherent is False
+
+
+def test_non_csl_approximate_spec_caps_inplane_box():
+    with pytest.warns(
+        UserWarning,
+        match=r"Gap equalization would remove all atoms from the right grain",
+    ):
+        gb = _build_non_csl_approximate_boundary()
+
+    assert gb.spacing["y"] <= 15.0 * gb.a0
+    assert gb.spacing["z"] <= 15.0 * gb.a0
+
+
+# --------------------------------------------------------------------------------------
 # Commensurate-pair search
 # --------------------------------------------------------------------------------------
 
@@ -670,6 +719,71 @@ def test_find_commensurate_pair_rejects_invalid_max_n(max_n):
         match=r"max_n must be a positive integer",
     ):
         _find_commensurate_pair(1.0, 1.0, max_n=max_n)
+
+
+@pytest.fixture
+def compact_gbmaker_options():
+    return {
+        "gb_thickness": 10.0,
+        "repeat_factor": 2,
+        "x_dim_min": 30.0,
+        "vacuum": 10.0,
+        "interaction_distance": 1.0,
+        "gb_id": 1,
+    }
+
+
+def test_legacy_constructor_emits_single_deprecation_warning(
+    compact_gbmaker_options,
+):
+    theta = math.radians(36.869898)
+
+    with pytest.warns(
+        DeprecationWarning,
+        match=r"GBMaker\(\.\.\.\)",
+    ) as caught:
+        gbm = GBMaker(
+            a0=3.61,
+            structure="fcc",
+            misorientation=np.array(
+                [theta, 0.0, 0.0, 0.0, -theta / 2.0]
+            ),
+            atom_types="Cu",
+            **compact_gbmaker_options,
+        )
+
+    assert len(caught) == 1
+    assert gbm.whole_system.size > 0
+
+
+def test_from_boundary_spec_does_not_emit_legacy_deprecation_warning(
+    compact_gbmaker_options,
+    recwarn,
+):
+    spec = CSLApproxSpec(
+        axis=[0, 0, 1],
+        plane=[1, 0, 0],
+        angle_deg=36.87,
+    )
+
+    gbm = GBMaker.from_boundary_spec(
+        3.61,
+        "fcc",
+        "Cu",
+        spec,
+        mode="approximate",
+        **compact_gbmaker_options,
+    )
+
+    legacy_deprecations = [
+        warning
+        for warning in recwarn
+        if issubclass(warning.category, DeprecationWarning)
+        and "GBMaker(...)" in str(warning.message)
+    ]
+
+    assert not legacy_deprecations
+    assert gbm.whole_system.size > 0
 
 
 class TestGBMaker(unittest.TestCase):
@@ -961,7 +1075,7 @@ class TestGBMaker(unittest.TestCase):
 
         self.gbm.x_dim_min = 35.0
 
-        self.assertGreaterEqual(self.gbm.box_dims[0][1], 20.0)
+        self.assertGreaterEqual(self.gbm.box_dims[0][1], 35.0)
         self.assertLess(self.gbm.x_dim, original_x_dim)
 
         self.gbm.vacuum_thickness = 50.0
@@ -2122,42 +2236,31 @@ class TestGBMakerGenerateGB(unittest.TestCase):
     def test_vacuum_zero_trim_preserves_fluorite_stoichiometry_per_grain(self):
         a0 = 5.47
         theta5 = 2 * np.arctan(1 / 3)
-        misorientation = np.array([theta5, 0, 0, 0, -theta5 / 2])
-        gb = GBMaker(
-            a0,
-            "fluorite",
-            0.0,
-            misorientation,
-            ("U", "O"),
-            vacuum=0,
-            repeat_factor=(2, 5),
-            x_dim_min=50,
-            interaction_distance=11.0,
+        mis = np.array([theta5, 0, 0, 0, -theta5 / 2])
+        gbm = GBMaker(a0, "fluorite", 0.0, mis, ("U", "O"),
+                      vacuum=0, repeat_factor=(2, 5), x_dim_min=50,
+                      interaction_distance=11.0)
+        ws = gbm.whole_system
+        names, counts = np.unique(ws["name"], return_counts=True)
+        c = {str(n): int(v) for n, v in zip(names, counts)}
+        self.assertEqual(
+            c["O"], 2 * c["U"],
+            f"Fluorite vacuum=0 bicrystal is not stoichiometric: {c}"
         )
-
-        _assert_fluorite_stoichiometry(gb.left_grain, label="left grain")
-        _assert_fluorite_stoichiometry(gb.right_grain, label="right grain")
-        _assert_fluorite_stoichiometry(gb.whole_system, label="whole system")
 
     def test_vacuum_zero_trim_preserves_rocksalt_stoichiometry_per_grain(self):
         a0 = 5.64
         theta5 = 2 * np.arctan(1 / 3)
-        misorientation = np.array([theta5, 0, 0, 0, -theta5 / 2])
-        gb = GBMaker(
-            a0,
-            "rocksalt",
-            0.0,
-            misorientation,
-            ("Na", "Cl"),
-            vacuum=0,
-            repeat_factor=(2, 4),
-            x_dim_min=50,
-            interaction_distance=11.0,
+        mis = np.array([theta5, 0, 0, 0, -theta5 / 2])
+        gbm = GBMaker(a0, "rocksalt", 0.0, mis, ("Na", "Cl"),
+                      vacuum=0, repeat_factor=(2, 4), x_dim_min=50,
+                      interaction_distance=11.0)
+        names, counts = np.unique(gbm.whole_system["name"], return_counts=True)
+        c = {str(n): int(v) for n, v in zip(names, counts)}
+        self.assertEqual(
+            c["Na"], c["Cl"],
+            f"Rocksalt vacuum=0 bicrystal is not stoichiometric: {c}",
         )
-
-        _assert_rocksalt_stoichiometry(gb.left_grain, label="left grain")
-        _assert_rocksalt_stoichiometry(gb.right_grain, label="right grain")
-        _assert_rocksalt_stoichiometry(gb.whole_system, label="whole system")
 
     @pytest.mark.filterwarnings(
         r"ignore:Repeat factor in [yz] modified to \d+ to satisfy the "
@@ -2167,7 +2270,8 @@ class TestGBMakerGenerateGB(unittest.TestCase):
         r"ignore:Required [yz]-spacing .* A exceeds threshold .* A; boundary is "
         r"non-periodic along [yz]\.:UserWarning"
     )
-    def test_known_fluorite_vacuum_zero_trim_regressions_are_stoichiometric(self):
+    def test_known_fluorite_vacuum0_trim_regressions_are_stoichiometric(self):
+        """Legacy float-path trimming must preserve complete fluorite origins."""
         case_names = (
             "sigma29_100_0_7_3bar_0_3bar_7_STGB",
             "sigma3_110_1_1bar_0_1_1bar_4_ATGB",

@@ -81,6 +81,14 @@ Each call produces a two-panel figure:
 
 ## Track 2 — Re-run the optimization
 
+`optimize.py` builds the $\Sigma 5$5[001]{310} starting structure with
+`GBMaker.from_boundary_spec(..., FiveDOFSpec(...), mode="approximate")`.
+This preserves the legacy five-DOF example geometry while avoiding the
+deprecated direct constructor. Exact five-DOF reconstruction is available for
+cubic CSL inputs; new workflows can switch this construction to
+`mode="prefer_exact"` or `mode="exact"` when exact stoichiometric construction
+is desired.
+
 ### Requirements
 
 - LAMMPS compiled with the KOKKOS and MANYBODY packages. The results in

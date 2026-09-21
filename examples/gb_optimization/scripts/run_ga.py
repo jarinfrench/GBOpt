@@ -22,6 +22,8 @@ except ImportError:
 from slurm_utils import SlurmJob, submit_job, wait_for_jobs
 
 from GBOpt import GBMaker, GBManipulator, GBMinimizer
+from GBOpt.BoundarySpec import FiveDOFSpec
+from GBOpt.Checkpoint import ENERGY_PENALTY
 
 SCRIPTS_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPTS_DIR.parent
@@ -35,7 +37,6 @@ ERROR_SIGNATURES = {
     "non_numeric_box_dimensions": "ERROR: Non-numeric box dimensions",
     "non_numeric_unstable": "ERROR: Non-numeric",
 }
-PENALTY = 1.0e30
 
 
 def _is_teton() -> bool:
@@ -62,6 +63,28 @@ def _load_boundaries():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.BOUNDARIES
+
+
+def _build_gb(
+    lattice_parameter: float,
+    structure: str,
+    atom_types: str | List[str],
+    misorientation: np.ndarray,
+    gb_thickness: float,
+    *,
+    x_dim_min: int,
+    repeat_factor: Tuple[int, int],
+    interaction_distance: float,
+) -> GBMaker:
+    return GBMaker.from_boundary_spec(
+        lattice_parameter, structure, atom_types, FiveDOFSpec(misorientation),
+        mode="approximate",
+        gb_thickness=gb_thickness,
+        x_dim_min=x_dim_min,
+        repeat_factor=repeat_factor,
+        interaction_distance=interaction_distance,
+        vacuum=0,
+    )
 
 
 def _file_contains(path: Path, needle: str) -> bool:
@@ -155,6 +178,7 @@ def evaluate_batch(
     input_script: str = "lmp.in",
     slurm_cfg: dict | None = None,
     material: str = "",
+    checkpoint=None,
     **kwargs,
 ) -> List[Dict[str, Any]]:
     if not (len(candidates) == len(unique_ids) == len(manipulators) == len(lineages)):
@@ -304,7 +328,7 @@ def evaluate_batch(
             reason = _detect_failure_reason([logfile, output_txt])
             if reason is not None:
                 results.append({
-                    "energy": PENALTY,
+                    "energy": ENERGY_PENALTY,
                     "final_dump": None,
                     "num_atoms": int(candidates[i].shape[0]),
                     "parents": list(lineages[i]),
@@ -332,7 +356,7 @@ def evaluate_batch(
         gbe_val = float(parts[0])
         reason = " ".join(parts[1:]) if len(parts) > 1 else None
 
-        status = "ok" if gbe_val < PENALTY else "failed"
+        status = "ok" if gbe_val < ENERGY_PENALTY else "failed"
 
         record = {
             "energy": float(gbe_val),
@@ -344,6 +368,8 @@ def evaluate_batch(
         if status != "ok":
             record["fail_reason"] = reason or "penalty"
         results.append(record)
+        if checkpoint is not None and not checkpoint.is_done(uid_str):
+            checkpoint.record(uid_str, record["energy"], record.get("final_dump"))
 
         if status == "ok":
             for p in (results_out, output_txt, logfile, temp_dump):
@@ -392,24 +418,20 @@ def run_evolution(
         material=material,
     )
 
-    GB0 = GBMaker(
-        lattice_parameter, structure, lattice_parameter, misorientation,
-        atom_types=atom_types,
+    GB0 = _build_gb(
+        lattice_parameter, structure, atom_types, misorientation, lattice_parameter,
         x_dim_min=x_dim_min,
         repeat_factor=repeat_factor,
         interaction_distance=interaction_distance,
-        vacuum=0,
     )
     gb_thickness = 2 * max(GB0.spacing["x"]["left"], GB0.spacing["x"]["right"])
     del GB0
 
-    GB = GBMaker(
-        lattice_parameter, structure, gb_thickness, misorientation,
-        atom_types=atom_types,
+    GB = _build_gb(
+        lattice_parameter, structure, atom_types, misorientation, gb_thickness,
         x_dim_min=x_dim_min,
         repeat_factor=repeat_factor,
         interaction_distance=interaction_distance,
-        vacuum=0,
     )
 
     if initial_structure is not None:
@@ -432,7 +454,7 @@ def run_evolution(
 
     min_gbe, _ = ga_minimizer.run_GA(
         unique_id=1,
-        # checkpoint_file="checkpoint.json",
+        checkpoint_file="checkpoint.json",
     )
     print(f"Final minimum GBE = {min_gbe}")
 
@@ -453,7 +475,8 @@ def main() -> None:
     args = parser.parse_args()
 
     init_type = "high_energy" if args.high_energy else "standard"
-    run_dir = PROJECT_ROOT / args.material / args.boundary / "GA" / init_type / f"run{args.run}"
+    run_dir = PROJECT_ROOT / args.material / \
+        args.boundary / "GA" / init_type / f"run{args.run}"
     run_dir.mkdir(parents=True, exist_ok=True)
     os.chdir(run_dir)
     global SLURM_WORK_ROOT
