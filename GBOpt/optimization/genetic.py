@@ -1056,7 +1056,16 @@ class GeneticAlgorithmMinimizer:
                         evaluated_manipulators.append(
                             self._make_manipulator_from_file(dump)
                         )
-                    except Exception:
+                    except Exception as exc:
+                        # Reconstructing one candidate's evaluator output is a
+                        # deliberate recovery boundary: any failure here penalizes
+                        # only this candidate rather than aborting the generation.
+                        warnings.warn(
+                            f"Candidate reconstruction failed for {dump!r}: "
+                            f"{type(exc).__name__}: {exc}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
                         gen_files[-1] = None
                         gen_energies[-1] = ENERGY_PENALTY
                         evaluated_manipulators.append(None)
@@ -1084,7 +1093,16 @@ class GeneticAlgorithmMinimizer:
                 try:
                     gbe, dump_file_name = self.gb_energy_func(
                         self.GB, manipulator, atom_positions, uid)
-                except Exception:
+                except Exception as exc:
+                    # The external evaluator callback is a deliberate recovery
+                    # boundary: any failure here penalizes only this candidate
+                    # rather than aborting the generation.
+                    warnings.warn(
+                        f"gb_energy_func failed for candidate {uid!r}: "
+                        f"{type(exc).__name__}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                     gbe, dump_file_name = ENERGY_PENALTY, None
                 if gen_checkpoint is not None:
                     gen_checkpoint.record(uid, gbe, dump_file_name)
@@ -1096,7 +1114,16 @@ class GeneticAlgorithmMinimizer:
                     evaluated_manipulators.append(
                         self._make_manipulator_from_file(dump_file_name)
                     )
-                except Exception:
+                except Exception as exc:
+                    # Reconstructing one candidate's evaluator output is a
+                    # deliberate recovery boundary: any failure here penalizes
+                    # only this candidate rather than aborting the generation.
+                    warnings.warn(
+                        f"Candidate reconstruction failed for {dump_file_name!r}: "
+                        f"{type(exc).__name__}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                     gen_files[-1] = None
                     gen_energies[-1] = ENERGY_PENALTY
                     evaluated_manipulators.append(None)
@@ -1627,9 +1654,10 @@ class GeneticAlgorithmMinimizer:
             for cp_path in population_checkpoint_paths:
                 try:
                     manip = self._make_manipulator_from_file(cp_path)
-                except Exception:
+                except Exception as exc:
                     raise GBMinimizerError(
-                        f"Checkpoint population path {cp_path} is missing/unreadable.")
+                        f"Checkpoint population path {cp_path} is missing/unreadable."
+                    ) from exc
                 population_manipulators.append(manip)
                 population_structures.append(
                     np.array(manip.parents[0].whole_system, copy=True)
