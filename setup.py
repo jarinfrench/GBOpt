@@ -18,7 +18,7 @@ setup(
     ],
     extras_require={
         "test": ["pytest"],
-        "dev": ["ruff", "mypy", "bandit", "pyscn"],
+        "dev": ["ruff", "mypy", "bandit", "bandit-sarif-formatter", "pyscn"],
     },
     author="Chaitanya Bhave and Jarin French",
     author_email="chaitanya.bhave@inl.gov and jarin.french@inl.gov",
