@@ -44,6 +44,11 @@ from GBOpt.GrainOwnership import (
     GrainOwnership,
     GrainOwnershipError,
 )
+from GBOpt.interface import InterfaceCandidate
+from GBOpt.interface.types import (
+    InterfaceCandidateTypeError,
+    InterfaceCandidateValueError,
+)
 from GBOpt.UnitCell import UnitCell
 
 # TODO: Generalize to interfaces, not just GBs
@@ -181,6 +186,67 @@ def _readonly_copy(values: np.ndarray, *, dtype=None) -> np.ndarray:
     result = np.array(values, dtype=dtype, copy=True)
     result.setflags(write=False)
     return result
+
+
+def _construct_interface_candidate(
+    *,
+    atoms: np.ndarray,
+    box_dims: np.ndarray,
+    gb_plane_x: float,
+    left_grain_x_bounds: np.ndarray | tuple[float, float],
+    right_grain_x_bounds: np.ndarray | tuple[float, float],
+    grain_labels: np.ndarray,
+    inplane_periodic: tuple[bool, bool],
+    normal_topology: BoundaryNormalTopology | str,
+    coordinate_tolerance: float,
+    interface_separation: float = 0.0,
+) -> InterfaceCandidate:
+    """Construct an ``InterfaceCandidate``, translating its exceptions to this module's.
+
+    ``InterfaceCandidate`` lives in the neutral ``GBOpt.interface`` package and raises
+    its own independent exception hierarchy. Callers within this module rely on
+    construction failures surfacing as ``GBManipulatorValueError``/
+    ``GBManipulatorTypeError``, matching every other validation failure in this module.
+
+    :param atoms: Keyword argument, required. Forwarded to ``InterfaceCandidate``.
+    :param box_dims: Keyword argument, required. Forwarded to ``InterfaceCandidate``.
+    :param gb_plane_x: Keyword argument, required. Forwarded to ``InterfaceCandidate``.
+    :param left_grain_x_bounds: Keyword argument, required. Forwarded to
+        ``InterfaceCandidate``.
+    :param right_grain_x_bounds: Keyword argument, required. Forwarded to
+        ``InterfaceCandidate``.
+    :param grain_labels: Keyword argument, required. Forwarded to
+        ``InterfaceCandidate``.
+    :param inplane_periodic: Keyword argument, required. Forwarded to
+        ``InterfaceCandidate``.
+    :param normal_topology: Keyword argument, required. Forwarded to
+        ``InterfaceCandidate``.
+    :param coordinate_tolerance: Keyword argument, required. Forwarded to
+        ``InterfaceCandidate``.
+    :param interface_separation: Keyword argument, optional, defaults to ``0.0``.
+        Forwarded to ``InterfaceCandidate``.
+    :return: The constructed candidate.
+    :raises GBManipulatorValueError: If candidate state is malformed or internally
+        inconsistent.
+    :raises GBManipulatorTypeError: If a candidate argument has an unsupported type.
+    """
+    try:
+        return InterfaceCandidate(
+            atoms=atoms,
+            box_dims=box_dims,
+            gb_plane_x=gb_plane_x,
+            left_grain_x_bounds=left_grain_x_bounds,
+            right_grain_x_bounds=right_grain_x_bounds,
+            grain_labels=grain_labels,
+            inplane_periodic=inplane_periodic,
+            normal_topology=normal_topology,
+            coordinate_tolerance=coordinate_tolerance,
+            interface_separation=interface_separation,
+        )
+    except InterfaceCandidateTypeError as exc:
+        raise GBManipulatorTypeError(str(exc)) from exc
+    except InterfaceCandidateValueError as exc:
+        raise GBManipulatorValueError(str(exc)) from exc
 
 
 def _affine_remap_axis_values(
@@ -444,192 +510,6 @@ def _cycle_half_open(
     wrapped = lower + np.mod(values + canonical_shift - lower, width)
     wrapped[np.isclose(wrapped, upper, atol=tolerance, rtol=0.0)] = lower
     return wrapped
-
-
-@dataclass(frozen=True, slots=True, init=False)
-class InterfaceCandidate:
-    """Immutable atom rows and interface geometry for composable manipulation.
-
-    Grain labels are local to this in-memory candidate. They are not persistent atom
-    identifiers and do not define an external-file ownership format.
-    """
-
-    _atoms: np.ndarray
-    _box_dims: np.ndarray
-    gb_plane_x: float
-    _left_grain_x_bounds: np.ndarray
-    _right_grain_x_bounds: np.ndarray
-    _grain_labels: np.ndarray
-    inplane_periodic: tuple[bool, bool]
-    normal_topology: BoundaryNormalTopology
-    coordinate_tolerance: float
-    interface_separation: float
-
-    def __init__(
-        self,
-        *,
-        atoms: np.ndarray,
-        box_dims: np.ndarray,
-        gb_plane_x: float,
-        left_grain_x_bounds: np.ndarray | tuple[float, float],
-        right_grain_x_bounds: np.ndarray | tuple[float, float],
-        grain_labels: np.ndarray,
-        inplane_periodic: tuple[bool, bool],
-        normal_topology: BoundaryNormalTopology | str,
-        coordinate_tolerance: float,
-        interface_separation: float = 0.0,
-    ) -> None:
-        """Initialize validated immutable candidate state.
-
-        :param atoms: Keyword argument, required. Structured atom rows.
-        :param box_dims: Keyword argument, required. Finite 3 by 2 box array.
-        :param gb_plane_x: Keyword argument, required. Interface-gap midpoint.
-        :param left_grain_x_bounds: Keyword argument, required. Left physical grain
-            interval.
-        :param right_grain_x_bounds: Keyword argument, required. Right physical grain
-            interval.
-        :param grain_labels: Keyword argument, required. Left/right labels aligned with
-            ``atoms``.
-        :param inplane_periodic: Keyword argument, required. y/z periodicity flags.
-        :param normal_topology: Keyword argument, required. Boundary-normal topology.
-        :param coordinate_tolerance: Keyword argument, required. Coordinate tolerance in
-            angstroms.
-        :param interface_separation: Keyword argument, optional, defaults to ``0.0``.
-            Inserted central separation in angstroms, optional, defaults to ``0.0``.
-        :raises GBManipulatorValueError: If candidate state is malformed or internally
-            inconsistent.
-        """
-        structured = np.asarray(atoms)
-        required_fields = {"name", "x", "y", "z"}
-        if (
-            structured.ndim != 1
-            or structured.dtype.names is None
-            or not required_fields.issubset(structured.dtype.names)
-        ):
-            raise GBManipulatorValueError(
-                "InterfaceCandidate atoms must be a one-dimensional structured array "
-                "containing name, x, y, and z fields"
-            )
-        labels = _normalize_grain_labels(grain_labels, expected_count=structured.size)
-        box = _strict_float_array("box_dims", box_dims, shape=(3, 2))
-        left_bounds = _strict_float_array(
-            "left_grain_x_bounds",
-            left_grain_x_bounds,
-            shape=(2,)
-        )
-        right_bounds = _strict_float_array(
-            "right_grain_x_bounds",
-            right_grain_x_bounds,
-            shape=(2,)
-        )
-        plane = _validate_finite_real("gb_plane_x", gb_plane_x)
-        tolerance = _validate_finite_real("coordinate_tolerance", coordinate_tolerance)
-        separation = _validate_finite_real("interface_separation", interface_separation)
-        if tolerance <= 0.0:
-            raise GBManipulatorValueError("coordinate_tolerance must be positive")
-        if separation < 0.0:
-            raise GBManipulatorValueError("interface_separation must be nonnegative")
-        if np.any(box[:, 0] >= box[:, 1]):
-            raise GBManipulatorValueError(
-                "InterfaceCandidate box bounds must be strictly ordered"
-            )
-        if not box[0, 0] < plane < box[0, 1]:
-            raise GBManipulatorValueError(
-                "InterfaceCandidate gb_plane_x must lie strictly inside the x box"
-            )
-        if left_bounds[0] >= left_bounds[1] or right_bounds[0] >= right_bounds[1]:
-            raise GBManipulatorValueError(
-                "Physical grain bounds must be strictly ordered"
-            )
-        if (
-            left_bounds[0] < box[0, 0] - tolerance
-            or right_bounds[1] > box[0, 1] + tolerance
-            or left_bounds[1] > plane + tolerance
-            or right_bounds[0] < plane - tolerance
-            or left_bounds[1] > right_bounds[0] + tolerance
-        ):
-            raise GBManipulatorValueError(
-                "Physical grain bounds must lie inside the box on their respective "
-                "sides of gb_plane_x without overlapping"
-            )
-        periodic = _normalize_inplane_periodic(inplane_periodic)
-        try:
-            topology = normalize_boundary_normal_topology(normal_topology)
-        except ValueError as exc:
-            raise GBManipulatorValueError(str(exc)) from exc
-
-        for axis_index, axis_name in enumerate(("x", "y", "z")):
-            coordinates = np.asarray(structured[axis_name], dtype=float)
-            if not np.all(np.isfinite(coordinates)):
-                raise GBManipulatorValueError(
-                    "InterfaceCandidate atom coordinates must be finite"
-                )
-            lower = float(box[axis_index, 0])
-            upper = float(box[axis_index, 1])
-            if np.any(coordinates < lower - tolerance) or np.any(coordinates >= upper):
-                raise GBManipulatorValueError(
-                    f"InterfaceCandidate atoms must lie inside the half-open "
-                    f"{axis_name} box"
-                )
-
-        left_x = np.asarray(structured["x"][labels == LEFT_GRAIN_LABEL], dtype=float)
-        right_x = np.asarray(structured["x"][labels == RIGHT_GRAIN_LABEL], dtype=float)
-        if (
-            np.any(left_x < left_bounds[0] - tolerance)
-            or np.any(left_x >= left_bounds[1])
-            or np.any(right_x < right_bounds[0] - tolerance)
-            or np.any(right_x >= right_bounds[1])
-        ):
-            raise GBManipulatorValueError(
-                "Candidate atoms must lie inside their labeled physical grain bounds"
-            )
-
-        object.__setattr__(self, "_atoms", _readonly_copy(structured))
-        object.__setattr__(self, "_box_dims", _readonly_copy(box, dtype=float))
-        object.__setattr__(self, "gb_plane_x", plane)
-        object.__setattr__(
-            self, "_left_grain_x_bounds", _readonly_copy(left_bounds, dtype=float)
-        )
-        object.__setattr__(
-            self, "_right_grain_x_bounds", _readonly_copy(right_bounds, dtype=float)
-        )
-        object.__setattr__(
-            self, "_grain_labels", _readonly_copy(labels, dtype=np.int8)
-        )
-        object.__setattr__(self, "inplane_periodic", periodic)
-        object.__setattr__(self, "normal_topology", topology)
-        object.__setattr__(self, "coordinate_tolerance", tolerance)
-        object.__setattr__(self, "interface_separation", separation)
-
-    @property
-    def atoms(self) -> np.ndarray:
-        """Defensive read-only atom-array copy."""
-        return _readonly_copy(self._atoms)
-
-    @property
-    def box_dims(self) -> np.ndarray:
-        """Defensive read-only box copy."""
-        return _readonly_copy(self._box_dims, dtype=float)
-
-    @property
-    def left_grain_x_bounds(self) -> np.ndarray:
-        """Defensive read-only left-grain interval copy."""
-        return _readonly_copy(self._left_grain_x_bounds, dtype=float)
-
-    @property
-    def right_grain_x_bounds(self) -> np.ndarray:
-        """Defensive read-only right-grain interval copy."""
-        return _readonly_copy(self._right_grain_x_bounds, dtype=float)
-
-    @property
-    def grain_labels(self) -> np.ndarray:
-        """Defensive read-only grain-label copy."""
-        return _readonly_copy(self._grain_labels, dtype=np.int8)
-
-    @property
-    def periodic_outer_x_interface(self) -> bool:
-        """Whether the outer x faces form a second interface."""
-        return self.normal_topology.periodic_outer_x_interface
 
 
 @dataclass(frozen=True, slots=True)
@@ -903,7 +783,7 @@ class Parent:
         :raises GBManipulatorValueError: If candidate rows or stored geometry are
             inconsistent.
         """
-        return InterfaceCandidate(
+        return _construct_interface_candidate(
             atoms=atoms,
             box_dims=self.box_dims,
             gb_plane_x=self.gb_plane_x,
@@ -2493,7 +2373,7 @@ class GBManipulator:
         labels = candidate.grain_labels
         shifted = np.array(atoms, copy=True)
         shifted["x"][labels == RIGHT_GRAIN_LABEL] += separation
-        return InterfaceCandidate(
+        return _construct_interface_candidate(
             atoms=shifted,
             box_dims=geometry.box_dims,
             gb_plane_x=geometry.gb_plane_x,
