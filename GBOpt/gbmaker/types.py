@@ -15,17 +15,18 @@ representations are referenced, not duplicated.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from numbers import Integral, Real
 from types import MappingProxyType
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
 from GBOpt.BoundarySpec import BoundaryEmbedding
 from GBOpt.BoundaryTopology import BoundaryNormalTopology
+from GBOpt.UnitCell import UnitCell
 
 
 class GBMakerConstructionError(Exception):
@@ -100,6 +101,23 @@ def _require_positive_int(value: object, name: str) -> int:
     return normalized
 
 
+def _require_nonnegative_int(value: object, name: str) -> int:
+    """Normalize a non-negative non-Boolean integer.
+
+    :param value: Candidate integer value.
+    :param name: Field name for diagnostics.
+    :return: Python integer.
+    :raises GBMakerConstructionValueError: If the value is not a non-negative
+        non-Boolean integer.
+    """
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+        raise GBMakerConstructionValueError(f"{name} must be a non-Boolean integer")
+    normalized = int(value)
+    if normalized < 0:
+        raise GBMakerConstructionValueError(f"{name} must be non-negative")
+    return normalized
+
+
 def _require_bool(value: object, name: str) -> bool:
     """Normalize a Boolean scalar.
 
@@ -160,13 +178,12 @@ def _require_repeat_factor(value: object) -> tuple[int, int]:
     if isinstance(value, Integral):
         repeat = _require_positive_int(value, "repeat_factor")
         return (repeat, repeat)
-    try:
-        y_value, z_value = value
-    except (TypeError, ValueError) as exc:
+    if not isinstance(value, Sequence) or len(value) != 2:
         raise GBMakerConstructionValueError(
             "repeat_factor must be a positive integer or a two-value sequence of "
             "positive integers"
-        ) from exc
+        )
+    y_value, z_value = value
     return (
         _require_positive_int(y_value, "repeat_factor[0]"),
         _require_positive_int(z_value, "repeat_factor[1]"),
@@ -185,7 +202,7 @@ def _require_strain_grain(value: object) -> StrainGrainPolicy:
         raise GBMakerConstructionValueError(
             f"strain_grain must be one of {expected}; got {value!r}"
         )
-    return value
+    return cast(StrainGrainPolicy, value)
 
 
 def _require_boundary_mode(value: object) -> BoundaryMode:
@@ -200,7 +217,7 @@ def _require_boundary_mode(value: object) -> BoundaryMode:
         raise GBMakerConstructionValueError(
             f"mode must be one of {expected}; got {value!r}"
         )
-    return value
+    return cast(BoundaryMode, value)
 
 
 def _require_grain_side(value: object) -> GrainSide:
@@ -215,7 +232,7 @@ def _require_grain_side(value: object) -> GrainSide:
         raise GBMakerConstructionValueError(
             f"grain_side must be one of {expected}; got {value!r}"
         )
-    return value
+    return cast(GrainSide, value)
 
 
 def _readonly_float_matrix(value: object, shape: tuple[int, ...], name: str) -> np.ndarray:
@@ -265,11 +282,16 @@ class MaterialState:
         ``"zincblende"``.
     :param atom_types: Atom type string or tuple of atom type strings accepted by
         ``UnitCell``.
+    :param unit_cell: Constructed ``UnitCell`` for this material identity, or ``None``
+        before resolution. Carries species, charges, rational-basis metadata, and
+        lattice-derived quantities; this field references that existing object rather
+        than duplicating its state.
     """
 
     a0: float
     structure: str
     atom_types: str | tuple[str, ...]
+    unit_cell: UnitCell | None = None
 
     def __post_init__(self) -> None:
         """Validate and freeze material-identity fields."""
@@ -278,6 +300,8 @@ class MaterialState:
             self, "structure", _require_nonempty_string(self.structure, "structure")
         )
         object.__setattr__(self, "atom_types", _require_atom_types(self.atom_types))
+        if self.unit_cell is not None and not isinstance(self.unit_cell, UnitCell):
+            raise GBMakerConstructionTypeError("unit_cell must be a UnitCell or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,7 +356,9 @@ class GBBuildConfig:
             "interaction_distance",
             _require_positive_float(self.interaction_distance, "interaction_distance"),
         )
-        object.__setattr__(self, "gb_id", _require_positive_int(self.gb_id, "gb_id"))
+        object.__setattr__(
+            self, "gb_id", _require_nonnegative_int(self.gb_id, "gb_id")
+        )
         object.__setattr__(self, "epsilon", _require_positive_float(self.epsilon, "epsilon"))
         object.__setattr__(
             self,
@@ -705,7 +731,9 @@ class BicrystalResult:
             raise GBMakerConstructionTypeError(
                 "normal_topology must be a BoundaryNormalTopology"
             )
-        object.__setattr__(self, "gb_id", _require_positive_int(self.gb_id, "gb_id"))
+        object.__setattr__(
+            self, "gb_id", _require_nonnegative_int(self.gb_id, "gb_id")
+        )
 
 
 __all__ = [

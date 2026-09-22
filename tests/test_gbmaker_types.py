@@ -124,6 +124,11 @@ def test_gb_build_config_rejects_non_material_state() -> None:
         GBBuildConfig(material="fcc", gb_thickness=0.0)  # type: ignore[arg-type]
 
 
+def test_gb_build_config_accepts_zero_gb_id() -> None:
+    config = GBBuildConfig(material=_material(), gb_thickness=0.0, gb_id=0)
+    assert config.gb_id == 0
+
+
 def test_gb_build_config_rejects_negative_gb_thickness() -> None:
     with pytest.raises(GBMakerConstructionValueError):
         GBBuildConfig(material=_material(), gb_thickness=-1.0)
@@ -371,11 +376,21 @@ def test_bicrystal_result_normalizes_valid_fields() -> None:
     assert not result.box_dims.flags.writeable
 
 
-def test_bicrystal_result_rejects_nonpositive_gb_id() -> None:
+def test_bicrystal_result_accepts_zero_gb_id() -> None:
+    result = BicrystalResult(
+        atoms=_atoms(4),
+        box_dims=_box_dims(),
+        normal_topology=BoundaryNormalTopology.PERIODIC_BICRYSTAL,
+        gb_id=0,
+    )
+    assert result.gb_id == 0
+
+
+def test_bicrystal_result_rejects_negative_gb_id() -> None:
     with pytest.raises(GBMakerConstructionValueError):
         BicrystalResult(
             atoms=_atoms(4),
             box_dims=_box_dims(),
             normal_topology=BoundaryNormalTopology.PERIODIC_BICRYSTAL,
-            gb_id=0,
+            gb_id=-1,
         )

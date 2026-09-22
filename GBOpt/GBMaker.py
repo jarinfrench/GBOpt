@@ -14,25 +14,30 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from GBOpt.BoundarySpec import (
-    BoundarySpecError,
     CSLApproxSpec,
     CSLExactSpec,
     FiveDOFSpec,
     PQSpec,
 )
 from GBOpt.BoundaryTopology import BoundaryNormalTopology
-from GBOpt.crystallography import (
-    csl_approx_spec_to_embedding,
-    csl_exact_spec_to_embedding,
-    exactify_five_dof,
-    five_dof_spec_to_embedding,
-    pq_spec_to_embedding,
-)
 from GBOpt.crystallography._limits import (
     DEFAULT_MAX_PQ_DETERMINANT,
     DEFAULT_MAX_PRIMITIVE_AREA_INDEX,
 )
-from GBOpt.crystallography.types import CrystallographyError
+from GBOpt.gbmaker.config import (
+    _validate_scalar,
+    normalize_legacy_config,
+    resolve_boundary_input,
+    validate_boundary_mode,
+    validate_exact_limit,
+    validate_mismatch_max_cells,
+    validate_mismatch_tol,
+    validate_strain_grain,
+)
+from GBOpt.gbmaker.types import (
+    GBMakerConstructionTypeError,
+    GBMakerConstructionValueError,
+)
 from GBOpt.gbmaker_supercell import (
     build_supercell_matrix,
     enumerate_supercell_sites,
@@ -381,10 +386,6 @@ def _miller_row_norm(row: Sequence[object] | np.ndarray) -> float:
     return math.sqrt(squared_norm)
 
 
-_VALID_STRAIN_GRAIN = frozenset({"both", "left", "right"})
-_VALID_BOUNDARY_MODES = frozenset({"exact", "prefer_exact", "approximate"})
-
-
 class GBMaker:
     """Create a grain-boundary structure from user-defined parameters.
 
@@ -448,13 +449,28 @@ class GBMaker:
                 stacklevel=2,
             )
 
-        self.__a0 = self.__validate(a0, Number, "a0", positive=True)
-        self.__structure = self.__validate(structure, str, "structure")
-        self.__gb_thickness = self.__validate(
-            gb_thickness, Number, "gb_thickness", positive=True
-        )
-        self.__epsilon = self.__validate(
-            epsilon, Number, "epsilon", strictly_positive=True)
+        try:
+            config = normalize_legacy_config(
+                a0, structure, gb_thickness, atom_types,
+                repeat_factor=repeat_factor,
+                x_dim_min=x_dim_min,
+                vacuum=vacuum,
+                interaction_distance=interaction_distance,
+                gb_id=gb_id,
+                epsilon=epsilon,
+                mismatch_tol=_mismatch_tol,
+                mismatch_max_cells=_mismatch_max_cells,
+                strain_grain=_strain_grain,
+            )
+        except GBMakerConstructionTypeError as exc:
+            raise GBMakerTypeError(str(exc)) from exc
+        except GBMakerConstructionValueError as exc:
+            raise GBMakerValueError(str(exc)) from exc
+
+        self.__a0 = config.material.a0
+        self.__structure = config.material.structure
+        self.__gb_thickness = config.gb_thickness
+        self.__epsilon = config.epsilon
         self.__assign_orientations(
             self.__validate(
                 np.asarray(misorientation),
@@ -463,44 +479,30 @@ class GBMaker:
                 expected_length=5,
             )
         )
-        self.__repeat_factor = self.__validate(
-            repeat_factor,
-            (int, Sequence),
-            "repeat_factor",
-            expected_length=2,
-            positive=True,
-        )
-        self.__x_dim_min = self.__validate(
-            x_dim_min, Number, "x_dim_min", positive=True)
-        vacuum_value = self.__validate(
-            vacuum, Number, "vacuum_thickness", positive=True
-        )
+        self.__repeat_factor = list(config.repeat_factor)
+        self.__x_dim_min = config.x_dim_min
         self.__vacuum_thickness, self.__normal_topology = (
             _normalize_vacuum_topology(
-                vacuum_value,
+                config.vacuum,
                 tolerance=self.__epsilon,
             )
         )
-        self.__interaction_distance = self.__validate(
-            interaction_distance, Number, "interaction_distance", positive=True
-        )
-        self.__id = self.__validate(gb_id, int, "id", positive=True)
+        self.__interaction_distance = config.interaction_distance
+        self.__id = config.gb_id
         self.__inplane_periodic = (True, True)
         self.__embedding = _embedding
-        self.__mismatch_tol = self.__validate_mismatch_tol(_mismatch_tol)
-        self.__mismatch_max_cells = self.__validate_mismatch_max_cells(
-            _mismatch_max_cells
-        )
-        self.__strain_grain = self.__validate_strain_grain(_strain_grain)
+        self.__mismatch_tol = config.mismatch_tol
+        self.__mismatch_max_cells = config.mismatch_max_cells
+        self.__strain_grain = config.strain_grain
         # Maps axis name ("y" or "z") to commensurate repeat metadata when
         # mismatch accommodation is active; empty when mismatch_tol is None.
         self.__strain_accommodation: dict[str, _AxisStrainAccommodation] = {}
 
-        self.__unit_cell = self.__init_unit_cell(atom_types)
+        self.__unit_cell = config.material.unit_cell
         self.__spacing = self.__calculate_periodic_spacing()  # periodic distances dict
         self.__update_dims()
 
-        self.__radius = a0 * self.__unit_cell.radius  # atom radius
+        self.__radius = config.material.a0 * self.__unit_cell.radius  # atom radius
         self.__box_dims = self.__calculate_box_dimensions()
 
     @classmethod
@@ -689,98 +691,15 @@ class GBMaker:
             "max_pq_determinant",
         )
 
-        if isinstance(boundary, PQSpec):
-            if mode == "approximate":
-                raise NotImplementedError(
-                    f"Construction mode '{mode}' is not yet supported for PQSpec; "
-                    f"use mode='exact' or mode='prefer_exact'."
-                )
-            embedding = pq_spec_to_embedding(
-                boundary,
-                max_primitive_area_index=max_primitive_area_index,
-                max_pq_determinant=max_pq_determinant,
-            )
-
-        elif isinstance(boundary, CSLExactSpec):
-            if mode == "approximate":
-                raise NotImplementedError(
-                    f"Construction mode '{mode}' is not yet supported for CSLExactSpec; "
-                    f"use mode='exact' or mode='prefer_exact'."
-                )
-            embedding = csl_exact_spec_to_embedding(
-                boundary,
-                max_primitive_area_index=max_primitive_area_index,
-                max_pq_determinant=max_pq_determinant,
-            )
-
-        elif isinstance(boundary, CSLApproxSpec):
-            if mode == "exact":
-                raise BoundarySpecError(
-                    "CSLApproxSpec cannot be used with mode='exact': no integer "
-                    "quaternion is available for exactification. Use CSLExactSpec "
-                    "for an exact construction, or mode='approximate'."
-                )
-            if mode == "prefer_exact":
-                warnings.warn(
-                    "CSLApproxSpec cannot be exactified from a floating-point "
-                    "angle; falling back to mode='approximate'.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-            embedding = csl_approx_spec_to_embedding(boundary)
-
-        elif isinstance(boundary, FiveDOFSpec):
-            params = np.asarray(boundary.params, dtype=float)
-
-            if mode == "exact":
-                try:
-                    P, Q = exactify_five_dof(
-                        params,
-                        max_primitive_area_index=max_primitive_area_index,
-                        max_pq_determinant=max_pq_determinant,
-                    )
-                except CrystallographyError as exc:
-                    raise BoundarySpecError(str(exc)) from exc
-
-                embedding = pq_spec_to_embedding(
-                    PQSpec(P=P, Q=Q, basis_mode="primitive"),
-                    max_primitive_area_index=max_primitive_area_index,
-                    max_pq_determinant=max_pq_determinant,
-                )
-
-            elif mode == "prefer_exact":
-                try:
-                    P, Q = exactify_five_dof(
-                        params,
-                        max_primitive_area_index=max_primitive_area_index,
-                        max_pq_determinant=max_pq_determinant,
-                    )
-                except (BoundarySpecError, CrystallographyError) as exc:
-                    warnings.warn(
-                        "FiveDOFSpec exactification failed; falling back to "
-                        f"mode='approximate'. Reason: {exc}",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-                    embedding = five_dof_spec_to_embedding(boundary)
-                else:
-                    embedding = pq_spec_to_embedding(
-                        PQSpec(P=P, Q=Q, basis_mode="primitive"),
-                        max_primitive_area_index=max_primitive_area_index,
-                        max_pq_determinant=max_pq_determinant,
-                    )
-
-            else:
-                embedding = five_dof_spec_to_embedding(boundary)
-
-        else:
-            raise NotImplementedError(
-                "from_boundary_spec does not yet support boundary objects of type "
-                f"{type(boundary).__name__}."
-            )
+        resolved = resolve_boundary_input(
+            boundary,
+            mode,
+            max_primitive_area_index=max_primitive_area_index,
+            max_pq_determinant=max_pq_determinant,
+        )
         misorientation = boundary.params if isinstance(boundary, FiveDOFSpec) else None
         return cls._from_boundary_embedding(
-            embedding,
+            resolved.embedding,
             a0=a0,
             structure=structure,
             atom_types=atom_types,
@@ -800,9 +719,10 @@ class GBMaker:
     def __validate_mismatch_tol(value: object) -> float | None:
         """Return a validated mismatch-accommodation tolerance.
 
-        ``None`` disables mismatch accommodation. Otherwise, the value is converted to
-        ``float`` and interpreted as the maximum allowed relative mismatch in the
-        one-dimensional commensurability search.
+        Thin wrapper delegating to the single pure implementation in
+        ``GBOpt.gbmaker.config.validate_mismatch_tol``, translating its
+        ``GBMakerConstructionValueError`` back to the established public
+        ``GBMakerValueError``.
 
         :param value: Candidate mismatch tolerance.
         :return: ``None`` if mismatch accommodation is disabled; otherwise a finite,
@@ -810,58 +730,33 @@ class GBMaker:
         :raises GBMakerValueError: If ``value`` is boolean, non-numeric, infinite, NaN,
             or negative.
         """
-        if value is None:
-            return None
-
-        if isinstance(value, (bool, np.bool_)):
-            raise GBMakerValueError(
-                f"mismatch_tol must be finite and non-negative; got {value!r}."
-            )
-
         try:
-            tol = float(value)
-        except (TypeError, ValueError) as exc:
-            raise GBMakerValueError(
-                f"mismatch_tol must be finite and non-negative; got {value!r}."
-            ) from exc
-
-        if not math.isfinite(tol) or tol < 0.0:
-            raise GBMakerValueError(
-                f"mismatch_tol must be finite and non-negative; got {value!r}."
-            )
-
-        return tol
+            return validate_mismatch_tol(value)
+        except GBMakerConstructionValueError as exc:
+            raise GBMakerValueError(str(exc)) from exc
 
     @staticmethod
     def __validate_mismatch_max_cells(value: object) -> int:
         """Return a validated commensurability-search repeat-count bound.
 
-        The returned value is the maximum integer repeat count allowed for either grain
-        in each one-dimensional mismatch-accommodation search.
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.config.validate_mismatch_max_cells``.
 
         :param value: Candidate maximum repeat count.
         :return: Positive integer repeat-count bound.
         :raises GBMakerValueError: If ``value`` is boolean, non-integral, or less than
             one.
         """
-        if isinstance(value, (bool, np.bool_)) or not isinstance(
-            value, (int, np.integer)
-        ):
-            raise GBMakerValueError(
-                f"mismatch_max_cells must be a positive integer; got {value!r}."
-            )
-
-        max_cells = int(value)
-        if max_cells < 1:
-            raise GBMakerValueError(
-                f"mismatch_max_cells must be a positive integer; got {value!r}."
-            )
-
-        return max_cells
+        try:
+            return validate_mismatch_max_cells(value)
+        except GBMakerConstructionValueError as exc:
+            raise GBMakerValueError(str(exc)) from exc
 
     @staticmethod
     def __validate_strain_grain(value: str) -> str:
         """Return a validated mismatch-strain policy.
+
+        Thin wrapper delegating to ``GBOpt.gbmaker.config.validate_strain_grain``.
 
         :param value: Grain strain policy. Supported values are ``"both"``, ``"left"``,
             and ``"right"``.
@@ -869,52 +764,37 @@ class GBMaker:
         :raises GBMakerValueError: If ``value`` is not one of ``"both"``, ``"left"``, or
             ``"right"``.
         """
-        if value not in _VALID_STRAIN_GRAIN:
-            raise GBMakerValueError(
-                f"Invalid strain_grain={value!r}. "
-                f"Must be one of {sorted(_VALID_STRAIN_GRAIN)}."
-            )
-        return value
+        try:
+            return validate_strain_grain(value)
+        except GBMakerConstructionValueError as exc:
+            raise GBMakerValueError(str(exc)) from exc
 
     @staticmethod
     def __validate_boundary_mode(value: str) -> str:
         """Return a validated boundary-spec construction mode.
+
+        Thin wrapper delegating to ``GBOpt.gbmaker.config.validate_boundary_mode``.
 
         :param value: Boundary-spec construction mode. Supported values are
             ``"exact"``, ``"approximate"``, and ``"prefer_exact"``.
         :return: Validated construction mode.
         :raises GBMakerValueError: If ``value`` is not one of the supported modes.
         """
-        if not isinstance(value, str):
-            raise GBMakerValueError(
-                f"mode must be one of {sorted(_VALID_BOUNDARY_MODES)}; got {value!r}."
-            )
-
-        if value not in _VALID_BOUNDARY_MODES:
-            raise GBMakerValueError(
-                f"mode must be one of {sorted(_VALID_BOUNDARY_MODES)}; got {value!r}."
-            )
-
-        return value
+        try:
+            return validate_boundary_mode(value)
+        except GBMakerConstructionValueError as exc:
+            raise GBMakerValueError(str(exc)) from exc
 
     @staticmethod
     def __validate_exact_limit(value: object, name: str) -> int:
-        """Return a validated positive exact-construction limit."""
-        if isinstance(value, (bool, np.bool_)) or not isinstance(
-            value,
-            (int, np.integer),
-        ):
-            raise GBMakerValueError(
-                f"{name} must be a positive integer; got {value!r}."
-            )
+        """Return a validated positive exact-construction limit.
 
-        limit = int(value)
-        if limit <= 0:
-            raise GBMakerValueError(
-                f"{name} must be a positive integer; got {value!r}."
-            )
-
-        return limit
+        Thin wrapper delegating to ``GBOpt.gbmaker.config.validate_exact_limit``.
+        """
+        try:
+            return validate_exact_limit(value, name)
+        except GBMakerConstructionValueError as exc:
+            raise GBMakerValueError(str(exc)) from exc
 
     @staticmethod
     def __reduce_integer_row(row: np.ndarray) -> np.ndarray:
@@ -3134,6 +3014,12 @@ class GBMaker:
     ):
         """Private method for validating the values passed in using the setters.
 
+        Thin wrapper delegating to the single pure implementation in
+        ``GBOpt.gbmaker.config._validate_scalar`` (also used by
+        ``normalize_legacy_config`` for the legacy constructor), translating its
+        ``GBMakerConstructionTypeError``/``GBMakerConstructionValueError`` back to the
+        established public ``GBMakerTypeError``/``GBMakerValueError``.
+
         :param value: The value to validate.
         :param expected_types: Single type or tuple containing the valid types for
             value.
@@ -3150,82 +3036,19 @@ class GBMaker:
             the specified parameter.
         :return: The validated value.
         """
-        if not isinstance(expected_types, tuple):
-            expected_types = (expected_types,)
-        if not any(isinstance(value, t) for t in expected_types) and not isinstance(
-            value, np.generic
-        ):
-            expected_type_names = ", ".join(t.__name__ for t in expected_types)
-            raise GBMakerTypeError(
-                f"{parameter_name} must be of type {expected_type_names}."
+        try:
+            return _validate_scalar(
+                value,
+                expected_types,
+                parameter_name,
+                positive=positive,
+                expected_length=expected_length,
+                strictly_positive=strictly_positive,
             )
-
-        if strictly_positive and isinstance(value, Number):
-            if value <= 0:
-                raise GBMakerValueError(f"{parameter_name} must be strictly positive")
-            if value < np.finfo(np.float64).eps:
-                warnings.warn(
-                    f"{parameter_name} ({value}) is below machine epsilon "
-                    f"({np.finfo(np.float64).eps:.2e}) and may not have any "
-                    "practical effect."
-                )
-        elif positive and isinstance(value, Number) and value < 0:
-            raise GBMakerValueError(
-                f"{parameter_name} must be a positive value.")
-
-        if (
-            isinstance(value, (Sequence, np.ndarray))
-            and all([isinstance(val, Number) for val in value])
-            and positive
-        ):
-            for val in value:
-                if val < 0:
-                    raise GBMakerValueError(
-                        f"{parameter_name} must have all positive values."
-                    )
-
-        if (
-            expected_length is not None
-            and isinstance(value, (Sequence, np.ndarray))
-            and len(value) != expected_length
-        ):
-            raise GBMakerValueError(
-                f"{parameter_name} must have {expected_length} elements."
-            )
-
-        if parameter_name == "structure" and value not in [
-            "fcc",
-            "bcc",
-            "sc",
-            "diamond",
-            "fluorite",
-            "rocksalt",
-            "zincblende",
-        ]:
-            raise GBMakerValueError(
-                f"{parameter_name} ({value}) must be one of ['fcc', 'bcc', 'sc', "
-                + "'diamond', 'fluorite', 'rocksalt', 'zincblende']."
-            )
-
-        if parameter_name == "repeat_factor":
-            if isinstance(value, int):
-                values = [value, value]
-            else:
-                values = list(value)
-                if not all(isinstance(val, int) for val in values):
-                    raise GBMakerValueError(
-                        "repeat_factor must be a sequence of type int."
-                    )
-
-            if any(val < 2 for val in values):
-                warnings.warn(
-                    "Recommended repeat factor is at least 2.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-
-            value = values
-        return value
+        except GBMakerConstructionTypeError as exc:
+            raise GBMakerTypeError(str(exc)) from exc
+        except GBMakerConstructionValueError as exc:
+            raise GBMakerValueError(str(exc)) from exc
 
     # Public methods
     def get_supercell(self, corners: np.ndarray) -> np.ndarray:

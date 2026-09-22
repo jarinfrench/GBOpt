@@ -2,16 +2,27 @@
 
 """Internal package for decomposing ``GBOpt.GBMaker`` construction.
 
-The package-level surface currently exposes only the construction-state contracts from
-``types``: the exception hierarchy and immutable dataclasses describing normalized build
-configuration, resolved boundary input, per-grain material identity, orientation state,
-per-axis strain accommodation, box-dimension planning, per-grain build requests and
-results, and the final assembled bicrystal. No construction, orientation-resolution, or
-supercell logic has moved into this package yet; that extraction happens incrementally
-in later roadmap issues (R04 through R09), which is why no compatibility facade is
-required here. Validation helpers in ``types`` are internal and are not promoted.
+The package-level surface exposes the construction-state contracts from ``types`` and
+the pure normalization functions from ``config`` and ``material`` that GBMaker's legacy
+constructor and ``from_boundary_spec`` factory now delegate to. GBMaker keeps its own
+``__validate`` instance method and per-field static validators for property setters,
+but those are thin wrappers over the pure functions here, so there is a single
+implementation of each validation rule. No orientation, geometry, or grain-generation
+logic has moved into this package yet; that extraction happens incrementally in later
+roadmap issues (R05 through R09). Internal validation helpers prefixed with an
+underscore are not promoted.
 """
 
+from .config import (
+    normalize_legacy_config,
+    resolve_boundary_input,
+    validate_boundary_mode,
+    validate_exact_limit,
+    validate_mismatch_max_cells,
+    validate_mismatch_tol,
+    validate_strain_grain,
+)
+from .material import resolve_material_state
 from .types import (
     AxisAccommodation,
     BicrystalResult,
@@ -49,4 +60,13 @@ __all__ = [
     "GrainBuildRequest",
     "GrainBuildResult",
     "BicrystalResult",
+    # Pure normalization functions
+    "resolve_material_state",
+    "normalize_legacy_config",
+    "resolve_boundary_input",
+    "validate_boundary_mode",
+    "validate_exact_limit",
+    "validate_mismatch_tol",
+    "validate_mismatch_max_cells",
+    "validate_strain_grain",
 ]
