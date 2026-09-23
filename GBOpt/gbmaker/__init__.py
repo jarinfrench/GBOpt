@@ -23,12 +23,24 @@ but are imported directly by ``GBOpt.GBMaker``, the same way it already imports
 ``config``'s ``_validate_scalar``. ``geometry`` is a leaf with respect to its
 ``gbmaker`` siblings (it depends only on ``types``); ``orientation`` and ``dimension``
 now import their shared ``_miller_row_norm`` from it instead of each carrying a private
-copy. Exact- and float-path grain enumeration
-(``__build_exact_grain``/``__generate_grain_result`` and the builder orchestration that
-calls the geometry kernels) has not moved into this package yet; that extraction
-happens in R08/R09.
+copy.
+
+``exact_grain`` and ``approximate_grain`` (R08, issue #69) extract the exact
+decorated-site and floating-point lattice-enumeration grain builders. Both consume a
+``GrainBuildRequest`` and return a ``GrainBuildResult``; ``build_exact_grain`` and
+``build_approximate_grain`` are promoted here as the package's builder contracts.
+``approximate_grain``'s ``filter_grain_result_complete_origins`` and
+``trim_grain_result_to_upper_x`` are post-build trimming helpers used only by
+``GBOpt.GBMaker``'s vacuum-zero and periodic-gap-equalization orchestration; like the
+underscore-prefixed geometry helpers, they are not promoted here but are imported
+directly by ``GBOpt.GBMaker``. Both new modules are leaves with respect to each other
+-- ``exact_grain`` and ``approximate_grain`` each depend only on ``geometry`` and
+``types``, not on one another. Grain-boundary assembly (merging left/right grains,
+periodic-gap equalization orchestration) and LAMMPS/file-writer code remain in
+``GBOpt.GBMaker``, per issue #69's non-goals.
 """
 
+from .approximate_grain import build_approximate_grain
 from .config import (
     normalize_legacy_config,
     resolve_boundary_input,
@@ -39,6 +51,7 @@ from .config import (
     validate_strain_grain,
 )
 from .dimension import plan_dimensions, plan_periodic_spacing
+from .exact_grain import build_exact_grain
 from .material import resolve_material_state
 from .orientation import resolve_orientation
 from .types import (
@@ -91,4 +104,7 @@ __all__ = [
     "resolve_orientation",
     "plan_periodic_spacing",
     "plan_dimensions",
+    # Grain builders
+    "build_exact_grain",
+    "build_approximate_grain",
 ]

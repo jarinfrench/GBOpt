@@ -67,6 +67,22 @@ def _require_positive_float(value: object, name: str) -> float:
     return normalized
 
 
+def _require_finite_float(value: object, name: str) -> float:
+    """Normalize a finite non-Boolean real scalar, positive, negative, or zero.
+
+    :param value: Candidate real value.
+    :param name: Field name for diagnostics.
+    :return: Python float.
+    :raises GBMakerConstructionValueError: If the value is not a finite real scalar.
+    """
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise GBMakerConstructionValueError(f"{name} must be a non-Boolean real scalar")
+    normalized = float(value)
+    if not np.isfinite(normalized):
+        raise GBMakerConstructionValueError(f"{name} must be a finite value")
+    return normalized
+
+
 def _require_nonnegative_float(value: object, name: str) -> float:
     """Normalize a finite non-negative non-Boolean real scalar.
 
@@ -714,22 +730,60 @@ class DimensionPlan:
 class GrainBuildRequest:
     """Inputs needed to build one grain's atoms for a bicrystal.
 
+    ``rotation`` and ``periodic_matrix`` are always both required, on both the exact
+    and approximate construction paths: ``rotation`` is the proper rotation applied to
+    crystal positions to reach the lab frame, and ``periodic_matrix`` is the integer
+    matrix whose rows define the boundary-normal (row 0) and in-plane (rows 1-2)
+    periodic directions in the unit-cell basis -- the canonical P/Q matrix on exact
+    paths, or the periodic Miller-row matrix on approximate paths. An earlier revision
+    of this type carried a single ``orientation`` field whose dtype depended on
+    ``exact`` and conflated these two distinct roles; the exact and approximate grain
+    builders need both simultaneously (confirmed against R08's actual call sites), so
+    this splits them.
+
     :param material: Crystal identity shared by both grains.
-    :param orientation: 3 by 3 orientation matrix for this grain: an exact integer P/Q
-        matrix on exact construction paths, or a floating-point rotation matrix on
-        approximate paths.
+    :param rotation: Proper 3 by 3 rotation matrix applied to crystal positions to
+        reach the lab frame for this grain.
+    :param periodic_matrix: 3 by 3 integer matrix whose rows define the
+        boundary-normal (row 0) and in-plane (rows 1-2) periodic directions in the
+        unit-cell basis.
     :param grain_side: Which grain this request builds, ``"left"`` or ``"right"``.
+    :param x_offset: Lab-frame x-coordinate of this grain's lower face (Angstroms).
     :param x_length: Equalized x-slab thickness for this grain (Angstroms).
-    :param box_dims: Shared simulation-box bounds this grain's atoms must fit within.
-    :param exact: Whether ``orientation`` is an exact integer matrix rather than a
-        floating-point rotation.
+    :param inplane_periodic: Per-axis in-plane periodicity flags ``(y, z)`` for the
+        shared simulation box.
+    :param inplane_box_lengths: Shared in-plane box lengths ``(y_dim, z_dim)``
+        (Angstroms).
+    :param epsilon: Numerical tolerance used for geometric comparisons.
+    :param y_scale: Lab-frame in-plane strain scale factor applied along y. Optional,
+        defaults to ``1.0`` (no strain).
+    :param z_scale: Lab-frame in-plane strain scale factor applied along z. Optional,
+        defaults to ``1.0`` (no strain).
+    :param y_repeats: Explicit exact-path supercell repeat count along y for this
+        grain, when mismatch accommodation supplied one. ``None`` derives the repeat
+        count from the shared y box length instead. Ignored on the approximate path.
+        Optional, defaults to ``None``.
+    :param z_repeats: Explicit exact-path supercell repeat count along z for this
+        grain, when mismatch accommodation supplied one. ``None`` derives the repeat
+        count from the shared z box length instead. Ignored on the approximate path.
+        Optional, defaults to ``None``.
+    :param exact: Whether this request should be built through the exact
+        decorated-site path rather than the floating-point lattice-enumeration path.
     """
 
     material: MaterialState
-    orientation: NDArray = field(repr=False)
+    rotation: NDArray = field(repr=False)
+    periodic_matrix: NDArray = field(repr=False)
     grain_side: GrainSide
+    x_offset: float
     x_length: float
-    box_dims: NDArray[np.floating] = field(repr=False)
+    inplane_periodic: tuple[bool, bool]
+    inplane_box_lengths: tuple[float, float]
+    epsilon: float
+    y_scale: float = 1.0
+    z_scale: float = 1.0
+    y_repeats: int | None = None
+    z_repeats: int | None = None
     exact: bool = False
 
     def __post_init__(self) -> None:
@@ -738,25 +792,70 @@ class GrainBuildRequest:
             raise GBMakerConstructionTypeError("material must be a MaterialState")
 
         object.__setattr__(self, "exact", _require_bool(self.exact, "exact"))
-        dtype = int if self.exact else float
-        try:
-            orientation = np.array(self.orientation, dtype=dtype, copy=True)
-        except (TypeError, ValueError) as exc:
-            raise GBMakerConstructionValueError(
-                "orientation must be a 3 by 3 real array-like"
-            ) from exc
-        if orientation.shape != (3, 3):
-            raise GBMakerConstructionValueError(
-                f"orientation must have shape (3, 3); got {orientation.shape}"
-            )
-        orientation.setflags(write=False)
-        object.__setattr__(self, "orientation", orientation)
+        object.__setattr__(
+            self, "rotation", _readonly_float_matrix(self.rotation, (3, 3), "rotation")
+        )
+        object.__setattr__(
+            self,
+            "periodic_matrix",
+            _readonly_miller_matrix(self.periodic_matrix, "periodic_matrix"),
+        )
 
         object.__setattr__(self, "grain_side", _require_grain_side(self.grain_side))
         object.__setattr__(
+            self, "x_offset", _require_finite_float(self.x_offset, "x_offset")
+        )
+        object.__setattr__(
             self, "x_length", _require_positive_float(self.x_length, "x_length")
         )
-        object.__setattr__(self, "box_dims", _readonly_box_dims(self.box_dims))
+
+        try:
+            y_periodic, z_periodic = self.inplane_periodic
+        except (TypeError, ValueError) as exc:
+            raise GBMakerConstructionValueError(
+                "inplane_periodic must be a two-value sequence of bools"
+            ) from exc
+        object.__setattr__(
+            self,
+            "inplane_periodic",
+            (
+                _require_bool(y_periodic, "inplane_periodic[0]"),
+                _require_bool(z_periodic, "inplane_periodic[1]"),
+            ),
+        )
+
+        try:
+            y_dim, z_dim = self.inplane_box_lengths
+        except (TypeError, ValueError) as exc:
+            raise GBMakerConstructionValueError(
+                "inplane_box_lengths must be a two-value sequence of positive floats"
+            ) from exc
+        object.__setattr__(
+            self,
+            "inplane_box_lengths",
+            (
+                _require_positive_float(y_dim, "inplane_box_lengths[0]"),
+                _require_positive_float(z_dim, "inplane_box_lengths[1]"),
+            ),
+        )
+
+        object.__setattr__(self, "epsilon", _require_positive_float(self.epsilon, "epsilon"))
+        object.__setattr__(self, "y_scale", _require_positive_float(self.y_scale, "y_scale"))
+        object.__setattr__(self, "z_scale", _require_positive_float(self.z_scale, "z_scale"))
+        object.__setattr__(
+            self,
+            "y_repeats",
+            None
+            if self.y_repeats is None
+            else _require_positive_int(self.y_repeats, "y_repeats"),
+        )
+        object.__setattr__(
+            self,
+            "z_repeats",
+            None
+            if self.z_repeats is None
+            else _require_positive_int(self.z_repeats, "z_repeats"),
+        )
 
 
 @dataclass(frozen=True, slots=True)

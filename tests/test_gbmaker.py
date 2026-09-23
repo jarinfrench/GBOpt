@@ -34,6 +34,12 @@ from GBOpt.GBMaker import (
     _find_commensurate_pair,
     wrap_reduced_coordinate,
 )
+from GBOpt.gbmaker.geometry import (
+    _cartesian_from_box_coordinates,
+    _reduced_box_coordinates,
+    _reduced_coordinate_tolerance,
+    _selection_basis_vectors,
+)
 from GBOpt.UnitCell import UnitCell
 from tests.data.olmsted_2009_fcc_gb_energies import (
     BOUNDARIES as OLMSTED_2009_BOUNDARIES,
@@ -1646,12 +1652,16 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                     dtype=np.float64,
                 )
 
-                selection_basis = gb._GBMaker__selection_basis_vectors(
-                    primitive_periods
+                selection_basis = _selection_basis_vectors(
+                    primitive_periods,
+                    gb.inplane_periodic,
+                    (gb.y_dim, gb.z_dim),
+                    gb.epsilon,
                 )
-                reduced = gb._GBMaker__reduced_box_coordinates(
+                reduced = _reduced_box_coordinates(
                     self._positions(atoms),
                     selection_basis,
+                    gb.epsilon,
                 )
 
                 yield (
@@ -1689,10 +1699,8 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                         continue
 
                     coordinate_index = row_index + 1
-                    tolerance = (
-                        gb._GBMaker__reduced_coordinate_tolerance(
-                            selection_basis[row_index]
-                        )
+                    tolerance = _reduced_coordinate_tolerance(
+                        selection_basis[row_index], gb.epsilon
                     )
                     wrapped = wrap_reduced_coordinate(
                         reduced[:, coordinate_index],
@@ -1734,10 +1742,8 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                         continue
 
                     coordinate_index = row_index + 1
-                    tolerance = (
-                        gb._GBMaker__reduced_coordinate_tolerance(
-                            selection_basis[row_index]
-                        )
+                    tolerance = _reduced_coordinate_tolerance(
+                        selection_basis[row_index], gb.epsilon
                     )
                     canonical[:, coordinate_index] = (
                         wrap_reduced_coordinate(
@@ -1746,11 +1752,9 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                         )
                     )
 
-                canonical_positions = (
-                    gb._GBMaker__cartesian_from_box_coordinates(
-                        canonical,
-                        selection_basis,
-                    )
+                canonical_positions = _cartesian_from_box_coordinates(
+                    canonical,
+                    selection_basis,
                 )
                 quantized = np.rint(
                     canonical_positions / gb.epsilon

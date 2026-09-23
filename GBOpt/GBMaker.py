@@ -6,7 +6,6 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Sequence
-from dataclasses import dataclass
 from numbers import Number
 from typing import Any
 
@@ -22,6 +21,11 @@ from GBOpt.BoundaryTopology import BoundaryNormalTopology
 from GBOpt.crystallography._limits import (
     DEFAULT_MAX_PQ_DETERMINANT,
     DEFAULT_MAX_PRIMITIVE_AREA_INDEX,
+)
+from GBOpt.gbmaker.approximate_grain import (
+    build_approximate_grain,
+    filter_grain_result_complete_origins,
+    trim_grain_result_to_upper_x,
 )
 from GBOpt.gbmaker.config import (
     _validate_scalar,
@@ -41,25 +45,15 @@ from GBOpt.gbmaker.dimension import (
     plan_dimensions,
     plan_periodic_spacing,
 )
+from GBOpt.gbmaker.exact_grain import build_exact_grain
 from GBOpt.gbmaker.geometry import (
     _box_periodic_basis,
-    _cartesian_from_box_coordinates,
-    _clip_complete_origins_to_cartesian_box,
     _complete_origin_atom_mask,
-    _deduplicate_complete_origins,
-    _filter_complete_origins,
-    _miller_row_norm,
-    _reduced_box_coordinates,
-    _reduced_coordinate_tolerance,
     _scaled_periodic_basis_vector,
-    _select_complete_origins_in_box_basis,
-    _selection_basis_vectors,
-    _x_index_range,
 )
 from GBOpt.gbmaker.geometry import wrap_reduced_coordinate as _wrap_reduced_coordinate
 from GBOpt.gbmaker.orientation import (
     _decompose_misorientation,
-    _reduce_integer_row,
     _x_period,
     resolve_orientation,
 )
@@ -67,10 +61,9 @@ from GBOpt.gbmaker.types import (
     AxisAccommodation,
     GBMakerConstructionTypeError,
     GBMakerConstructionValueError,
-)
-from GBOpt.gbmaker_supercell import (
-    build_supercell_matrix,
-    enumerate_supercell_sites,
+    GrainBuildRequest,
+    GrainBuildResult,
+    MaterialState,
 )
 from GBOpt.UnitCell import UnitCell
 
@@ -137,36 +130,6 @@ def _find_commensurate_pair(
         return _plan_find_commensurate_pair(d1, d2, tol=tol, max_n=max_n)
     except GBMakerConstructionValueError as exc:
         raise GBMakerValueError(str(exc)) from exc
-
-
-@dataclass(frozen=True)
-class _FloatGrainBuildResult:
-    """Float-path atoms with conventional-cell origin metadata.
-
-    Carries the result of the floating-point grain-build path through trimming,
-    clipping, wrapping, and deduplication operations that must preserve complete
-    conventional-cell origins.
-
-    ``atoms`` and ``origin_ids`` are parallel one-dimensional arrays. Each atom has one
-    origin identifier, and atoms sharing an origin identifier belong to the same
-    generated conventional-cell origin group. ``basis_size`` gives the expected number
-    of atoms in each complete origin group.
-
-    The dataclass is frozen to prevent rebinding the result fields, but the underlying
-    NumPy arrays remain mutable because the generated atom arrays are later assigned
-    into GBMaker state and may be modified by downstream geometry operations.
-
-    :param atoms: Structured atom array for the generated grain after float-path
-        selection and filtering.
-    :param origin_ids: Integer array parallel to ``atoms``. Each value identifies the
-        generated conventional-cell origin that produced the corresponding atom.
-    :param basis_size: Number of atoms generated per conventional-cell origin.
-        Complete-origin filtering assumes retained atom groups have this size.
-    """
-
-    atoms: np.ndarray
-    origin_ids: np.ndarray
-    basis_size: int
 
 
 def wrap_reduced_coordinate(reduced_coord: np.ndarray, tol: float = 1e-8) -> np.ndarray:
@@ -611,19 +574,6 @@ class GBMaker:
             validate_exact_limit, value, name
         )
 
-    @staticmethod
-    def __reduce_integer_row(row: np.ndarray) -> np.ndarray:
-        """Reduce an integer row by its GCD.
-
-        Thin wrapper delegating to ``GBOpt.gbmaker.orientation._reduce_integer_row``,
-        kept for the geometry call sites (exact-repeat and box-basis direction
-        reduction) that have not yet moved out of ``GBMaker`` themselves.
-
-        :param row: Integer row vector
-        :return: GCD-reduced integer row vector
-        """
-        return _reduce_integer_row(row)
-
     # Private class methods
     def __assign_orientations(self, misorientation: np.ndarray) -> None:
         """ Private method to separate the misorientation and inclination from the
@@ -658,110 +608,95 @@ class GBMaker:
             )
         )
 
-    def __exact_grain_repeats(
+    def __material_state(self) -> MaterialState:
+        """Return the current crystal identity as a ``MaterialState``.
+
+        Thin wrapper constructing a ``GBOpt.gbmaker.types.MaterialState`` from current
+        instance state, for the ``GrainBuildRequest`` contract consumed by
+        ``GBOpt.gbmaker.exact_grain.build_exact_grain`` and
+        ``GBOpt.gbmaker.approximate_grain.build_approximate_grain``.
+
+        :return: Current material identity.
+        """
+        return self.__translate_construction_error(
+            MaterialState,
+            a0=self.__a0,
+            structure=self.__structure,
+            atom_types=tuple(self.__unit_cell.names()),
+            unit_cell=self.__unit_cell,
+        )
+
+    def __grain_build_request(
         self,
-        P_or_Q: np.ndarray,
+        R_grain: np.ndarray,
+        periodic_matrix: np.ndarray,
         x_length: float,
+        x_offset: float,
         grain_side: str,
-    ) -> tuple[np.ndarray, int, int, int]:
-        """Compute exact-path supercell repeat counts for one grain.
+        *,
+        exact: bool,
+    ) -> GrainBuildRequest:
+        """Build the ``GrainBuildRequest`` shared by both grain-build paths.
 
-        Builds the integer supercell matrix for the supplied canonical orientation
-        matrix and derives the number of repeated supercell periods needed along the
-        boundary-normal x direction and the two in-plane directions. The x repeat count
-        is derived from the grain's already equalized x-slab thickness. The y and z
-        repeat counts are derived from the shared in-plane box dimensions, unless
-        mismatch accommodation supplied explicit left/right repeat counts for that axis.
+        Thin wrapper collecting the instance state ``GBOpt.gbmaker.exact_grain`` and
+        ``GBOpt.gbmaker.approximate_grain`` need but do not read from ``self``
+        directly, including the explicit exact-path repeat counts a mismatch
+        accommodation supplies (``GrainBuildRequest.y_repeats``/``z_repeats``).
 
-        :param P_or_Q: Canonical 3 by 3 integer orientation matrix for this grain.
+        :param R_grain: Proper rotation matrix for this grain.
+        :param periodic_matrix: 3x3 integer orientation matrix: the canonical P/Q
+            matrix on the exact path, or the periodic Miller-row matrix on the
+            approximate path.
         :param x_length: Equalized x-slab thickness for this grain (Angstroms).
-        :param grain_side: Grain side, either ``"left"`` or ``"right"``. Used to select
-            the appropriate repeat count when mismatch accommodation is active.
-        :return: ``(supercell, repeat_x, repeat_y, repeat_z)`` where ``supercell`` is
-            the validated integer supercell matrix and the remaining values are positive
-            Python integers.
+        :param x_offset: Lab x-coordinate of the grain's lower face (Angstroms).
+        :param grain_side: Grain side, either ``"left"`` or ``"right"``.
+        :param exact: Keyword argument, required. Whether this request targets the
+            exact decorated-site path.
+        :return: Grain build request for this grain.
         :raises GBMakerValueError: If ``grain_side`` is not ``"left"`` or ``"right"``,
-            if the supercell matrix cannot be built, or if the x, y, or z box length is
-            not commensurate with this grain's corresponding period.
+            or if any field fails ``GrainBuildRequest`` validation.
         """
         if grain_side not in {"left", "right"}:
             raise GBMakerValueError(
                 f"grain_side must be 'left' or 'right'; got {grain_side!r}."
             )
 
-        try:
-            supercell = build_supercell_matrix(P_or_Q)
-        except ValueError as exc:
-            raise GBMakerValueError(str(exc)) from exc
-
-        a0 = self.__a0
-        x_period = a0 * self.__translate_construction_error(
-            _miller_row_norm, supercell[0]
-        )
-        y_period = a0 * self.__translate_construction_error(
-            _miller_row_norm, supercell[1]
-        )
-        z_period = a0 * self.__translate_construction_error(
-            _miller_row_norm, supercell[2]
-        )
-
-        tol = 1e-6
-
-        def commensurate_repeat(
-            box_length: float,
-            period: float,
-            axis_name: str,
-        ) -> int:
-            """Return a positive repeat count for one exact box/period pair.
-
-            :param box_length: Box length along this axis (Angstroms).
-            :param period: Grain period along this axis (Angstroms).
-            :param axis_name: Axis label used in error messages.
-            :return: Positive integer repeat count.
-            :raises GBMakerValueError: If ``box_length`` is not an integer multiple of
-                ``period`` within the repeat-count tolerance.
-            """
-            repeat_raw = box_length / period
-            repeat = int(round(repeat_raw))
-
-            if abs(repeat_raw - repeat) > tol:
-                raise GBMakerValueError(
-                    f"Exact construction requires the {axis_name} box "
-                    f"({box_length:.6f}A) to be an integer multiple of this grain's "
-                    f"{axis_name}-period ({period:.6f} A), but got repeat_{axis_name} "
-                    f"= {repeat_raw:.8f}. Use mode='approximate' or adjust "
-                    "repeat_factor until both grains' periods divide the shared box "
-                    "exactly. See the commensurability note in from_boundary_spec for "
-                    "details."
-                )
-
-            if repeat <= 0:
-                raise GBMakerValueError(
-                    f"Exact construction requires positive {axis_name} repeats; got "
-                    f"{repeat}."
-                )
-
-            return repeat
-
-        repeat_x = commensurate_repeat(x_length, x_period, "x")
+        y_scale, z_scale = self.__grain_strain_scales(grain_side)
 
         y_accommodation = self.__strain_accommodation.get("y")
-        if y_accommodation is None:
-            repeat_y = commensurate_repeat(self.__y_dim, y_period, "y")
-        elif grain_side == "left":
-            repeat_y = y_accommodation.left_repeats
-        else:
-            repeat_y = y_accommodation.right_repeats
-
         z_accommodation = self.__strain_accommodation.get("z")
-        if z_accommodation is None:
-            repeat_z = commensurate_repeat(self.__z_dim, z_period, "z")
-        elif grain_side == "left":
-            repeat_z = z_accommodation.left_repeats
-        else:
-            repeat_z = z_accommodation.right_repeats
+        y_repeats = None
+        z_repeats = None
+        if exact and y_accommodation is not None:
+            y_repeats = (
+                y_accommodation.left_repeats
+                if grain_side == "left"
+                else y_accommodation.right_repeats
+            )
+        if exact and z_accommodation is not None:
+            z_repeats = (
+                z_accommodation.left_repeats
+                if grain_side == "left"
+                else z_accommodation.right_repeats
+            )
 
-        return supercell, repeat_x, repeat_y, repeat_z
+        return self.__translate_construction_error(
+            GrainBuildRequest,
+            material=self.__material_state(),
+            rotation=R_grain,
+            periodic_matrix=periodic_matrix,
+            grain_side=grain_side,
+            x_offset=x_offset,
+            x_length=x_length,
+            inplane_periodic=self.__inplane_periodic,
+            inplane_box_lengths=(self.__y_dim, self.__z_dim),
+            epsilon=self.__epsilon,
+            y_scale=y_scale,
+            z_scale=z_scale,
+            y_repeats=y_repeats,
+            z_repeats=z_repeats,
+            exact=exact,
+        )
 
     def __build_exact_grain(
         self,
@@ -773,12 +708,7 @@ class GBMaker:
     ) -> np.ndarray:
         """Build one grain from exact decorated repeated-supercell sites.
 
-        Enumerates every rational decorated basis site in the repeated integer supercell
-        before any floating-point conversion. Exact conventional coordinates are
-        reconstructed from exact site metadata and converted once to Cartesian crystal
-        positions. Existing rotation, in-plane strain, placement, and periodic in-plane
-        wrapping are then applied without Cartesian membership clipping or
-        complete-origin deletion.
+        Thin wrapper delegating to ``GBOpt.gbmaker.exact_grain.build_exact_grain``.
 
         :param R_grain: Proper rotation matrix for this grain.
         :param P_or_Q: 3x3 canonical integer orientation matrix.
@@ -790,177 +720,14 @@ class GBMaker:
             enumeration violates a population invariant, or final coordinates are
             non-finite or outside the intended grain box.
         """
-        rational_basis = self.__unit_cell.rational_basis
-        if rational_basis is None:
-            raise GBMakerValueError(
-                "Exact grain generation requires UnitCell.rational_basis; arbitrary "
-                "floating-point basis coordinates are not accepted."
+
+        def _call() -> GrainBuildResult:
+            request = self.__grain_build_request(
+                R_grain, P_or_Q, x_length, x_offset, grain_side, exact=True
             )
+            return build_exact_grain(request)
 
-        supercell, repeat_x, repeat_y, repeat_z = self.__exact_grain_repeats(
-            P_or_Q, x_length, grain_side
-        )
-
-        try:
-            sites = enumerate_supercell_sites(
-                supercell,
-                repeat_x,
-                repeat_y,
-                repeat_z,
-                rational_basis=rational_basis,
-            )
-        except ValueError as exc:
-            raise GBMakerValueError(
-                f"Exact decorated-site enumeration failed for the {grain_side} grain: "
-                f"{exc}"
-            ) from exc
-
-        basis_size = sites.basis_size
-        basis_indices = sites.basis_indices
-        expected_site_count = sites.site_count
-
-        structured_basis = self.__unit_cell.asarray()
-        structured_names = tuple(
-            str(name) for name in structured_basis["name"]
-        )
-
-        if len(structured_basis) != basis_size:
-            raise GBMakerValueError(
-                "UnitCell rational-basis and structured-basis sizes disagree: "
-                f"{basis_size} exact sites versus {len(structured_basis)} structured "
-                "atoms."
-            )
-
-        if structured_names != rational_basis.names:
-            raise GBMakerValueError(
-                "UnitCell rational-basis and structured-basis species order disagree: "
-                f"exact={rational_basis.names!r}, structured={structured_names!r}."
-            )
-
-        atoms = np.empty(expected_site_count, dtype=structured_basis.dtype)
-        atoms["name"] = structured_basis["name"][basis_indices]
-
-        # This is the sole exact-to-floating conversion in grain construction. Exact
-        # site metadata stores canonical repeated-supercell coordinates; multiplying by
-        # S reconstructs exact conventional-cell coordinate numerators.
-        conventional_numerators = sites.coordinate_numerators @ sites.supercell_matrix
-
-        try:
-            with np.errstate(over="ignore", invalid="ignore"):
-                crystal_positions = np.asarray(
-                    conventional_numerators,
-                    dtype=np.float64,
-                )
-                crystal_positions *= self.__a0 / sites.coordinate_denominator
-
-            rotation = np.asarray(R_grain, dtype=np.float64)
-            inplane_orientation_rows = np.asarray(P_or_Q[1:], dtype=np.float64)
-        except (OverflowError, TypeError, ValueError) as exc:
-            raise GBMakerValueError(
-                "Exact decorated-site coordinates or orientation rows cannot be "
-                f"represented as finite Cartesian values for the {grain_side} grain."
-            ) from exc
-
-        if (
-            not np.all(np.isfinite(crystal_positions))
-            or not np.all(np.isfinite(rotation))
-            or not np.all(np.isfinite(inplane_orientation_rows))
-        ):
-            raise GBMakerValueError(
-                "Exact decorated-site coordinates or orientation rows became "
-                f"non-finite during Cartesian conversion for the {grain_side} grain."
-            )
-
-        rotated = crystal_positions @ rotation.T
-
-        y_scale, z_scale = self.__grain_strain_scales(grain_side)
-        strain_scales = np.array([1.0, y_scale, z_scale], dtype=np.float64)
-
-        rotated *= strain_scales
-        rotated[:, 0] += x_offset
-
-        rotated_unit_cell_basis = self.__unit_cell.conventional @ rotation.T
-        primitive_periods = inplane_orientation_rows @ rotated_unit_cell_basis
-        strained_periods = primitive_periods * strain_scales
-        selection_basis = self.__selection_basis_vectors(strained_periods)
-
-        box_coordinates = self.__reduced_box_coordinates(rotated, selection_basis)
-
-        for row_index, is_periodic in enumerate(self.__inplane_periodic):
-            if not is_periodic:
-                continue
-
-            coordinate_index = row_index + 1
-            tolerance = self.__reduced_coordinate_tolerance(selection_basis[row_index])
-            box_coordinates[:, coordinate_index] = wrap_reduced_coordinate(
-                box_coordinates[:, coordinate_index],
-                tolerance,
-            )
-
-        rotated = self.__cartesian_from_box_coordinates(
-            box_coordinates,
-            selection_basis,
-        )
-        if not np.all(np.isfinite(rotated)):
-            raise GBMakerValueError(
-                "Exact decorated-site conversion produced non-finite Cartesian "
-                f"coordinates for the {grain_side} grain."
-            )
-        atoms["x"], atoms["y"], atoms["z"] = rotated.T
-
-        lower_x = float(x_offset)
-        upper_x = lower_x + float(x_length)
-        x_coordinates = atoms["x"]
-
-        near_lower = (
-            (x_coordinates < lower_x)
-            & (x_coordinates >= lower_x - self.__epsilon)
-        )
-        near_upper = (
-            (x_coordinates >= upper_x)
-            & (x_coordinates < upper_x + self.__epsilon)
-        )
-
-        # Preserve the physical side of the upper termination while ensuring that its
-        # floating representation remains strictly half-open.
-        x_coordinates[near_lower] = lower_x
-        x_coordinates[near_upper] = np.nextafter(upper_x, lower_x)
-
-        outside_x = ((x_coordinates < lower_x) | (x_coordinates >= upper_x))
-        if np.any(outside_x):
-            offending = x_coordinates[outside_x]
-            raise GBMakerValueError(
-                "Exact decorated-site conversion produced atoms outside the "
-                f"{grain_side} half-open x slab [{lower_x:.8f}, {upper_x:.8f}): "
-                f"min={float(np.min(offending)):.8f}, "
-                f"max={float(np.max(offending)):.8f}."
-            )
-
-        for axis_name, dimension, is_periodic in zip(
-            ("y", "z"),
-            (self.__y_dim, self.__z_dim),
-            self.__inplane_periodic,
-        ):
-            if not is_periodic:
-                continue
-            coordinates = atoms[axis_name]
-            near_lower = (coordinates < 0.0) & (coordinates >= -self.__epsilon)
-            near_upper = (coordinates >= dimension) & (
-                coordinates < dimension + self.__epsilon
-            )
-            coordinates[near_lower | near_upper] = 0.0
-
-            outside = (coordinates < 0.0) | (coordinates >= dimension)
-            if np.any(outside):
-                offending = coordinates[outside]
-                raise GBMakerValueError(
-                    "Exact decorated-site conversion produced atoms outside the "
-                    f"periodic {axis_name} box [0, {dimension:.8f}): "
-                    f"min={float(np.min(offending)):.8f}, "
-                    f"max={float(np.max(offending)):.8f}."
-                )
-
-        return atoms
+        return self.__translate_construction_error(_call).atoms
 
     def __grain_x_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """Return initial lab-frame x bounds for the left and right grains.
@@ -1049,7 +816,7 @@ class GBMaker:
         self,
         left_bounds: np.ndarray,
         right_effective_bounds: np.ndarray,
-    ) -> tuple[_FloatGrainBuildResult, np.ndarray, bool, float]:
+    ) -> tuple[GrainBuildResult, np.ndarray, bool, float]:
         """Generate both grains using the floating-point path.
 
         For ``vacuum=0``, trims one complete right-grain x period from the high-x side
@@ -1143,7 +910,7 @@ class GBMaker:
         right_max_x: float,
         left_bounds: np.ndarray,
         right_effective_bounds: np.ndarray,
-        right_float_result: _FloatGrainBuildResult,
+        right_float_result: GrainBuildResult,
         x_period_right: float,
     ) -> None:
         """Equalize the periodic gap by removing whole right-grain x periods.
@@ -1226,7 +993,7 @@ class GBMaker:
         left_bounds: np.ndarray,
         right_effective_bounds: np.ndarray,
         use_exact: bool,
-        right_float_result: _FloatGrainBuildResult | None,
+        right_float_result: GrainBuildResult | None,
         vacuum0_trim_applied: bool,
         x_period_right: float | None,
     ) -> None:
@@ -1308,7 +1075,7 @@ class GBMaker:
         right_effective_bounds = right_bounds.copy()
 
         use_exact = self.__use_exact_grain_generation()
-        right_float_result: _FloatGrainBuildResult | None = None
+        right_float_result: GrainBuildResult | None = None
         vacuum0_trim_applied = False
         x_period_right: float | None = None
 
@@ -1473,18 +1240,18 @@ class GBMaker:
         periodic_miller_rows: np.ndarray,
         x_bounds: np.ndarray,
         *,
-        grain_side: str | None = None,
-    ) -> _FloatGrainBuildResult:
+        grain_side: str,
+    ) -> GrainBuildResult:
         """Generate one grain using the floating-point lattice-enumeration path.
 
-        Enumerates conventional-cell lattice coefficients over a conservative slab,
-        expands each retained origin to the full conventional-cell basis, rotates atoms
-        into the lab frame, applies any requested lab-frame in-plane strain,
-        selects/wraps periodic in-plane coordinates, clips to the Cartesian x slab, and
-        removes duplicate complete-origin groups.
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.approximate_grain.build_approximate_grain``.
 
-        ``origin_ids`` is preserved in parallel with the atom array so later trimming
-        operations can keep or remove complete conventional-cell origins.
+        An earlier revision of this method accepted ``grain_side: str | None = None``
+        to apply no strain when unset; both current call sites always supply
+        ``"left"``/``"right"``, and ``GrainBuildRequest.grain_side`` requires a
+        concrete value, so this now requires one too -- see ``REFACTOR_CLEANUP.md``
+        for the R08 note recording this intentional signature tightening.
 
         :param R_grain: Proper rotation matrix for this grain.
         :param periodic_miller_rows: Three-row integer periodic Miller matrix for this
@@ -1492,9 +1259,8 @@ class GBMaker:
             the floating-point selection basis.
         :param x_bounds: Length-2 array-like containing the lower and upper x bounds for
             this grain in the lab frame (Angstroms).
-        :param grain_side: Grain side, either ``"left"`` or ``"right"``, when
-            mismatch-accommodation strain scales should be applied. ``None`` applies no
-            strain. Keyword parameter, optional, defaults to ``None``.
+        :param grain_side: Keyword argument, required. Grain side, either ``"left"``
+            or ``"right"``.
         :return: Float-path grain build result containing the atom array, parallel
             origin-ID array, and conventional-cell basis size.
         :raises GBMakerValueError: If ``grain_side`` is invalid, if selection or
@@ -1502,120 +1268,21 @@ class GBMaker:
             remain after filtering.
         """
         x_bounds = np.asarray(x_bounds, dtype=np.float64)
+        x_offset = float(x_bounds[0])
+        x_length = float(x_bounds[1] - x_bounds[0])
 
-        y_scale = 1.0
-        z_scale = 1.0
-        if grain_side is not None:
-            y_scale, z_scale = self.__grain_strain_scales(grain_side)
-        strain_scales = np.array([1.0, y_scale, z_scale], dtype=np.float64)
-
-        rotated_unit_cell_basis = self.__unit_cell.conventional @ R_grain.T
-
-        primitive_periods = np.asarray(periodic_miller_rows[1:], dtype=np.float64)
-        primitive_periods = primitive_periods @ rotated_unit_cell_basis
-
-        # Selection and wrapping operate on strained lab-frame coordinates, so the
-        # period vectors passed to those helpers must carry the same lab-frame y/z
-        # strain as the atoms.
-        strained_periods = primitive_periods * strain_scales
-
-        reduced_periods = np.linalg.solve(
-            rotated_unit_cell_basis.T, primitive_periods.T
-        ).T
-        x_direction_lattice = np.cross(reduced_periods[0], reduced_periods[1])
-        rounded_direction = np.rint(x_direction_lattice)
-        if np.allclose(
-            x_direction_lattice, rounded_direction, atol=self.__epsilon, rtol=0.0
-        ) and np.any(rounded_direction):
-            x_direction_lattice = self.__reduce_integer_row(
-                rounded_direction.astype(int)
-            ).astype(np.float64)
-
-        # Build the final strained selection basis, then map it back through the
-        # lab-frame strain before converting to lattice coordinates. This keeps the
-        # coefficient search conservative for the unstrained lattice that is enumerated
-        # before atom positions are strained.
-        selection_box_basis = self.__selection_basis_vectors(strained_periods).copy()
-        axis_dims = (self.__y_dim, self.__z_dim)
-        inplane_periodic = self.__inplane_periodic
-        for row_index, (is_periodic, axis_dim) in enumerate(
-            zip(inplane_periodic, axis_dims)
-        ):
-            if not is_periodic:
-                selection_box_basis[row_index] *= axis_dim
-
-        prestrain_selection_box_basis = selection_box_basis / strain_scales
-        selection_box_basis_lattice = np.linalg.solve(
-            rotated_unit_cell_basis.T, prestrain_selection_box_basis.T
-        ).T
-
-        local_x_bounds = np.array([0.0, x_bounds[1] - x_bounds[0]], dtype=np.float64)
-        nx_range = self.__x_index_range(
-            primitive_periods, rotated_unit_cell_basis, local_x_bounds
-        )
-
-        lattice_bound_corners = []
-        for nx in (nx_range[0], nx_range[-1]):
-            x_base = nx * x_direction_lattice
-            for uy in (0.0, 1.0):
-                for uz in (0.0, 1.0):
-                    cell_origin = (
-                        x_base
-                        + uy * selection_box_basis_lattice[0]
-                        + uz * selection_box_basis_lattice[1]
-                    )
-                    for cell_corner in np.ndindex((2, 2, 2)):
-                        lattice_bound_corners.append(
-                            cell_origin + np.array(cell_corner, dtype=np.float64)
-                        )
-
-        lattice_bound_corners = np.asarray(lattice_bound_corners, dtype=np.float64)
-        lattice_min = np.floor(np.min(lattice_bound_corners, axis=0)).astype(int) - 1
-        lattice_max = np.ceil(np.max(lattice_bound_corners, axis=0)).astype(int) + 1
-
-        coefficient_ranges = [
-            np.arange(lower, upper + 1, dtype=int)
-            for lower, upper in zip(lattice_min, lattice_max)
-        ]
-        lattice_coefficients = np.array(
-            np.meshgrid(*coefficient_ranges, indexing="ij")
-        ).reshape(3, -1).T
-
-        basis_size = len(self.__unit_cell.asarray())
-        atoms = self.get_supercell(lattice_coefficients @ self.__unit_cell.conventional)
-        origin_ids = np.repeat(
-            np.arange(len(lattice_coefficients), dtype=np.int64), basis_size
-        )
-
-        positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
-        rotated_positions = positions @ R_grain.T
-        rotated_positions *= strain_scales
-        rotated_positions[:, 0] += x_bounds[0]
-        atoms["x"], atoms["y"], atoms["z"] = rotated_positions.T
-
-        if any(inplane_periodic):
-            atoms, origin_ids = self.__select_complete_origins_in_box_basis(
-                atoms, origin_ids, strained_periods, x_bounds, basis_size
+        def _call() -> GrainBuildResult:
+            request = self.__grain_build_request(
+                R_grain,
+                periodic_miller_rows,
+                x_length,
+                x_offset,
+                grain_side,
+                exact=False,
             )
+            return build_approximate_grain(request)
 
-        atoms, origin_ids = self.__clip_complete_origins_to_cartesian_box(
-            atoms, origin_ids, x_bounds, basis_size
-        )
-        atoms, origin_ids = self.__deduplicate_complete_origins(
-            atoms, origin_ids, basis_size
-        )
-
-        if len(atoms) == 0:
-            raise GBMakerValueError(
-                f"Float grain generation removed all complete origins for the "
-                f"{grain_side or 'unstrained'} grain."
-            )
-
-        return _FloatGrainBuildResult(
-            atoms=atoms,
-            origin_ids=origin_ids,
-            basis_size=basis_size,
-        )
+        return self.__translate_construction_error(_call)
 
     def __set_gb_region(self):
         """
@@ -1627,18 +1294,6 @@ class GBMaker:
         left_gb = self.__left_grain[self.__left_grain['x'] > left_cut]
         right_gb = self.__right_grain[self.__right_grain['x'] < right_cut]
         self.__gb_region = np.hstack((left_gb, right_gb))
-
-    def __reduced_coordinate_tolerance(self, basis_vector: np.ndarray) -> float:
-        """
-        Convert the Cartesian epsilon to reduced-coordinate units for a basis vector.
-
-        Thin wrapper delegating to
-        ``GBOpt.gbmaker.geometry._reduced_coordinate_tolerance``.
-
-        :param basis_vector: Cartesian basis vector used to define the coordinate scale.
-        :return: Reduced-coordinate tolerance corresponding to ``self.__epsilon``.
-        """
-        return _reduced_coordinate_tolerance(basis_vector, self.__epsilon)
 
     def __scaled_periodic_basis_vector(
         self, period_vector: np.ndarray, box_length: float, axis_index: int
@@ -1675,93 +1330,6 @@ class GBMaker:
             self.__epsilon,
         )
 
-    def __selection_basis_vectors(self, primitive_periods: np.ndarray) -> np.ndarray:
-        """
-        Build the canonical in-plane selection basis for y/z box coordinates.
-
-        Thin wrapper delegating to ``GBOpt.gbmaker.geometry._selection_basis_vectors``.
-
-        Periodic axes use the box-periodic basis vectors; non-periodic axes fall back
-        to the corresponding Cartesian unit vectors.
-
-        :param primitive_periods: 2x3 array containing primitive y/z period vectors.
-        :return: 2x3 array containing the y/z selection basis vectors.
-        """
-        return self.__translate_construction_error(
-            _selection_basis_vectors,
-            primitive_periods,
-            self.__inplane_periodic,
-            (self.__y_dim, self.__z_dim),
-            self.__epsilon,
-        )
-
-    def __x_index_range(
-        self,
-        primitive_periods: np.ndarray,
-        rotated_unit_cell_basis: np.ndarray,
-        x_bounds: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Build a conservative contiguous lattice-index range along the x-period vector.
-
-        Thin wrapper delegating to ``GBOpt.gbmaker.geometry._x_index_range``.
-
-        The x-period direction is derived in lattice space as the cross product of the
-        two in-plane primitive periods expressed in the rotated unit-cell basis. The
-        returned integer range is padded conservatively so translated unit cells cover
-        the requested x slab after in-plane box tilts and unit-cell extent are applied.
-
-        :param primitive_periods: 2x3 array containing primitive y/z period vectors.
-        :param rotated_unit_cell_basis: 3x3 array containing the rotated unit-cell
-            basis vectors as rows.
-        :param x_bounds: Length-2 array-like containing ``[x_min, x_max]``.
-        :return: Contiguous integer array of lattice indices along the x-period
-            direction.
-        """
-        return self.__translate_construction_error(
-            _x_index_range,
-            primitive_periods,
-            rotated_unit_cell_basis,
-            x_bounds,
-            self.__inplane_periodic,
-            (self.__y_dim, self.__z_dim),
-            self.__epsilon,
-        )
-
-    def __reduced_box_coordinates(
-        self, cartesian_coordinates: np.ndarray, box_basis: np.ndarray
-    ) -> np.ndarray:
-        """
-        Convert Cartesian coordinates to mixed box coordinates ``[x_cart, u_y, u_z]``.
-
-        Thin wrapper delegating to ``GBOpt.gbmaker.geometry._reduced_box_coordinates``.
-
-        The mixed basis is ``[e_x, A_y, A_z]`` where ``e_x`` is the Cartesian x-axis
-        and ``A_y``/``A_z`` are the in-plane box basis vectors.
-
-        :param cartesian_coordinates: Cartesian coordinates with shape ``(..., 3)``.
-        :param box_basis: 2x3 array containing ``A_y`` and ``A_z``.
-        :return: Mixed box coordinates with shape ``(..., 3)``.
-        """
-        return self.__translate_construction_error(
-            _reduced_box_coordinates, cartesian_coordinates, box_basis, self.__epsilon
-        )
-
-    def __cartesian_from_box_coordinates(
-        self, box_coordinates: np.ndarray, box_basis: np.ndarray
-    ) -> np.ndarray:
-        """
-        Convert mixed box coordinates ``[x_cart, u_y, u_z]`` to Cartesian coordinates.
-
-        Thin wrapper delegating to
-        ``GBOpt.gbmaker.geometry._cartesian_from_box_coordinates``.
-
-        :param box_coordinates: Mixed box coordinates with shape ``(..., 3)``.
-        :param box_basis: 2x3 array containing ``A_y`` and ``A_z``.
-        :return: Cartesian coordinates with shape ``(..., 3)``.
-        """
-        return _cartesian_from_box_coordinates(box_coordinates, box_basis)
-
     def __complete_origin_atom_mask(
         self,
         atom_mask: np.ndarray,
@@ -1792,115 +1360,15 @@ class GBMaker:
             _complete_origin_atom_mask, atom_mask, origin_ids, basis_size
         )
 
-    def __filter_complete_origins(
-        self,
-        atoms: np.ndarray,
-        origin_ids: np.ndarray,
-        atom_mask: np.ndarray,
-        basis_size: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Filter atoms and origin IDs while preserving complete origin groups.
-
-        Thin wrapper delegating to ``GBOpt.gbmaker.geometry._filter_complete_origins``.
-
-        :param atoms: Structured atom array to filter.
-        :param origin_ids: Integer origin-ID array parallel to ``atoms``.
-        :param atom_mask: Boolean atom-level mask parallel to ``atoms``.
-        :param basis_size: Number of atoms expected in one complete origin group.
-        :return: ``(filtered_atoms, filtered_origin_ids)``.
-        :raises GBMakerValueError: If ``atoms`` and ``origin_ids`` are not parallel, or
-            if complete-origin masking rejects the mask, origin IDs, or basis size.
-        """
-        return self.__translate_construction_error(
-            _filter_complete_origins, atoms, origin_ids, atom_mask, basis_size
-        )
-
-    def __clip_complete_origins_to_cartesian_box(
-        self,
-        atoms: np.ndarray,
-        origin_ids: np.ndarray,
-        x_bounds: np.ndarray,
-        basis_size: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Clip atoms to the Cartesian grain box by complete origin groups.
-
-        Thin wrapper delegating to
-        ``GBOpt.gbmaker.geometry._clip_complete_origins_to_cartesian_box``.
-
-        Atoms are tested against the half-open x interval ``[x_bounds[0], x_bounds[1])``
-        using the instance tolerance. Non-periodic in-plane axes are also clipped to
-        their Cartesian box dimensions. Periodic in-plane axes are not clipped here
-        because they have already been selected and wrapped by the mixed-basis selection
-        path.
-
-        Complete-origin filtering is applied after the atom-level box mask is
-        constructed, so an origin is retained only when all atoms in that origin remain
-        inside the requested box.
-
-        :param atoms: Structured atom array to clip.
-        :param origin_ids: Integer origin-ID array parallel to ``atoms``.
-        :param x_bounds: Length-2 array containing lower and upper x bounds (Angstroms).
-        :param basis_size: Number of atoms expected in one complete origin group.
-        :return: ``(clipped_atoms, clipped_origin_ids)``.
-        :raises GBMakerValueError: If ``x_bounds`` is not a finite increasing two-value
-            interval, or if complete-origin filtering rejects the inputs.
-        """
-        return self.__translate_construction_error(
-            _clip_complete_origins_to_cartesian_box,
-            atoms,
-            origin_ids,
-            x_bounds,
-            basis_size,
-            self.__inplane_periodic,
-            (self.__y_dim, self.__z_dim),
-            self.__epsilon,
-        )
-
-    def __deduplicate_complete_origins(
-        self,
-        atoms: np.ndarray,
-        origin_ids: np.ndarray,
-        basis_size: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Remove duplicate complete-origin groups by full atom signatures.
-
-        Thin wrapper delegating to
-        ``GBOpt.gbmaker.geometry._deduplicate_complete_origins``.
-
-        Each origin group is expected to contain exactly ``basis_size`` contiguous
-        atoms with a single origin ID. Duplicate groups are identified by the full
-        ordered basis signature: atom names plus quantized Cartesian positions. The
-        first occurrence of each unique complete-origin group is retained.
-
-        :param atoms: Structured atom array containing complete contiguous origin
-            groups.
-        :param origin_ids: Integer origin-ID array parallel to ``atoms``.
-        :param basis_size: Number of atoms expected in one complete origin group.
-        :return: ``(deduplicated_atoms, deduplicated_origin_ids)``.
-        :raises GBMakerValueError: If the inputs are not parallel, if
-            ``origin_ids`` is not integer-valued, if ``basis_size`` is not a
-            positive integer, or if the atom array cannot be reshaped into complete
-            contiguous origin groups.
-        """
-        return self.__translate_construction_error(
-            _deduplicate_complete_origins,
-            atoms,
-            origin_ids,
-            basis_size,
-            self.__epsilon,
-        )
-
     def __filter_float_result_complete_origins(
         self,
-        result: _FloatGrainBuildResult,
+        result: GrainBuildResult,
         atom_mask: np.ndarray,
-    ) -> _FloatGrainBuildResult:
+    ) -> GrainBuildResult:
         """Filter a float-path build result by complete origin groups.
 
-        Applies ``atom_mask`` to ``result.atoms`` through complete-origin filtering,
-        preserving only conventional-cell origins for which every atom in the origin
-        group passes the mask. The returned result carries the filtered atom array,
-        filtered parallel origin IDs, and the original basis size.
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.approximate_grain.filter_grain_result_complete_origins``.
 
         :param result: Float-path grain build result to filter.
         :param atom_mask: Boolean atom-level mask parallel to ``result.atoms``.
@@ -1908,28 +1376,19 @@ class GBMaker:
         :raises GBMakerValueError: If complete-origin filtering rejects the mask, origin
             IDs, or basis size.
         """
-        atoms, origin_ids = self.__filter_complete_origins(
-            result.atoms,
-            result.origin_ids,
-            atom_mask,
-            result.basis_size,
-        )
-        return _FloatGrainBuildResult(
-            atoms=atoms,
-            origin_ids=origin_ids,
-            basis_size=result.basis_size,
+        return self.__translate_construction_error(
+            filter_grain_result_complete_origins, result, atom_mask
         )
 
     def __trim_float_result_to_upper_x(
         self,
-        result: _FloatGrainBuildResult,
+        result: GrainBuildResult,
         upper_x: float,
-    ) -> _FloatGrainBuildResult:
+    ) -> GrainBuildResult:
         """Trim a float-path grain to an upper x bound by complete origins.
 
-        Retains only complete conventional-cell origins whose atoms all lie below
-        ``upper_x`` using the same half-open upper-bound convention as the rest of the
-        grain-generation pipeline.
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.approximate_grain.trim_grain_result_to_upper_x``.
 
         :param result: Float-path grain build result to trim.
         :param upper_x: Upper x bound in Angstroms.
@@ -1937,66 +1396,8 @@ class GBMaker:
         :raises GBMakerValueError: If ``upper_x`` is not finite or if complete-origin
             filtering rejects the result metadata.
         """
-        try:
-            upper_x = float(upper_x)
-        except (TypeError, ValueError) as exc:
-            raise GBMakerValueError(
-                f"upper_x must be a finite number; got {upper_x!r}."
-            ) from exc
-
-        if not math.isfinite(upper_x):
-            raise GBMakerValueError(
-                f"upper_x must be a finite number; got {upper_x!r}."
-            )
-
-        atom_mask = result.atoms["x"] < upper_x - self.__epsilon
-        return self.__filter_float_result_complete_origins(result, atom_mask)
-
-    def __select_complete_origins_in_box_basis(
-        self,
-        atoms: np.ndarray,
-        origin_ids: np.ndarray,
-        primitive_periods: np.ndarray,
-        x_bounds: np.ndarray,
-        basis_size: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Select and wrap in-plane coordinates while preserving complete origins.
-
-        Thin wrapper delegating to
-        ``GBOpt.gbmaker.geometry._select_complete_origins_in_box_basis``.
-
-        Builds the y/z selection basis from ``primitive_periods`` and filters atoms into
-        the in-plane simulation box. Periodic in-plane axes are selected in reduced
-        coordinates and wrapped onto the periodic box. Non-periodic in-plane axes are
-        selected against their Cartesian box extents.
-
-        When the selection basis has no x component, the method uses an axis-aligned
-        fast path. Otherwise, atoms are converted into mixed box coordinates ``[x_cart,
-        u_y, u_z]``, selected/wrapped there, converted back to Cartesian coordinates,
-        and then re-filtered by complete origins against the x slab.
-
-        :param atoms: Structured atom array to select and wrap.
-        :param origin_ids: Integer origin-ID array parallel to ``atoms``.
-        :param primitive_periods: Two-row array containing the in-plane y and z
-            primitive period vectors in strained lab-frame Cartesian coordinates.
-        :param x_bounds: Length-2 array containing lower and upper x bounds (Angstroms).
-        :param basis_size: Number of atoms expected in one complete origin group.
-        :return: ``(selected_atoms, selected_origin_ids)`` after complete-origin
-            selection and periodic wrapping.
-        :raises GBMakerValueError: If ``x_bounds`` is not a finite increasing interval,
-            if the selection basis is singular, or if complete-origin filtering rejects
-            the inputs.
-        """
         return self.__translate_construction_error(
-            _select_complete_origins_in_box_basis,
-            atoms,
-            origin_ids,
-            primitive_periods,
-            x_bounds,
-            basis_size,
-            self.__inplane_periodic,
-            (self.__y_dim, self.__z_dim),
-            self.__epsilon,
+            trim_grain_result_to_upper_x, result, upper_x, self.__epsilon
         )
 
     def __grain_strain_scales(self, grain_side: str) -> tuple[float, float]:

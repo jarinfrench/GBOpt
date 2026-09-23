@@ -310,38 +310,48 @@ def test_dimension_plan_rejects_wrong_accommodation_value_type() -> None:
 # --------------------------------------------------------------------------------------
 
 
-def test_grain_build_request_normalizes_exact_orientation() -> None:
+def _grain_build_request_kwargs(**overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "material": _material(),
+        "rotation": np.eye(3),
+        "periodic_matrix": np.eye(3, dtype=int),
+        "grain_side": "left",
+        "x_offset": 0.0,
+        "x_length": 25.0,
+        "inplane_periodic": (True, True),
+        "inplane_box_lengths": (30.0, 30.0),
+        "epsilon": 1e-10,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_grain_build_request_normalizes_periodic_matrix() -> None:
     request = GrainBuildRequest(
-        material=_material(),
-        orientation=np.eye(3, dtype=int),
-        grain_side="left",
-        x_length=25.0,
-        box_dims=_box_dims(),
-        exact=True,
+        **_grain_build_request_kwargs(exact=True)
     )
-    assert request.orientation.dtype.kind == "i"
-    assert not request.orientation.flags.writeable
+    assert request.periodic_matrix.dtype == object
+    assert not request.periodic_matrix.flags.writeable
+    assert request.rotation.dtype.kind == "f"
+    assert not request.rotation.flags.writeable
 
 
-def test_grain_build_request_rejects_bad_orientation_shape() -> None:
+def test_grain_build_request_rejects_bad_rotation_shape() -> None:
+    with pytest.raises(GBMakerConstructionValueError):
+        GrainBuildRequest(**_grain_build_request_kwargs(rotation=np.eye(2)))
+
+
+def test_grain_build_request_rejects_bad_periodic_matrix_shape() -> None:
     with pytest.raises(GBMakerConstructionValueError):
         GrainBuildRequest(
-            material=_material(),
-            orientation=np.eye(2),
-            grain_side="left",
-            x_length=25.0,
-            box_dims=_box_dims(),
+            **_grain_build_request_kwargs(periodic_matrix=np.eye(2, dtype=int))
         )
 
 
 def test_grain_build_request_rejects_bad_grain_side() -> None:
     with pytest.raises(GBMakerConstructionValueError):
         GrainBuildRequest(
-            material=_material(),
-            orientation=np.eye(3),
-            grain_side="middle",  # type: ignore[arg-type]
-            x_length=25.0,
-            box_dims=_box_dims(),
+            **_grain_build_request_kwargs(grain_side="middle")  # type: ignore[arg-type]
         )
 
 
