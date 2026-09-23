@@ -167,6 +167,17 @@ def _require_atom_types(value: object) -> str | tuple[str, ...]:
 def _require_repeat_factor(value: object) -> tuple[int, int]:
     """Normalize an in-plane repeat factor to a ``(y, z)`` positive integer pair.
 
+    Rejected at exactly ``0`` (and below) even though the legacy
+    ``_validate_scalar``/``normalize_legacy_config`` path this replaces only warns
+    -- "Recommended repeat factor is at least 2." -- for any value below ``2``,
+    including ``0`` or a negative count, and otherwise lets construction proceed. Like
+    ``MaterialState.a0``, a zero or negative repeat factor was never a *usable* legacy
+    value: it zeroes out (or negates) the corresponding in-plane box dimension, which
+    ``DimensionPlan``'s own box-bounds validation (upper bound must exceed lower bound)
+    guarantees fails downstream regardless, just with a different, later error.
+    Rejecting it here is a genuine improvement, not a behavior change a caller could
+    depend on.
+
     :param value: Candidate repeat-factor value: a single positive integer applied to
         both axes, or a two-value sequence applied to y and z respectively.
     :return: ``(y, z)`` positive integer repeat pair.

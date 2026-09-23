@@ -33,6 +33,14 @@ from GBOpt.gbmaker.config import (
     validate_mismatch_tol,
     validate_strain_grain,
 )
+from GBOpt.gbmaker.dimension import (
+    _find_commensurate_pair as _plan_find_commensurate_pair,
+)
+from GBOpt.gbmaker.dimension import (
+    _plan_box_dims,
+    plan_dimensions,
+    plan_periodic_spacing,
+)
 from GBOpt.gbmaker.orientation import (
     _decompose_misorientation,
     _reduce_integer_row,
@@ -40,6 +48,7 @@ from GBOpt.gbmaker.orientation import (
     resolve_orientation,
 )
 from GBOpt.gbmaker.types import (
+    AxisAccommodation,
     GBMakerConstructionTypeError,
     GBMakerConstructionValueError,
 )
@@ -91,14 +100,10 @@ def _find_commensurate_pair(
 ) -> tuple[int, int, float, float] | None:
     """Find a small commensurate repeat pair for two one-dimensional periods.
 
-    Searches for integer repeat counts ``n1`` and ``n2`` such that the repeated lengths
-    ``n1*d1`` and ``n2*d2`` match within the requested relative mismatch tolerance.
-    Candidate pairs are ordered by shared length first, then mismatch, total repeat
-    count, ``n1``, and ``n2``.
-
-    The mismatch is computed as::
-
-        abs(n1*d1 - n2*d2) / max(n1*d1, n2*d2)
+    Thin wrapper delegating to
+    ``GBOpt.gbmaker.dimension._find_commensurate_pair``, kept as a module-level
+    compatibility alias since existing code imports
+    ``GBOpt.GBMaker._find_commensurate_pair`` directly.
 
     :param d1: Period of the first grain along the selected in-plane axis (Angstroms).
     :param d2: Period of the second grain along the selected in-plane axis (Angstroms).
@@ -112,197 +117,10 @@ def _find_commensurate_pair(
         ``tol`` is not finite and non-negative, or if ``max_n`` is not a positive
         integer.
     """
-    if isinstance(d1, (bool, np.bool_)):
-        raise GBMakerValueError(f"d1 must be a finite positive period; got {d1!r}.")
-    if isinstance(d2, (bool, np.bool_)):
-        raise GBMakerValueError(f"d2 must be a finite positive period; got {d2!r}.")
-    if isinstance(tol, (bool, np.bool_)):
-        raise GBMakerValueError(
-            f"tol must be finite and non-negative; got {tol!r}."
-        )
-    if isinstance(max_n, (bool, np.bool_)) or not isinstance(max_n, (int, np.integer)):
-        raise GBMakerValueError(
-            f"max_n must be a positive integer; got {max_n!r}."
-        )
-
     try:
-        d1 = float(d1)
-        d2 = float(d2)
-        tol = float(tol)
-    except (TypeError, ValueError) as exc:
-        raise GBMakerValueError(
-            "d1 and d2 must be finite positive periods, and tol must be finite and "
-            "non-negative."
-        ) from exc
-
-    max_n = int(max_n)
-
-    if not math.isfinite(d1) or d1 <= 0.0:
-        raise GBMakerValueError(f"d1 must be a finite positive period; got {d1!r}.")
-    if not math.isfinite(d2) or d2 <= 0.0:
-        raise GBMakerValueError(f"d2 must be a finite positive period; got {d2!r}.")
-    if not math.isfinite(tol) or tol < 0.0:
-        raise GBMakerValueError(f"tol must be finite and non-negative; got {tol!r}.")
-    if max_n < 1:
-        raise GBMakerValueError(f"max_n must be a positive integer; got {max_n!r}.")
-
-    best: tuple[int, int, float, float] | None = None
-    best_key: tuple[float, float, int, int, int] | None = None
-    seen: set[tuple[int, int]] = set()
-
-    def consider(n1: int, n2: int) -> None:
-        """Evaluate one integer repeat-count pair against the current best pair.
-
-        Operates on the enclosing helper's non-local search state. Out-of-bounds and
-        previously checked pairs are ignored. Admissible pairs update ``best`` and
-        ``best_key`` when they improve the current candidate under the enclosing
-        helper's ordering: shared length, mismatch, total repeat count, ``n1``, then
-        ``n2``.
-
-        :param n1: Integer repeat count for the first grain.
-        :param n2: Integer repeat count for the second grain.
-        :return: ``None``. The enclosing ``best``, ``best_key``, and ``seen`` state
-            may be updated.
-        """
-        nonlocal best, best_key
-
-        if n1 < 1 or n2 < 1 or n1 > max_n or n2 > max_n:
-            return
-
-        pair = (n1, n2)
-        if pair in seen:
-            return
-        seen.add(pair)
-
-        l1 = n1 * d1
-        l2 = n2 * d2
-        size = max(l1, l2)
-        mismatch = abs(l1 - l2) / size
-
-        if mismatch <= tol:
-            key = (size, mismatch, n1 + n2, n1, n2)
-            if best_key is None or key < best_key:
-                best = (n1, n2, l1, l2)
-                best_key = key
-
-    # n1*d1 ~= n2*d2 is equivalent to n1/n2 ~= d2/d1. Continued-fraction convergents and
-    # intermediate convergents give the relevant small rational candidates without
-    # scanning all O(max_n**2) repeat pairs.
-    ratio = d2 / d1
-    x = ratio
-
-    p_prev2, q_prev2 = 0, 1
-    p_prev1, q_prev1 = 1, 0
-
-    for _ in range(256):
-        a = int(math.floor(x))
-
-        if p_prev1 == 0:
-            k_limit_p = max_n if p_prev2 <= max_n else 0
-        else:
-            k_limit_p = (max_n - p_prev2) // p_prev1
-
-        if q_prev1 == 0:
-            k_limit_q = max_n if q_prev2 <= max_n else 0
-        else:
-            k_limit_q = (max_n - q_prev2) // q_prev1
-
-        k_limit = min(a, k_limit_p, k_limit_q)
-        for k in range(1, k_limit + 1):
-            consider(k * p_prev1 + p_prev2, k * q_prev1 + q_prev2)
-
-        p_next = a * p_prev1 + p_prev2
-        q_next = a * q_prev1 + q_prev2
-
-        frac = x - a
-        if frac <= 1e-15 * max(1.0, abs(x)):
-            break
-
-        p_prev2, q_prev2 = p_prev1, q_prev1
-        p_prev1, q_prev1 = p_next, q_next
-
-        if p_prev1 > max_n or q_prev1 > max_n:
-            break
-
-        x = 1.0 / frac
-    else:
-        raise GBMakerValueError(
-            "Commensurate-period search exceeded the continued-fraction iteration limit"
-            f" before completing; got max_n={max_n!r}."
-        )
-
-    return best
-
-
-@dataclass(frozen=True)
-class _AxisStrainAccommodation:
-    """Integer repeat pair and lab-axis scale factors for one in-plane axis.
-
-    Produced by ``_find_commensurate_pair`` for a single in-plane axis, y or z, when
-    mismatch accommodation is requested.
-
-    :param left_repeats: Number of left-grain unit-cell repeats along this axis.
-    :param right_repeats: Number of right-grain unit-cell repeats along this axis.
-    :param left_unstrained_length: Unstrained left-grain slab length along this axis,
-        equal to ``left_repeats`` times the left-grain period (Angstroms).
-    :param right_unstrained_length: Unstrained right-grain slab length along this axis,
-        equal to ``right_repeats`` times the right-grain period (Angstroms).
-    :param box_length: Shared simulation box length along this axis (Angstroms). Chosen
-        from the unstrained lengths according to the ``strain_grain`` policy.
-    :param left_scale: Factor by which left-grain atom coordinates are scaled along this
-        axis to fit the shared box, equal to ``box_length / left_unstrained_length``.
-    :param right_scale: Factor by which right-grain atom coordinates are scaled along
-        this axis to fit the shared box, equal to ``box_length /
-        right_unstrained_length``.
-    :param mismatch: Relative mismatch before scaling, computed as ``abs(l1 - l2) /
-        max(l1, l2)``.
-    """
-
-    left_repeats: int
-    right_repeats: int
-    left_unstrained_length: float
-    right_unstrained_length: float
-    box_length: float
-    left_scale: float
-    right_scale: float
-    mismatch: float
-
-    def resized(self, factor: int) -> _AxisStrainAccommodation:
-        """Return this accommodation with repeat counts and lengths multiplied.
-
-        The repeat counts, unstrained lengths, and shared box length are multiplied by
-        ``factor``. Coordinate scale factors and mismatch are unchanged because the
-        relative strain state is unchanged.
-
-        :param factor: Positive integer multiplier for the repeat counts and axis
-            lengths.
-        :return: Resized strain accommodation for the same axis.
-        :raises GBMakerValueError: If ``factor`` is boolean, non-integral, or less than
-            one.
-        """
-        if isinstance(factor, (bool, np.bool_)) or not isinstance(
-            factor, (int, np.integer)
-        ):
-            raise GBMakerValueError(
-                f"Strain resize factor must be a positive integer; got {factor!r}."
-            )
-
-        factor = int(factor)
-        if factor < 1:
-            raise GBMakerValueError(
-                f"Strain resize factor must be a positive integer; got {factor!r}."
-            )
-
-        return _AxisStrainAccommodation(
-            left_repeats=self.left_repeats * factor,
-            right_repeats=self.right_repeats * factor,
-            left_unstrained_length=self.left_unstrained_length * factor,
-            right_unstrained_length=self.right_unstrained_length * factor,
-            box_length=self.box_length * factor,
-            left_scale=self.left_scale,
-            right_scale=self.right_scale,
-            mismatch=self.mismatch,
-        )
+        return _plan_find_commensurate_pair(d1, d2, tol=tol, max_n=max_n)
+    except GBMakerConstructionValueError as exc:
+        raise GBMakerValueError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -501,7 +319,7 @@ class GBMaker:
         self.__strain_grain = config.strain_grain
         # Maps axis name ("y" or "z") to commensurate repeat metadata when
         # mismatch accommodation is active; empty when mismatch_tol is None.
-        self.__strain_accommodation: dict[str, _AxisStrainAccommodation] = {}
+        self.__strain_accommodation: dict[str, AxisAccommodation] = {}
 
         self.__unit_cell = config.material.unit_cell
         self.__spacing = self.__calculate_periodic_spacing()  # periodic distances dict
@@ -851,14 +669,14 @@ class GBMaker:
     def __calculate_box_dimensions(self) -> np.ndarray:
         """Private method to calculate the box dimensions
 
+        Thin wrapper delegating to ``GBOpt.gbmaker.dimension._plan_box_dims``.
+
         :return: The 3x2 array containing xlo, xhi, ylo, yhi, zlo, and zi.
         """
         return np.array(
-            [
-                [0, self.__x_dim + 2 * self.__vacuum_thickness],
-                [0, self.__y_dim],
-                [0, self.__z_dim],
-            ]
+            _plan_box_dims(
+                self.__x_dim, self.__vacuum_thickness, self.__y_dim, self.__z_dim
+            )
         )
 
     def __exact_grain_repeats(
@@ -1561,56 +1379,28 @@ class GBMaker:
         self.__right_periodic_miller_rows = orientation.right_periodic_miller_rows
         self.__inplane_periodic = orientation.inplane_periodic
 
-        # The periodic distance in each direction is the lattice parameter multiplied by
-        # norm of the Miller indices in that direction. This is determined using the
-        # usual formula for the interplanar spacing: d = a / sqrt(h**2+k**2+l**2). The
-        # square of the denominator here is the number of planes needed before
-        # periodicity. Thus, if we multiply that distance by the interplanar spacing we
-        # will get the interplanar spacing. This simplifies to
-        # (a0**2/d**2)*d = a0**2/d --> spacing = a0 * sqrt(h**2+k**2+l**2)
-        spacing_left = {
-            axis: self.__a0 * _miller_row_norm(vec)
-            for axis, vec in zip(["x", "y", "z"], self.__left_periodic_miller_rows)
-        }
-        spacing_right = {
-            axis: self.__a0 * _miller_row_norm(vec)
-            for axis, vec in zip(["x", "y", "z"], self.__right_periodic_miller_rows)
-        }
-
-        spacing = {
-            "x": {"left": spacing_left["x"], "right": spacing_right["x"]}}
-        self.__left_x = math.ceil(
-            self.__x_dim_min / spacing["x"]["left"]) * spacing["x"]["left"]
-        self.__right_x = math.ceil(
-            self.__x_dim_min / spacing["x"]["right"]) * spacing["x"]["right"]
-        target = max(self.__left_x, self.__right_x)
-        self.__left_x = math.ceil(
-            target / spacing["x"]["left"] - self.__epsilon) * spacing["x"]["left"]
-        self.__right_x = math.ceil(
-            target / spacing["x"]["right"] - self.__epsilon) * spacing["x"]["right"]
-        self.__x_dim = self.__left_x + self.__right_x
-        spacing.update(
-            {
-                axis: max(spacing_left[axis], spacing_right[axis])
-                for axis in ["y", "z"]
-            }
-        )
-
+        # Periodic-spacing and boundary-normal x-extent arithmetic is a pure
+        # construction stage; see ``GBOpt.gbmaker.dimension.plan_periodic_spacing``.
         # In-plane periodicity was already resolved by ``resolve_orientation`` above
         # (including, on the legacy/five-DOF path, its own threshold warning); this
         # only reapplies the resulting flags to the returned spacing values used for
         # box-dimension planning.
-        if self.__embedding is not None and self.__embedding.source != "five_dof":
-            # Trust non-legacy spec adapters directly. FiveDOFSpec keeps the
-            # legacy threshold heuristic below until exactification replaces
-            # its approximate-only embedding path.
-            if not all(self.__inplane_periodic):
-                for axis in ("y", "z"):
-                    spacing[axis] = min(spacing[axis], threshold)
-        else:
-            for axis, is_periodic in zip(("y", "z"), self.__inplane_periodic):
-                if not is_periodic:
-                    spacing[axis] = threshold
+        spacing, self.__left_x, self.__right_x, self.__x_dim = (
+            self.__translate_construction_error(
+                plan_periodic_spacing,
+                a0=self.__a0,
+                left_periodic_miller_rows=self.__left_periodic_miller_rows,
+                right_periodic_miller_rows=self.__right_periodic_miller_rows,
+                x_dim_min=self.__x_dim_min,
+                epsilon=self.__epsilon,
+                inplane_periodic=self.__inplane_periodic,
+                threshold=threshold,
+                legacy_periodicity_heuristic=(
+                    self.__embedding is None
+                    or self.__embedding.source == "five_dof"
+                ),
+            )
+        )
 
         return spacing
 
@@ -2651,274 +2441,44 @@ class GBMaker:
 
         return y_scale, z_scale
 
-    def __build_strain_accommodation(
-        self,
-        axis_name: str,
-        *,
-        require_pair: bool,
-    ) -> _AxisStrainAccommodation | None:
-        """Build commensurate repeat and strain metadata for one in-plane axis.
-
-        Computes the left- and right-grain unstrained periods for the selected in-plane
-        axis, searches for a small commensurate integer repeat pair, and returns the
-        repeat counts, unstrained lengths, shared box length, scale factors, and
-        residual mismatch for that axis.
-
-        The selected axis is mapped to the corresponding periodic Miller row: ``"y"``
-        uses row 1 and ``"z"`` uses row 2. The period for each grain is computed as ``a0
-        * ||row||``.
-
-        If no admissible repeat pair is found, the behavior depends on
-        ``require_pair``. Exact construction passes ``True`` and raises
-        ``GBMakerValueError``. Approximate construction passes ``False``, emits a
-        ``UserWarning``, and returns ``None`` so the legacy repeat-factor box can be
-        used.
-
-        :param axis_name: In-plane axis name, either ``"y"`` or ``"z"``.
-        :param require_pair: Whether failure to find a commensurate pair is fatal.
-            Keyword parameter.
-        :return: Strain-accommodation metadata for the selected axis, or ``None`` when
-            no pair is found and ``require_pair`` is ``False``.
-        :raises GBMakerValueError: If ``axis_name`` is not ``"y"`` or ``"z"``, if
-            ``require_pair`` is not boolean, if mismatch accommodation is disabled, if
-            the Miller rows are invalid, if the commensurate-pair search receives
-            invalid parameters, if no pair is found when ``require_pair`` is ``True``,
-            or if the strain policy is invalid.
-        """
-        if axis_name not in {"y", "z"}:
-            raise GBMakerValueError(
-                f"axis_name must be 'y' or 'z'; got {axis_name!r}."
-            )
-
-        if not isinstance(require_pair, bool):
-            raise GBMakerValueError(
-                f"require_pair must be boolean; got {require_pair!r}."
-            )
-
-        mismatch_tol = self.__mismatch_tol
-        if mismatch_tol is None:
-            raise GBMakerValueError(
-                "Strain accommodation requires mismatch_tol to be set."
-            )
-
-        axis_row = 1 if axis_name == "y" else 2
-        d1 = self.__a0 * _miller_row_norm(self.__left_periodic_miller_rows[axis_row])
-        d2 = self.__a0 * _miller_row_norm(self.__right_periodic_miller_rows[axis_row])
-
-        result = _find_commensurate_pair(
-            d1,
-            d2,
-            tol=mismatch_tol,
-            max_n=self.__mismatch_max_cells,
-        )
-
-        if result is None:
-            residual = abs(d1 - d2) / max(d1, d2)
-            msg = (
-                f"No commensurate {axis_name} pair found within "
-                f"mismatch_max_cells={self.__mismatch_max_cells} for "
-                f"mismatch_tol={mismatch_tol}. Residual one-period mismatch is "
-                f"{residual:.4%}."
-            )
-
-            if require_pair:
-                raise GBMakerValueError(
-                    f"{msg} Exact strain accommodation cannot build this boundary "
-                    "within the requested tolerance."
-                )
-
-            warnings.warn(
-                f"{msg} Falling back to max(d_left, d_right) * repeat_factor.",
-                UserWarning,
-                stacklevel=4,
-            )
-            return None
-
-        n1, n2, l1, l2 = result
-
-        if self.__strain_grain == "both":
-            box_length = (l1 + l2) / 2.0
-        elif self.__strain_grain == "left":
-            box_length = l2
-        elif self.__strain_grain == "right":
-            box_length = l1
-        else:
-            raise GBMakerValueError(
-                f"Invalid strain_grain={self.__strain_grain!r}."
-            )
-
-        mismatch = abs(l1 - l2) / max(l1, l2)
-
-        return _AxisStrainAccommodation(
-            left_repeats=n1,
-            right_repeats=n2,
-            left_unstrained_length=l1,
-            right_unstrained_length=l2,
-            box_length=box_length,
-            left_scale=box_length / l1,
-            right_scale=box_length / l2,
-            mismatch=mismatch,
-        )
-
-    def __set_inplane_axis_dim(self, axis_name: str, dim: float) -> None:
-        """Set one in-plane box dimension and synchronize its nominal repeat factor.
-
-        The repeat factor is synchronized as the smallest positive integer whose
-        unstrained spacing-based box length is at least ``dim``. When mismatch
-        accommodation is active, this repeat factor is nominal because the actual
-        left/right repeat counts are stored in ``self.__strain_accommodation``.
-
-        :param axis_name: In-plane axis name, either ``"y"`` or ``"z"``.
-        :param dim: New box length for this axis (Angstroms).
-        :return: ``None``. Updates the selected box dimension and corresponding entry in
-            ``self.__repeat_factor``.
-        :raises GBMakerValueError: If ``axis_name`` is not ``"y"`` or ``"z"``, if
-            ``dim`` is not finite and positive, or if the stored spacing for this axis
-            is not finite and positive.
-        """
-        if axis_name == "y":
-            repeat_index = 0
-        elif axis_name == "z":
-            repeat_index = 1
-        else:
-            raise GBMakerValueError(
-                f"axis_name must be 'y' or 'z'; got {axis_name!r}."
-            )
-
-        try:
-            dim = float(dim)
-        except (TypeError, ValueError) as exc:
-            raise GBMakerValueError(
-                f"{axis_name}_dim must be finite and positive; got {dim!r}."
-            ) from exc
-
-        if not math.isfinite(dim) or dim <= 0.0:
-            raise GBMakerValueError(
-                f"{axis_name}_dim must be finite and positive; got {dim!r}."
-            )
-
-        spacing = self.__spacing[axis_name]
-        if not math.isfinite(spacing) or spacing <= 0.0:
-            raise GBMakerValueError(
-                f"{axis_name}-spacing must be finite and positive; got {spacing!r}."
-            )
-
-        if axis_name == "y":
-            self.__y_dim = dim
-        else:
-            self.__z_dim = dim
-
-        self.__repeat_factor[repeat_index] = max(
-            1,
-            int(math.ceil(dim / spacing - self.__epsilon)),
-        )
-
-    def __ensure_minimum_inplane_dim(
-        self,
-        axis_name: str,
-        cutoff: float,
-    ) -> None:
-        """Resize one in-plane axis to satisfy a minimum box-length cutoff.
-
-        If the current axis length already satisfies ``cutoff``, no change is made. When
-        mismatch accommodation is active for the axis, the commensurate repeat pair is
-        multiplied by a positive integer resize factor. Otherwise, the spacing-based
-        repeat factor is increased.
-
-        :param axis_name: In-plane axis name, either ``"y"`` or ``"z"``.
-        :param cutoff: Minimum required box length for the axis (Angstroms).
-        :return: ``None``. May update the selected box dimension, repeat factor, and
-            strain-accommodation metadata.
-        :raises GBMakerValueError: If ``axis_name`` is not ``"y"`` or ``"z"``, or if
-            ``cutoff`` is not finite and non-negative.
-        """
-        if axis_name == "y":
-            current_dim = self.__y_dim
-        elif axis_name == "z":
-            current_dim = self.__z_dim
-        else:
-            raise GBMakerValueError(
-                f"axis_name must be 'y' or 'z'; got {axis_name!r}."
-            )
-
-        try:
-            cutoff = float(cutoff)
-        except (TypeError, ValueError) as exc:
-            raise GBMakerValueError(
-                f"cutoff must be finite and non-negative; got {cutoff!r}."
-            ) from exc
-
-        if not math.isfinite(cutoff) or cutoff < 0.0:
-            raise GBMakerValueError(
-                f"cutoff must be finite and non-negative; got {cutoff!r}."
-            )
-
-        if current_dim >= cutoff:
-            return
-
-        accommodation = self.__strain_accommodation.get(axis_name)
-        if accommodation is not None:
-            resize_factor = max(
-                1,
-                int(math.ceil(cutoff / accommodation.box_length - self.__epsilon)),
-            )
-            accommodation = accommodation.resized(resize_factor)
-            self.__strain_accommodation[axis_name] = accommodation
-            self.__set_inplane_axis_dim(axis_name, accommodation.box_length)
-
-            warnings.warn(
-                f"Commensurate repeat pair in {axis_name} multiplied by "
-                f"{resize_factor} to satisfy the minimum in-plane dimension "
-                f"cutoff of {cutoff:.6g} A.",
-                UserWarning,
-                stacklevel=3,
-            )
-            return
-
-        spacing = self.__spacing[axis_name]
-        if not math.isfinite(spacing) or spacing <= 0.0:
-            raise GBMakerValueError(
-                f"{axis_name}-spacing must be finite and positive; got {spacing!r}."
-            )
-
-        repeat = max(1, int(math.ceil(cutoff / spacing - self.__epsilon)))
-        self.__set_inplane_axis_dim(axis_name, repeat * spacing)
-
-        warnings.warn(
-            f"Repeat factor in {axis_name} modified to {repeat} to satisfy the "
-            f"minimum in-plane dimension cutoff of {cutoff:.6g} A.",
-            UserWarning,
-            stacklevel=3,
-        )
-
     def __update_dims(self) -> None:
         """Updates the y_dim and z_dim parameters after a relevant parameter has been
         changed.
-        """
-        self.__strain_accommodation = {}
-        self.__y_dim = self.__repeat_factor[0] * self.__spacing["y"]
-        self.__z_dim = self.__repeat_factor[1] * self.__spacing["z"]
 
+        In-plane strain-accommodation search, minimum in-plane dimension enforcement,
+        and box-dimension assembly are a pure construction stage; see
+        ``GBOpt.gbmaker.dimension.plan_dimensions``.
+        """
         use_exact = (
             self.__embedding is not None
             and self.__embedding.exact
             and self.__embedding.P is not None
         )
-        if self.__mismatch_tol is not None:
-            for axis_name in ("y", "z"):
-                accommodation = self.__build_strain_accommodation(
-                    axis_name, require_pair=use_exact,
-                )
-                if accommodation is not None:
-                    self.__strain_accommodation[axis_name] = accommodation
-                    self.__set_inplane_axis_dim(
-                        axis_name, accommodation.box_length
-                    )
 
-        cutoff = 2 * self.__interaction_distance
-        for axis_name in ("y", "z"):
-            self.__ensure_minimum_inplane_dim(axis_name, cutoff)
-        self.__box_dims = self.__calculate_box_dimensions()
+        plan, (self.__repeat_factor[0], self.__repeat_factor[1]) = (
+            self.__translate_construction_error(
+                plan_dimensions,
+                a0=self.__a0,
+                left_periodic_miller_rows=self.__left_periodic_miller_rows,
+                right_periodic_miller_rows=self.__right_periodic_miller_rows,
+                spacing_y=self.__spacing["y"],
+                spacing_z=self.__spacing["z"],
+                repeat_factor=tuple(self.__repeat_factor),
+                mismatch_tol=self.__mismatch_tol,
+                mismatch_max_cells=self.__mismatch_max_cells,
+                strain_grain=self.__strain_grain,
+                require_exact_pair=use_exact,
+                interaction_distance=self.__interaction_distance,
+                x_dim=self.__x_dim,
+                vacuum_thickness=self.__vacuum_thickness,
+                normal_topology=self.__normal_topology,
+                epsilon=self.__epsilon,
+            )
+        )
+        self.__strain_accommodation = dict(plan.accommodation)
+        self.__y_dim = float(plan.box_dims[1][1])
+        self.__z_dim = float(plan.box_dims[2][1])
+        self.__box_dims = np.array(plan.box_dims, dtype=float)
 
         self.__generate_gb()
         self.__set_gb_region()
