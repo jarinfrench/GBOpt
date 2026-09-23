@@ -2844,20 +2844,25 @@ class TestGBMakerTriclinic(unittest.TestCase):
         self.assertAlmostEqual(xz, 0.0, places=3)
         self.assertAlmostEqual(yz, 0.0, places=3)
 
-    @pytest.mark.filterwarnings(
-        "ignore:File-backed Parent initialization without explicit grain ownership is "
-        "deprecated.*:DeprecationWarning"
-    )
     def test_triclinic_gbmanipulator_reads_back(self):
-        from GBOpt.GBManipulator import Parent
+        # As of R13, Parent's file-backed construction delegates LAMMPS data reading to
+        # GBOpt.io.lammps.LammpsDataReader, which (per R11/R12) only ever supported
+        # reading orthogonal boxes -- it rejects any "xy xz yz" tilt line outright, even
+        # though Parent itself never used tilt (it only keeps orthogonal box bounds).
+        # Legacy Parent's hand-rolled parsing tolerated a triclinic data file by
+        # storing the tilt in an unused attribute and ignoring it; that tolerance was
+        # specific to Parent's own now-removed parsing and is not preserved. Reading a
+        # triclinic-written LAMMPS data file back into a Parent is therefore no longer
+        # supported -- this is a disclosed capability loss, not a bug (see
+        # REFACTOR_CLEANUP.md's R13 entry).
+        from GBOpt.GBManipulator import Parent, ParentCorruptedFileError
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dat", mode="w") as f:
             fname = f.name
         try:
             self.gbm.write_lammps(fname, triclinic=True)
-            # Should not raise - GBManipulator must parse the xy xz yz line cleanly
-            parent = Parent(fname, unit_cell=self.gbm.unit_cell,
-                            gb_thickness=self.gbm.gb_thickness)
-            self.assertIsNotNone(parent)
+            with self.assertRaises(ParentCorruptedFileError):
+                Parent(fname, unit_cell=self.gbm.unit_cell,
+                       gb_thickness=self.gbm.gb_thickness)
         finally:
             os.unlink(fname)
 

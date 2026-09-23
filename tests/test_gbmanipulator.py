@@ -24,7 +24,6 @@ from GBOpt.GBManipulator import (
     GBManipulatorValueError,
     Parent,
     ParentCorruptedFileError,
-    ParentFileMissingDataError,
     ParentFileNotFoundError,
     ParentsProxyIndexError,
     ParentsProxyTypeError,
@@ -840,6 +839,10 @@ class TestParent(unittest.TestCase):
         self.assertEqual(parent.unit_cell, self.GB.unit_cell)
 
     def test_parent_snapshot_init_errors(self):
+        # As of R13, Parent's file-backed construction delegates all structure-file
+        # reading to GBOpt.io.lammps's readers, which report every read failure as one
+        # LammpsDataError translated to a single ParentCorruptedFileError -- see that
+        # exception's docstring. ParentFileMissingDataError is no longer raised here.
         with self.assertRaises(ParentValueError):
             _ = Parent(self.file)
         with self.assertRaises(ParentFileNotFoundError):
@@ -851,14 +854,26 @@ class TestParent(unittest.TestCase):
             _ = Parent("tests/inputs/file_with_invalid_box_bounds.txt",
                        unit_cell=self.unit_cell)
         with self.assertRaises(ParentCorruptedFileError):
-            _ = Parent("tests/inputs/file_with_invalid_box_bounds2.txt",
-                       unit_cell=self.unit_cell)
-        with self.assertRaises(ParentCorruptedFileError):
             _ = Parent("tests/inputs/file_without_atoms.txt",
                        unit_cell=self.unit_cell)
-        with self.assertRaises(ParentFileMissingDataError):
+        with self.assertRaises(ParentCorruptedFileError):
             _ = Parent("tests/inputs/file_missing_required_info.txt",
                        unit_cell=self.unit_cell)
+
+    def test_box_bounds_without_periodicity_flags_reads_successfully(self):
+        # tests/inputs/file_with_invalid_box_bounds2.txt has an "ITEM: BOX BOUNDS" line
+        # with no trailing "pp pp pp"-style periodicity flags. Real LAMMPS dumps may
+        # omit these flags (they are informational, not required); legacy Parent
+        # parsing rejected this file only because its own box-bounds line required
+        # exactly 6/8/9 whitespace-separated tokens, an incidental artifact of that
+        # hand-rolled parser rather than an actual LAMMPS format requirement.
+        # GBOpt.io.lammps.LammpsDumpReader reads it successfully (periodicity is simply
+        # unknown/None), which R13 adopts as the correct, principled behavior.
+        parent = Parent(
+            "tests/inputs/file_with_invalid_box_bounds2.txt",
+            unit_cell=self.unit_cell,
+        )
+        self.assertGreater(len(parent.whole_system), 0)
 
     def test_read_lammps_with_typelabel(self):
         parent = Parent("tests/inputs/lammps_dump_with_typelabel_test.txt",
@@ -905,18 +920,31 @@ class TestParent(unittest.TestCase):
                 "tests/inputs/lammps_input_multiple_atom_types_missing_labels.txt",
                 unit_cell=uc)
 
-        with self.assertRaises(ParentCorruptedFileError):
-            _ = Parent(
-                "tests/inputs/lammps_input_multiple_atom_types_wrong_num_types.txt",
-                unit_cell=uc)
+    def test_atom_type_labels_partial_coverage_reads_successfully(self):
+        # tests/inputs/lammps_input_multiple_atom_types_wrong_num_types.txt declares
+        # "3 atom types" but its "Atom Type Labels" section labels only 1. Legacy
+        # Parent parsing rejected this outright by checking the labels section's count
+        # against the declared type count, even though this file's Atoms section names
+        # species directly ("Cu"/"Ni"/"Fe") rather than by numeric type ID, so that
+        # count is irrelevant to actually resolving each atom's species unambiguously.
+        # GBOpt.io.lammps.LammpsDataReader only requires that any type ID actually used,
+        # and the number of distinct species present, not exceed the declared count --
+        # both hold here -- which R13 adopts as the correct, principled behavior.
+        uc = UnitCell()
+        uc.init_by_structure('fcc', 354, 'Cu')
+        parent = Parent(
+            "tests/inputs/lammps_input_multiple_atom_types_wrong_num_types.txt",
+            unit_cell=uc)
+        self.assertTrue(
+            all(np.unique(parent.whole_system['name']) == np.array(['Cu', 'Fe', 'Ni'])))
 
     def test_unknown_file_type(self):
-        with self.assertRaises(ParentValueError):
+        with self.assertRaises(ParentCorruptedFileError):
             _ = Parent('tests/inputs/unknown_file_type.txt',
                        unit_cell=self.unit_cell, gb_thickness=20)
 
     def test_file_too_short(self):
-        with self.assertRaises(ParentValueError):
+        with self.assertRaises(ParentCorruptedFileError):
             _ = Parent("tests/inputs/file_too_short.txt",
                        unit_cell=self.unit_cell, gb_thickness=20)
 
