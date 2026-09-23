@@ -4,6 +4,7 @@ import copy
 import filecmp
 import importlib
 import math
+import os
 import tempfile
 import unittest
 import warnings
@@ -623,20 +624,24 @@ class TestGBManipulator(unittest.TestCase):
         self.assertEqual(set(base_names), expected_types)
 
         def roundtrip_names(atoms):
-            with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                fname = temp_file.name
+            try:
                 gb.write_lammps(
-                    temp_file.name,
+                    fname,
                     atoms,
                     gb.box_dims,
                     type_as_int=True,
                 )
                 loaded = GBManipulator(
-                    temp_file.name,
+                    fname,
                     unit_cell=gb.unit_cell,
                     gb_thickness=gb.gb_thickness,
                     seed=self.seed,
                 )
                 return loaded.parents[0].whole_system["name"]
+            finally:
+                os.unlink(fname)
 
         manipulator = GBManipulator(gb, seed=self.seed)
 
@@ -780,11 +785,15 @@ class TestGBManipulator(unittest.TestCase):
         p2 = manipulator2.slice_and_merge()
         p3 = manipulator1.insert_atoms(fill_fraction=0.2, method='delaunay')
         # p4 = manipulator1.remove_atoms(0.2)
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.tilt.write_lammps(temp_file.name, p1, self.tilt.box_dims)
-            self.tilt.write_lammps(temp_file.name, p2, self.tilt.box_dims)
-            self.tilt.write_lammps(temp_file.name, p3, self.tilt.box_dims)
-            # self.tilt.write_lammps(temp_file.name, p4, self.tilt.box_dims)
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            fname = temp_file.name
+        try:
+            self.tilt.write_lammps(fname, p1, self.tilt.box_dims)
+            self.tilt.write_lammps(fname, p2, self.tilt.box_dims)
+            self.tilt.write_lammps(fname, p3, self.tilt.box_dims)
+            # self.tilt.write_lammps(fname, p4, self.tilt.box_dims)
+        finally:
+            os.unlink(fname)
 
 
 class TestParent(unittest.TestCase):

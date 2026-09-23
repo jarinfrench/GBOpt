@@ -1,16 +1,17 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
-"""Shared data types and exceptions for the ``GBOpt.io.lammps`` reader package.
+"""Shared data types and exceptions for the ``GBOpt.io.lammps`` package.
 
 Contains ``LammpsDataError`` (the established public exception raised by the LAMMPS
-readers) and ``LammpsAtomData`` (the legacy parsed-snapshot value type returned by the
-compatibility wrapper functions moved from ``GBOpt.FileGrainOwnership``). Neither type
-encodes parsing logic; ``LammpsDataError`` extends the generic ``GBOpt.io`` format-error
-base so callers that already catch ``GBOpt.io.StructureFormatError`` or ``ValueError``
-continue to work unchanged, and ``LammpsAtomData`` is a thin, LAMMPS-specific view kept
-only for compatibility with existing callers of the pre-R11 reader functions -- new code
-should consume ``GBOpt.io.StructureData`` via ``LammpsDataReader``/``LammpsDumpReader``
-instead.
+readers), ``LammpsWriteError`` (raised by ``LammpsDataWriter`` for invalid write
+options), and ``LammpsAtomData`` (the legacy parsed-snapshot value type returned by the
+compatibility wrapper functions moved from ``GBOpt.FileGrainOwnership``). None of these
+types encode parsing or formatting logic; both exceptions extend the generic
+``GBOpt.io`` exception hierarchy so callers that already catch
+``GBOpt.io.StructureFormatError``/``StructureIOError`` or ``ValueError`` continue to
+work unchanged, and ``LammpsAtomData`` is a thin, LAMMPS-specific view kept only for
+compatibility with existing callers of the pre-R11 reader functions -- new code should
+consume ``GBOpt.io.StructureData`` via ``LammpsDataReader``/``LammpsDumpReader`` instead.
 """
 
 from __future__ import annotations
@@ -20,11 +21,15 @@ from dataclasses import dataclass
 import numpy as np
 
 from GBOpt.Atom import Atom
-from GBOpt.io.types import StructureFormatError, _readonly_copy
+from GBOpt.io.types import StructureFormatError, StructureIOError, _readonly_copy
 
 
 class LammpsDataError(StructureFormatError):
     """Raised when a LAMMPS data or dump file cannot be read unambiguously."""
+
+
+class LammpsWriteError(StructureIOError, ValueError):
+    """Raised when ``LammpsDataWriter`` is given invalid structure data or options."""
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -78,4 +83,4 @@ class LammpsAtomData:
         return _readonly_copy(self._box_dims)
 
 
-__all__ = ["LammpsAtomData", "LammpsDataError"]
+__all__ = ["LammpsAtomData", "LammpsDataError", "LammpsWriteError"]

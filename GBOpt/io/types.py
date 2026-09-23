@@ -16,6 +16,7 @@ data-definition layer.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -180,6 +181,84 @@ class StructureData:
         object.__setattr__(self, "frame_index", frame_index)
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class WriteResult:
+    """Outcome metadata from one ``StructureWriter`` write.
+
+    Carries the candidate-local row-to-external-ID mapping a write assigned, so a later
+    ownership reload (R14) can align a re-read file back to the rows of the
+    ``StructureData`` that produced it, plus an explicit account of what the write did
+    not preserve. Deliberately format-neutral, like ``StructureData`` itself: nothing
+    here is LAMMPS-specific, even though ``GBOpt.io.lammps`` is this type's only
+    producer today.
+
+    :param target: Destination path the structure was written to.
+    :param format: Format identifier the writer produced (e.g. ``"lammps_data"``).
+    :param atom_ids: Length-``len(structure.atoms)`` array of external atom IDs assigned
+        in atom-row order. Index ``i`` is the row-to-external-ID mapping for row ``i``;
+        these IDs are local to this one write and carry no persistent atom identity
+        across writes, reads, or reloads.
+    :param digest: Content signature of the written file, or ``None`` when not
+        requested.
+    :param losses: Human-readable descriptions of source ``StructureData`` information
+        this write did not preserve (e.g. periodicity flags, pre-existing external IDs).
+        Empty when nothing was dropped.
+    """
+
+    target: Path
+    format: str
+    atom_ids: np.ndarray
+    digest: str | None
+    losses: tuple[str, ...]
+
+    def __init__(
+        self,
+        target: str | Path,
+        format: str,
+        atom_ids: np.ndarray,
+        *,
+        digest: str | None = None,
+        losses: tuple[str, ...] = (),
+    ) -> None:
+        """Construct one immutable write outcome.
+
+        :param target: Destination path the structure was written to.
+        :param format: Format identifier the writer produced.
+        :param atom_ids: Array-like of external atom IDs assigned, in atom-row order.
+        :param digest: Keyword argument, optional, defaults to ``None``. Content
+            signature of the written file.
+        :param losses: Keyword argument, optional, defaults to ``()``. Descriptions of
+            information the write did not preserve.
+        :raises StructureValueError: If any field is malformed.
+        """
+        target_path = Path(target)
+
+        if not isinstance(format, str) or not format:
+            raise StructureValueError("format must be a non-empty string")
+
+        try:
+            ids_array = _readonly_copy(atom_ids, dtype=np.int64)
+        except (TypeError, ValueError) as exc:
+            raise StructureValueError(
+                "atom_ids must be an integer array-like"
+            ) from exc
+        if ids_array.ndim != 1:
+            raise StructureValueError("atom_ids must be one-dimensional")
+
+        if digest is not None and not isinstance(digest, str):
+            raise StructureValueError("digest must be a string or None")
+
+        normalized_losses = tuple(losses)
+        if not all(isinstance(loss, str) for loss in normalized_losses):
+            raise StructureValueError("losses must be a sequence of strings")
+
+        object.__setattr__(self, "target", target_path)
+        object.__setattr__(self, "format", format)
+        object.__setattr__(self, "atom_ids", ids_array)
+        object.__setattr__(self, "digest", digest)
+        object.__setattr__(self, "losses", normalized_losses)
+
+
 @runtime_checkable
 class StructureReader(Protocol):
     """Protocol satisfied by a format-specific structure reader."""
@@ -213,6 +292,7 @@ __all__ = [
     "StructureFormatError",
     "StructureValueError",
     "StructureData",
+    "WriteResult",
     "StructureReader",
     "StructureWriter",
 ]

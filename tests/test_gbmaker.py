@@ -1268,13 +1268,17 @@ class TestGBMaker(unittest.TestCase):
     def test_write_lammps(self):
         atoms = self.gbm.whole_system
         box_sizes = self.gbm.box_dims
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(temp_file.name, atoms, box_sizes)
-            with open(temp_file.name, "r") as f:
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            fname = temp_file.name
+        try:
+            self.gbm.write_lammps(fname, atoms, box_sizes)
+            with open(fname, "r") as f:
                 content = f.readlines()
             self.assertGreater(len(content), 0)
             self.assertIn("atoms", content[2].lower())
             self.assertIn("atom types", content[3].lower())
+        finally:
+            os.unlink(fname)
 
     # Tests for setters
     def test_box_dimensions_after_updates(self):
@@ -1498,22 +1502,24 @@ class TestGBMaker(unittest.TestCase):
         atoms = np.array([("Cu", 0.0, 0.0, 0.0), ("H", 1.0, 1.0, 1.0)],
                          dtype=Atom.atom_dtype)
         box_sizes = np.array([[0.0, 10.0], [0.0, 10.0], [0.0, 10.0]])
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(temp_file.name, atoms, box_sizes)
-            with open(temp_file.name, "r") as f:
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            fname = temp_file.name
+        try:
+            self.gbm.write_lammps(fname, atoms, box_sizes)
+            with open(fname, "r") as f:
                 content = f.readlines()
             self.assertEqual(content[2].strip(), "2 atoms")
             self.assertEqual(content[3].strip(), "2 atom types")
 
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(temp_file.name, atoms,
-                                  box_sizes, type_as_int=False)
-            with open(temp_file.name, "r") as f:
+            self.gbm.write_lammps(fname, atoms, box_sizes, type_as_int=False)
+            with open(fname, "r") as f:
                 content = f.readlines()
 
             self.assertEqual(content[8].strip(), "Atom Type Labels")
             self.assertEqual(content[10].strip(), "1 Cu")
             self.assertEqual(content[11].strip(), "2 H")
+        finally:
+            os.unlink(fname)
 
     def test_lammps_file_formatting_with_charge(self):
         atoms = np.array(
@@ -1526,9 +1532,11 @@ class TestGBMaker(unittest.TestCase):
         )
         charges = {'U': 2.4, 'O': -1.2}
         box_sizes = np.array([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]])
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(temp_file.name, atoms, box_sizes, charges=charges)
-            with open(temp_file.name, 'r') as f:
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            fname = temp_file.name
+        try:
+            self.gbm.write_lammps(fname, atoms, box_sizes, charges=charges)
+            with open(fname, 'r') as f:
                 content = f.readlines()
             self.assertEqual(content[2].strip(), '3 atoms')
             self.assertEqual(content[3].strip(), '2 atom types')
@@ -1539,10 +1547,9 @@ class TestGBMaker(unittest.TestCase):
             self.assertEqual(content[17].strip(),
                              '3 O -1.200000 0.250000 0.250000 0.750000')
 
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-            self.gbm.write_lammps(temp_file.name, atoms, box_sizes,
+            self.gbm.write_lammps(fname, atoms, box_sizes,
                                   charges=charges, type_as_int=True)
-            with open(temp_file.name, 'r') as f:
+            with open(fname, 'r') as f:
                 content = f.readlines()
             self.assertEqual(content[2].strip(), '3 atoms')
             self.assertEqual(content[3].strip(), '2 atom types')
@@ -1552,6 +1559,8 @@ class TestGBMaker(unittest.TestCase):
                              '2 1 -1.200000 0.250000 0.250000 0.250000')
             self.assertEqual(content[12].strip(),
                              '3 1 -1.200000 0.250000 0.250000 0.750000')
+        finally:
+            os.unlink(fname)
 
     def test_data_integrity_in_gb(self):
         left_grain = self.gbm.left_grain
@@ -2823,18 +2832,26 @@ class TestGBMakerTriclinic(unittest.TestCase):
         )
 
     def test_triclinic_writes_tilt_line(self):
-        with tempfile.NamedTemporaryFile(delete=True) as f:
-            self.gbm.write_lammps(f.name, triclinic=True)
-            with open(f.name) as fread:
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            fname = f.name
+        try:
+            self.gbm.write_lammps(fname, triclinic=True)
+            with open(fname) as fread:
                 content = fread.read()
-        self.assertIn("xy xz yz", content)
+            self.assertIn("xy xz yz", content)
+        finally:
+            os.unlink(fname)
 
     def test_non_triclinic_no_tilt_line(self):
-        with tempfile.NamedTemporaryFile(delete=True) as f:
-            self.gbm.write_lammps(f.name)
-            with open(f.name) as fread:
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            fname = f.name
+        try:
+            self.gbm.write_lammps(fname)
+            with open(fname) as fread:
                 content = fread.read()
-        self.assertNotIn("xy xz yz", content)
+            self.assertNotIn("xy xz yz", content)
+        finally:
+            os.unlink(fname)
 
     def test_csl_boundary_zero_tilt(self):
         # Sigma5 is a CSL boundary - period vectors lie exactly on axis directions, so
@@ -2922,10 +2939,14 @@ class TestGBMakerTriclinic(unittest.TestCase):
                 self.assertFalse(np.allclose(
                     actual, expected_other, atol=1e-12, rtol=0.0))
 
-                with tempfile.NamedTemporaryFile(delete=True) as f:
-                    self.gbm.write_lammps(f.name, triclinic=True)
-                    with open(f.name) as fread:
+                with tempfile.NamedTemporaryFile(delete=False) as f:
+                    fname = f.name
+                try:
+                    self.gbm.write_lammps(fname, triclinic=True)
+                    with open(fname) as fread:
                         content = fread.readlines()
+                finally:
+                    os.unlink(fname)
 
                 tilt_line = next(
                     line.strip() for line in content if line.endswith("xy xz yz\n")
