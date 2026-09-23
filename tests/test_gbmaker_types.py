@@ -129,6 +129,27 @@ def test_gb_build_config_accepts_zero_gb_id() -> None:
     assert config.gb_id == 0
 
 
+def test_gb_build_config_accepts_zero_x_dim_min() -> None:
+    config = GBBuildConfig(material=_material(), gb_thickness=0.0, x_dim_min=0.0)
+    assert config.x_dim_min == 0.0
+
+
+def test_gb_build_config_accepts_zero_interaction_distance() -> None:
+    config = GBBuildConfig(
+        material=_material(), gb_thickness=0.0, interaction_distance=0.0
+    )
+    assert config.interaction_distance == 0.0
+
+
+def test_gb_build_config_distinguishes_zero_mismatch_tol_from_none() -> None:
+    disabled = GBBuildConfig(material=_material(), gb_thickness=0.0)
+    exact_match = GBBuildConfig(
+        material=_material(), gb_thickness=0.0, mismatch_tol=0.0
+    )
+    assert disabled.mismatch_tol is None
+    assert exact_match.mismatch_tol == 0.0
+
+
 def test_gb_build_config_rejects_negative_gb_thickness() -> None:
     with pytest.raises(GBMakerConstructionValueError):
         GBBuildConfig(material=_material(), gb_thickness=-1.0)

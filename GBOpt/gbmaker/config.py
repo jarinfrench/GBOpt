@@ -55,7 +55,7 @@ def _validate_scalar(
     expected_types: type | tuple[type, ...],
     parameter_name: str,
     *,
-    positive: bool = False,
+    nonnegative: bool = False,
     expected_length: int | None = None,
     strictly_positive: bool = False,
 ):
@@ -63,16 +63,21 @@ def _validate_scalar(
 
     This is the single implementation behind ``GBMaker.__validate`` (used by the legacy
     constructor and every property setter) and ``normalize_legacy_config``.
+    ``GBMaker.__validate`` still calls its own parameter ``positive`` (the established,
+    behavior-preserving name from the original method) and passes it through as
+    ``nonnegative`` here; only this new module's own parameter name changed.
 
     :param value: The value to validate.
     :param expected_types: Single type or tuple containing the valid types for value.
     :param parameter_name: The name of the parameter.
-    :param positive: Whether or not the value should be positive (>= 0), optional,
-        defaults to False.
+    :param nonnegative: Whether or not the value should be non-negative (>= 0),
+        optional, defaults to False. Named accurately here, unlike the legacy
+        ``GBMaker.__validate(..., positive=True)`` this replaces, which despite its
+        name also only rejects negative values (``0`` passes).
     :param expected_length: Specific to sequences or arrays. The expected length of the
         sequence or array, optional, defaults to None.
-    :param strictly_positive: Supercedes ``positive`` by enforcing value > 0. Optional,
-        defaults to False.
+    :param strictly_positive: Supercedes ``nonnegative`` by enforcing value > 0.
+        Optional, defaults to False.
     :raises GBMakerConstructionTypeError: If the type of the value does not match the
         expected type(s).
     :raises GBMakerConstructionValueError: If invalid values are given for the
@@ -100,14 +105,14 @@ def _validate_scalar(
                 f"({np.finfo(np.float64).eps:.2e}) and may not have any "
                 "practical effect."
             )
-    elif positive and isinstance(value, Number) and value < 0:
+    elif nonnegative and isinstance(value, Number) and value < 0:
         raise GBMakerConstructionValueError(
             f"{parameter_name} must be a positive value.")
 
     if (
         isinstance(value, (Sequence, np.ndarray))
         and all([isinstance(val, Number) for val in value])
-        and positive
+        and nonnegative
     ):
         for val in value:
             if val < 0:
@@ -326,10 +331,10 @@ def normalize_legacy_config(
     :raises UnitCellError: If unit-cell construction fails for the resolved material
         identity.
     """
-    a0 = _validate_scalar(a0, Number, "a0", positive=True)
+    a0 = _validate_scalar(a0, Number, "a0", nonnegative=True)
     structure = _validate_scalar(structure, str, "structure")
     gb_thickness = _validate_scalar(
-        gb_thickness, Number, "gb_thickness", positive=True
+        gb_thickness, Number, "gb_thickness", nonnegative=True
     )
     epsilon = _validate_scalar(epsilon, Number, "epsilon", strictly_positive=True)
     repeat_factor = _validate_scalar(
@@ -337,14 +342,14 @@ def normalize_legacy_config(
         (int, Sequence),
         "repeat_factor",
         expected_length=2,
-        positive=True,
+        nonnegative=True,
     )
-    x_dim_min = _validate_scalar(x_dim_min, Number, "x_dim_min", positive=True)
-    vacuum = _validate_scalar(vacuum, Number, "vacuum_thickness", positive=True)
+    x_dim_min = _validate_scalar(x_dim_min, Number, "x_dim_min", nonnegative=True)
+    vacuum = _validate_scalar(vacuum, Number, "vacuum_thickness", nonnegative=True)
     interaction_distance = _validate_scalar(
-        interaction_distance, Number, "interaction_distance", positive=True
+        interaction_distance, Number, "interaction_distance", nonnegative=True
     )
-    gb_id = _validate_scalar(gb_id, int, "id", positive=True)
+    gb_id = _validate_scalar(gb_id, int, "id", nonnegative=True)
     mismatch_tol = validate_mismatch_tol(mismatch_tol)
     mismatch_max_cells = validate_mismatch_max_cells(mismatch_max_cells)
     strain_grain = validate_strain_grain(strain_grain)

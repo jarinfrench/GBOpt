@@ -3041,7 +3041,7 @@ class GBMaker:
                 value,
                 expected_types,
                 parameter_name,
-                positive=positive,
+                nonnegative=positive,
                 expected_length=expected_length,
                 strictly_positive=strictly_positive,
             )

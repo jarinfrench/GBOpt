@@ -295,7 +295,17 @@ class MaterialState:
     unit_cell: UnitCell | None = None
 
     def __post_init__(self) -> None:
-        """Validate and freeze material-identity fields."""
+        """Validate and freeze material-identity fields.
+
+        ``a0`` is rejected at exactly ``0`` even though the legacy
+        ``GBMaker.__validate(..., positive=True)`` check it replaces only rejects
+        negative values. Unlike ``x_dim_min``/``interaction_distance``/``mismatch_tol``,
+        a zero lattice parameter was never a usable legacy value: nothing downstream
+        (unit-cell radius, box dimensions, geometry) produces a valid structure at
+        ``a0 == 0``, only a confusing failure further from the actual cause. Rejecting
+        it here is a genuine improvement, not a behavior change a caller could depend
+        on.
+        """
         object.__setattr__(self, "a0", _require_positive_float(self.a0, "a0"))
         object.__setattr__(
             self, "structure", _require_nonempty_string(self.structure, "structure")
@@ -349,13 +359,15 @@ class GBBuildConfig:
             self, "repeat_factor", _require_repeat_factor(self.repeat_factor)
         )
         object.__setattr__(
-            self, "x_dim_min", _require_positive_float(self.x_dim_min, "x_dim_min")
+            self, "x_dim_min", _require_nonnegative_float(self.x_dim_min, "x_dim_min")
         )
         object.__setattr__(self, "vacuum", _require_nonnegative_float(self.vacuum, "vacuum"))
         object.__setattr__(
             self,
             "interaction_distance",
-            _require_positive_float(self.interaction_distance, "interaction_distance"),
+            _require_nonnegative_float(
+                self.interaction_distance, "interaction_distance"
+            ),
         )
         object.__setattr__(
             self, "gb_id", _require_nonnegative_int(self.gb_id, "gb_id")
@@ -366,7 +378,7 @@ class GBBuildConfig:
             "mismatch_tol",
             None
             if self.mismatch_tol is None
-            else _require_positive_float(self.mismatch_tol, "mismatch_tol"),
+            else _require_nonnegative_float(self.mismatch_tol, "mismatch_tol"),
         )
         object.__setattr__(
             self,
