@@ -332,7 +332,7 @@ def normalize_legacy_config(
         gb_thickness, Number, "gb_thickness", positive=True
     )
     epsilon = _validate_scalar(epsilon, Number, "epsilon", strictly_positive=True)
-    validated_repeat_factor = _validate_scalar(
+    repeat_factor = _validate_scalar(
         repeat_factor,
         (int, Sequence),
         "repeat_factor",
@@ -354,7 +354,7 @@ def normalize_legacy_config(
     return GBBuildConfig(
         material=material,
         gb_thickness=gb_thickness,
-        repeat_factor=tuple(validated_repeat_factor),
+        repeat_factor=tuple(repeat_factor),
         x_dim_min=x_dim_min,
         vacuum=vacuum,
         interaction_distance=interaction_distance,

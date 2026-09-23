@@ -15,7 +15,7 @@ representations are referenced, not duplicated.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from numbers import Integral, Real
 from types import MappingProxyType
@@ -178,12 +178,13 @@ def _require_repeat_factor(value: object) -> tuple[int, int]:
     if isinstance(value, Integral):
         repeat = _require_positive_int(value, "repeat_factor")
         return (repeat, repeat)
-    if not isinstance(value, Sequence) or len(value) != 2:
+    try:
+        y_value, z_value = value
+    except (TypeError, ValueError) as exc:
         raise GBMakerConstructionValueError(
             "repeat_factor must be a positive integer or a two-value sequence of "
             "positive integers"
-        )
-    y_value, z_value = value
+        ) from exc
     return (
         _require_positive_int(y_value, "repeat_factor[0]"),
         _require_positive_int(z_value, "repeat_factor[1]"),
