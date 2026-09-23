@@ -880,3 +880,80 @@ def _select_complete_origins_in_box_basis(
         inside_x,
         basis_size,
     )
+
+
+def _triclinic_tilt_params(
+    *,
+    inplane_periodic: tuple[bool, bool],
+    left_periodic_miller_rows: np.ndarray,
+    right_periodic_miller_rows: np.ndarray,
+    R_left: np.ndarray,
+    R_right: np.ndarray,
+    conventional_basis: np.ndarray,
+    y_dim: float,
+    z_dim: float,
+    epsilon: float,
+) -> tuple[float, float, float, float]:
+    """Compute LAMMPS restricted-triclinic tilt factors.
+
+    The y-period in the lab frame is ``R_grain @ (g_y * a0)``. For an exact CSL
+    boundary this is exactly ``||g_y|| * a0 * e_y``; for non-CSL it has small x and z
+    components. To satisfy LAMMPS's restriction that the b-vector lies in the xy-plane,
+    everything is rotated about the x-axis by ``theta = -atan2(A2[2], A2[1])``.
+
+    :param inplane_periodic: ``(y_periodic, z_periodic)`` periodicity flags.
+    :param left_periodic_miller_rows: Left-grain periodic Miller-row matrix.
+    :param right_periodic_miller_rows: Right-grain periodic Miller-row matrix.
+    :param R_left: Left-grain rotation matrix.
+    :param R_right: Right-grain rotation matrix.
+    :param conventional_basis: Conventional unit-cell basis vectors as rows.
+    :param y_dim: Simulation box length along y (Angstroms).
+    :param z_dim: Simulation box length along z (Angstroms).
+    :param epsilon: Cartesian numerical tolerance (Angstroms).
+    :return: ``(xy, xz, yz, theta)`` -- the three tilt scalars and the rotation angle
+        to apply to atom coordinates.
+    :raises GBMakerConstructionValueError: If ``inplane_periodic`` is not periodic
+        along both y and z, or if the selected grain's primitive periods have a
+        near-zero projection on their own box axis.
+    """
+    if not all(inplane_periodic):
+        raise GBMakerConstructionValueError(
+            "Triclinic output requires periodic y and z directions."
+        )
+
+    # Use grain with larger y-period, consistent with how spacing["y"] is chosen.
+    if (
+        np.linalg.norm(left_periodic_miller_rows[1])
+        >= np.linalg.norm(right_periodic_miller_rows[1])
+    ):
+        R_grain = R_left
+        R_grain_approx = left_periodic_miller_rows
+    else:
+        R_grain = R_right
+        R_grain_approx = right_periodic_miller_rows
+
+    # conventional_basis stores basis vectors as rows: C = [a1; a2; a3].
+    # Rotating each row vector to the lab frame gives [R@a1; R@a2; R@a3],
+    # which in batch form is (R @ C.T).T = C @ R.T.
+    rotated_unit_cell_basis = conventional_basis @ R_grain.T
+    primitive_periods = (
+        np.asarray(R_grain_approx[1:], dtype=np.float64) @ rotated_unit_cell_basis
+    )
+    A2_lab, A3_lab = _box_periodic_basis(
+        primitive_periods, inplane_periodic, (y_dim, z_dim), epsilon
+    )
+
+    # Rotate about x to bring A2 into the xy-plane (LAMMPS restricted-triclinic
+    # requires b-vector in the xy-plane). x-components are unaffected by this
+    # rotation.
+    theta = -math.atan2(float(A2_lab[2]), float(A2_lab[1]))
+    ct, st = math.cos(theta), math.sin(theta)
+
+    # The x-rotation matrix is [[1,0,0],[0,ct,-st],[0,st,ct]]. The x-components of
+    # A2_lab and A3_lab are unchanged by it, so xy and xz can be read directly from
+    # the pre-rotation vectors. yz requires the full rotation.
+    xy = float(A2_lab[0])
+    xz = float(A3_lab[0])
+    yz = float(ct * A3_lab[1] - st * A3_lab[2])
+
+    return xy, xz, yz, theta

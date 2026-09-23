@@ -22,7 +22,6 @@ from GBOpt.crystallography._limits import (
     DEFAULT_MAX_PQ_DETERMINANT,
     DEFAULT_MAX_PRIMITIVE_AREA_INDEX,
 )
-from GBOpt.gbmaker.approximate_grain import filter_grain_result_complete_origins
 from GBOpt.gbmaker.assembly import assemble_bicrystal
 from GBOpt.gbmaker.config import (
     _validate_scalar,
@@ -46,6 +45,7 @@ from GBOpt.gbmaker.geometry import (
     _box_periodic_basis,
     _complete_origin_atom_mask,
     _scaled_periodic_basis_vector,
+    _triclinic_tilt_params,
 )
 from GBOpt.gbmaker.geometry import wrap_reduced_coordinate as _wrap_reduced_coordinate
 from GBOpt.gbmaker.orientation import (
@@ -56,7 +56,6 @@ from GBOpt.gbmaker.types import (
     AxisAccommodation,
     GBMakerConstructionTypeError,
     GBMakerConstructionValueError,
-    GrainBuildResult,
     MaterialState,
 )
 from GBOpt.io.lammps.data_writer import LammpsDataWriter
@@ -725,52 +724,28 @@ class GBMaker:
 
     def __get_triclinic_params(self):
         """
-        Computes the LAMMPS restricted-triclinic tilt factors. The y-period in the lab
-        frame is R_grain @ (g_y * a0). For an exact CSL boundary this is exactly
-        ||g_y|| * a0 * e_y; for non-CSL it has small x and z components. To satisfy
-        LAMMPS's restriction that the b-vector lies in the xy-plane, rotate everything
-        about the x-axis by theta = -atan2(A2[2], A2[1]).
+        Computes the LAMMPS restricted-triclinic tilt factors.
+
+        Thin wrapper delegating to ``GBOpt.gbmaker.geometry._triclinic_tilt_params``.
 
         :return: (xy, xz, yz, theta) - the three tilt scalars and the rotation angle to
                                        apply to atom coordinates
+        :raises GBMakerValueError: If the y/z directions are not both periodic, or if
+            the selected grain's primitive periods have a near-zero projection on
+            their own box axis.
         """
-        if not all(self.__inplane_periodic):
-            raise GBMakerValueError(
-                "Triclinic output requires periodic y and z directions."
-            )
-
-        # Use grain with larger y-period, consistent with how spacing["y"] is chosen
-        if (np.linalg.norm(self.__left_periodic_miller_rows[1])
-                >= np.linalg.norm(self.__right_periodic_miller_rows[1])):
-            R_grain = self.__R_left
-            R_grain_approx = self.__left_periodic_miller_rows
-        else:
-            R_grain = self.__R_right
-            R_grain_approx = self.__right_periodic_miller_rows
-
-        # conventional stores basis vectors as rows: C = [a1; a2; a3].
-        # Rotating each row vector to the lab frame gives [R@a1; R@a2; R@a3],
-        # which in batch form is (R @ C.T).T = C @ R.T.
-        rotated_unit_cell_basis = self.__unit_cell.conventional @ R_grain.T
-        primitive_periods = (
-            np.asarray(R_grain_approx[1:], dtype=np.float64) @ rotated_unit_cell_basis
+        return self.__translate_construction_error(
+            _triclinic_tilt_params,
+            inplane_periodic=self.__inplane_periodic,
+            left_periodic_miller_rows=self.__left_periodic_miller_rows,
+            right_periodic_miller_rows=self.__right_periodic_miller_rows,
+            R_left=self.__R_left,
+            R_right=self.__R_right,
+            conventional_basis=self.__unit_cell.conventional,
+            y_dim=self.__y_dim,
+            z_dim=self.__z_dim,
+            epsilon=self.__epsilon,
         )
-        A2_lab, A3_lab = self.__box_periodic_basis(primitive_periods)
-
-        # Rotate about x to bring A2 into the xy-plane (LAMMPS restricted-triclinic
-        # requires b-vector in the xy-plane). x-components are unaffected by this
-        # rotation
-        theta = -math.atan2(float(A2_lab[2]), float(A2_lab[1]))
-        ct, st = math.cos(theta), math.sin(theta)
-
-        # The x-rotation matrix is [[1,0,0],[0,ct,-st],[0,st,ct]]. The x-components of
-        # A2_lab and A3_lab are unchanged by it, so xy and xz can be read direcly from
-        # the pre-rotation vectors. yz requires the full rotation.
-        xy = float(A2_lab[0])
-        xz = float(A3_lab[0])
-        yz = float(ct * A3_lab[1] - st * A3_lab[2])
-
-        return xy, xz, yz, theta
 
     def __init_unit_cell(self, atom_types: str | tuple[str, ...]) -> UnitCell:
         """
@@ -847,26 +822,6 @@ class GBMaker:
             _complete_origin_atom_mask, atom_mask, origin_ids, basis_size
         )
 
-    def __filter_float_result_complete_origins(
-        self,
-        result: GrainBuildResult,
-        atom_mask: np.ndarray,
-    ) -> GrainBuildResult:
-        """Filter a float-path build result by complete origin groups.
-
-        Thin wrapper delegating to
-        ``GBOpt.gbmaker.approximate_grain.filter_grain_result_complete_origins``.
-
-        :param result: Float-path grain build result to filter.
-        :param atom_mask: Boolean atom-level mask parallel to ``result.atoms``.
-        :return: Filtered float-path grain build result.
-        :raises GBMakerValueError: If complete-origin filtering rejects the mask, origin
-            IDs, or basis size.
-        """
-        return self.__translate_construction_error(
-            filter_grain_result_complete_origins, result, atom_mask
-        )
-
     def __update_dims(self) -> None:
         """Updates the y_dim and z_dim parameters after a relevant parameter has been
         changed.
@@ -914,7 +869,7 @@ class GBMaker:
         expected_types: type | tuple[type, ...],
         parameter_name: str,
         *,
-        positive: bool = False,
+        nonnegative: bool = False,
         expected_length: int | None = None,
         strictly_positive: bool = False
     ):
@@ -929,11 +884,11 @@ class GBMaker:
         :param expected_types: Single type or tuple containing the valid types for
             value.
         :param parameter_name: The name of the parameter.
-        :param positive: Whether or not the value should be positive (>= 0), optional,
-            defaults to False.
+        :param nonnegative: Whether or not the value should be non-negative (>= 0),
+            optional, defaults to False.
         :param expected_length: Specific to sequences or arrays. The expected length of
             the sequence or array, optional, defaults to None.
-        :param strictly_positive: Supercedes ``positive`` by enforcing value > 0.
+        :param strictly_positive: Supercedes ``nonnegative`` by enforcing value > 0.
             Optional, defaults to False.
         :raises GBMakerTypeError: Exception raised if the type of the value does not
             match the expected type(s).
@@ -946,7 +901,7 @@ class GBMaker:
             value,
             expected_types,
             parameter_name,
-            nonnegative=positive,
+            nonnegative=nonnegative,
             expected_length=expected_length,
             strictly_positive=strictly_positive,
         )
@@ -1062,7 +1017,7 @@ class GBMaker:
     @a0.setter
     def a0(self, value: Number) -> None:
         atom_types = tuple(self.__unit_cell.names())
-        self.__a0 = self.__validate(value, float, "a0", positive=True)
+        self.__a0 = self.__validate(value, float, "a0", nonnegative=True)
         self.__unit_cell = self.__init_unit_cell(atom_types)
         self.update_spacing()
 
@@ -1082,7 +1037,7 @@ class GBMaker:
     @gb_thickness.setter
     def gb_thickness(self, value: Number):
         self.__gb_thickness = self.__validate(
-            value, Number, "gb_thickness", positive=True)
+            value, Number, "gb_thickness", nonnegative=True)
         self.__box_dims = self.__calculate_box_dimensions()
 
     @property
@@ -1091,7 +1046,7 @@ class GBMaker:
 
     @id.setter
     def id(self, value: int):
-        self.__id = self.__validate(value, int, "id", positive=True)
+        self.__id = self.__validate(value, int, "id", nonnegative=True)
 
     @property
     def interaction_distance(self) -> float:
@@ -1100,7 +1055,7 @@ class GBMaker:
     @interaction_distance.setter
     def interaction_distance(self, value: Number) -> None:
         self.__interaction_distance = self.__validate(
-            value, Number, "interaction_distance", positive=True)
+            value, Number, "interaction_distance", nonnegative=True)
         self.__update_dims()
 
     @property
@@ -1125,7 +1080,7 @@ class GBMaker:
     @repeat_factor.setter
     def repeat_factor(self, value: int):
         self.__repeat_factor = self.__validate(
-            value, (int, Sequence), "repeat_factor", positive=True)
+            value, (int, Sequence), "repeat_factor", nonnegative=True)
         self.__update_dims()
 
     @property
@@ -1152,7 +1107,7 @@ class GBMaker:
     def vacuum_thickness(self, value: Number):
         old_vacuum = self.__vacuum_thickness
         vacuum_value = self.__validate(
-            value, Number, "vacuum_thickness", positive=True
+            value, Number, "vacuum_thickness", nonnegative=True
         )
         self.__vacuum_thickness, self.__normal_topology = (
             _normalize_vacuum_topology(
@@ -1174,7 +1129,7 @@ class GBMaker:
     @x_dim_min.setter
     def x_dim_min(self, value: Number):
         self.__x_dim_min = self.__validate(
-            value, Number, "x_dim_min", positive=True)
+            value, Number, "x_dim_min", nonnegative=True)
         self.update_spacing()
         self.__box_dims = self.__calculate_box_dimensions()
 

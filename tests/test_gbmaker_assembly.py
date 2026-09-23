@@ -368,3 +368,45 @@ def test_gbmaker_construction_does_not_import_optimization_modules():
         "assert leaked == [], leaked\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_gbmaker_package_does_not_import_optimizer_or_file_format_modules():
+    """Issue #71's (R10) "architecture tests enforce that GBOpt.gbmaker does not import
+    optimizer or file-format implementation modules" acceptance criterion.
+
+    Unlike the sibling test above (which deliberately also imports GBOpt.GBMaker, the
+    facade, to check *its* construction path), this isolates GBOpt.gbmaker the
+    subpackage on its own. GBOpt/__init__.py unconditionally imports GBOpt.GBMaker
+    (which itself imports GBOpt.io.lammps.data_writer for write_lammps), and Python
+    always runs a package's __init__.py before any of its submodules -- so a plain
+    "import GBOpt.gbmaker; assert 'GBOpt.io...' not in sys.modules" would fail
+    regardless of what GBOpt.gbmaker itself imports. Stub out "GBOpt" with an empty
+    module (its on-disk __path__ preserved via importlib.util.find_spec, which locates
+    the package without executing it) before importing GBOpt.gbmaker, so
+    GBOpt/__init__.py's body never runs in this subprocess and only GBOpt.gbmaker's own
+    import graph is observed. Same technique as
+    test_io_lammps_data_writer.py::test_data_writer_module_does_not_import_gbmaker
+    (R12), per CLAUDE.md's "reuse the stub-parent-package technique for any 'not
+    imported' target GBOpt/__init__.py eagerly imports" guidance.
+    """
+    import subprocess
+
+    script = (
+        "import importlib.util, sys, types\n"
+        "spec = importlib.util.find_spec('GBOpt')\n"
+        "stub = types.ModuleType('GBOpt')\n"
+        "stub.__path__ = spec.submodule_search_locations\n"
+        "sys.modules['GBOpt'] = stub\n"
+        "import GBOpt.gbmaker\n"
+        "leaked = [m for m in sys.modules if "
+        "m.startswith('GBOpt.optimization') or m.startswith('GBOpt.GBMinimizer') "
+        "or m.startswith('GBOpt.io')]\n"
+        "assert leaked == [], leaked\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

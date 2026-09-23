@@ -12,6 +12,7 @@ from GBOpt.gbmaker.geometry import (
     _reduced_coordinate_tolerance,
     _scaled_periodic_basis_vector,
     _selection_basis_vectors,
+    _triclinic_tilt_params,
     _x_index_range,
     wrap_reduced_coordinate,
 )
@@ -431,3 +432,96 @@ def test_clip_complete_origins_to_cartesian_box_epsilon_controls_boundary_inclus
         epsilon=1e-13,
     )
     assert len(result_small) == 0
+
+
+# --------------------------------------------------------------------------------------
+# _triclinic_tilt_params
+# --------------------------------------------------------------------------------------
+
+
+def test_triclinic_tilt_params_orthogonal_case_has_zero_tilt():
+    conventional = np.diag([2.0, 2.0, 2.0])
+    rows = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+    R = np.eye(3)
+
+    xy, xz, yz, theta = _triclinic_tilt_params(
+        inplane_periodic=(True, True),
+        left_periodic_miller_rows=rows,
+        right_periodic_miller_rows=rows,
+        R_left=R,
+        R_right=R,
+        conventional_basis=conventional,
+        y_dim=5.0,
+        z_dim=6.0,
+        epsilon=1e-8,
+    )
+
+    assert (xy, xz, yz, theta) == pytest.approx((0.0, 0.0, 0.0, 0.0), abs=1e-12)
+
+
+def test_triclinic_tilt_params_not_periodic_raises_construction_error():
+    conventional = np.eye(3)
+    rows = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+    R = np.eye(3)
+
+    with pytest.raises(GBMakerConstructionValueError):
+        _triclinic_tilt_params(
+            inplane_periodic=(True, False),
+            left_periodic_miller_rows=rows,
+            right_periodic_miller_rows=rows,
+            R_left=R,
+            R_right=R,
+            conventional_basis=conventional,
+            y_dim=5.0,
+            z_dim=6.0,
+            epsilon=1e-8,
+        )
+
+
+def test_triclinic_tilt_params_selects_left_grain_when_its_y_period_row_is_larger():
+    # left_rows[1] has norm 1.0 > right_rows[1]'s norm 0.5, so the left grain
+    # (R_left, left_periodic_miller_rows) determines the output, and the skewed
+    # conventional basis is what produces the nonzero tilt below.
+    conventional = np.array([[1.0, 0.0, 0.0], [0.2, 1.0, 0.15], [0.0, 0.3, 1.0]])
+    left_rows = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+    right_rows = np.array([[1, 0, 0], [0, 0.5, 0], [0, 0, 1]])
+    R = np.eye(3)
+
+    result = _triclinic_tilt_params(
+        inplane_periodic=(True, True),
+        left_periodic_miller_rows=left_rows,
+        right_periodic_miller_rows=right_rows,
+        R_left=R,
+        R_right=R,
+        conventional_basis=conventional,
+        y_dim=2.0,
+        z_dim=3.0,
+        epsilon=1e-8,
+    )
+
+    expected = (0.4, 0.0, 1.3350640763722015, -0.14888994760949725)
+    assert result == pytest.approx(expected, abs=1e-12)
+
+
+def test_triclinic_tilt_params_selects_right_grain_when_its_y_period_row_is_larger():
+    # Mirror of the test above with the roles (and the skewed conventional basis
+    # layout) swapped, so the right grain determines the output this time.
+    conventional = np.array([[1.0, 0.0, 0.0], [0.0, 0.3, 1.0], [0.2, 1.0, 0.15]])
+    left_rows = np.array([[1, 0, 0], [0, 0.5, 0], [0, 0, 1]])
+    right_rows = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+    R = np.eye(3)
+
+    result = _triclinic_tilt_params(
+        inplane_periodic=(True, True),
+        left_periodic_miller_rows=left_rows,
+        right_periodic_miller_rows=right_rows,
+        R_left=R,
+        R_right=R,
+        conventional_basis=conventional,
+        y_dim=2.0,
+        z_dim=3.0,
+        epsilon=1e-8,
+    )
+
+    expected = (0.0, 4.0, 8.620436566990362, -1.2793395323170296)
+    assert result == pytest.approx(expected, abs=1e-12)
