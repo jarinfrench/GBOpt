@@ -716,13 +716,36 @@ class GBMaker:
         )
 
     @staticmethod
+    def __translate_construction_error(func, *args, **kwargs):
+        """Call a ``gbmaker`` pure validation function, translating its exception.
+
+        Single shared implementation behind every ``GBMaker`` validator wrapper below
+        (and ``__validate`` itself): translates ``GBOpt.gbmaker.types``'s
+        ``GBMakerConstructionTypeError``/``GBMakerConstructionValueError`` back to the
+        established public ``GBMakerTypeError``/``GBMakerValueError``, so property
+        setters and the legacy constructor see the same exception identities they
+        always have while the validation logic itself lives in ``gbmaker.config``.
+
+        :param func: Pure validation function to call.
+        :param args: Positional arguments forwarded to ``func``.
+        :param kwargs: Keyword arguments forwarded to ``func``.
+        :return: Whatever ``func`` returns.
+        :raises GBMakerTypeError: If ``func`` raises ``GBMakerConstructionTypeError``.
+        :raises GBMakerValueError: If ``func`` raises ``GBMakerConstructionValueError``.
+        """
+        try:
+            return func(*args, **kwargs)
+        except GBMakerConstructionTypeError as exc:
+            raise GBMakerTypeError(str(exc)) from exc
+        except GBMakerConstructionValueError as exc:
+            raise GBMakerValueError(str(exc)) from exc
+
+    @staticmethod
     def __validate_mismatch_tol(value: object) -> float | None:
         """Return a validated mismatch-accommodation tolerance.
 
         Thin wrapper delegating to the single pure implementation in
-        ``GBOpt.gbmaker.config.validate_mismatch_tol``, translating its
-        ``GBMakerConstructionValueError`` back to the established public
-        ``GBMakerValueError``.
+        ``GBOpt.gbmaker.config.validate_mismatch_tol``.
 
         :param value: Candidate mismatch tolerance.
         :return: ``None`` if mismatch accommodation is disabled; otherwise a finite,
@@ -730,10 +753,7 @@ class GBMaker:
         :raises GBMakerValueError: If ``value`` is boolean, non-numeric, infinite, NaN,
             or negative.
         """
-        try:
-            return validate_mismatch_tol(value)
-        except GBMakerConstructionValueError as exc:
-            raise GBMakerValueError(str(exc)) from exc
+        return GBMaker.__translate_construction_error(validate_mismatch_tol, value)
 
     @staticmethod
     def __validate_mismatch_max_cells(value: object) -> int:
@@ -747,10 +767,9 @@ class GBMaker:
         :raises GBMakerValueError: If ``value`` is boolean, non-integral, or less than
             one.
         """
-        try:
-            return validate_mismatch_max_cells(value)
-        except GBMakerConstructionValueError as exc:
-            raise GBMakerValueError(str(exc)) from exc
+        return GBMaker.__translate_construction_error(
+            validate_mismatch_max_cells, value
+        )
 
     @staticmethod
     def __validate_strain_grain(value: str) -> str:
@@ -764,10 +783,7 @@ class GBMaker:
         :raises GBMakerValueError: If ``value`` is not one of ``"both"``, ``"left"``, or
             ``"right"``.
         """
-        try:
-            return validate_strain_grain(value)
-        except GBMakerConstructionValueError as exc:
-            raise GBMakerValueError(str(exc)) from exc
+        return GBMaker.__translate_construction_error(validate_strain_grain, value)
 
     @staticmethod
     def __validate_boundary_mode(value: str) -> str:
@@ -780,10 +796,7 @@ class GBMaker:
         :return: Validated construction mode.
         :raises GBMakerValueError: If ``value`` is not one of the supported modes.
         """
-        try:
-            return validate_boundary_mode(value)
-        except GBMakerConstructionValueError as exc:
-            raise GBMakerValueError(str(exc)) from exc
+        return GBMaker.__translate_construction_error(validate_boundary_mode, value)
 
     @staticmethod
     def __validate_exact_limit(value: object, name: str) -> int:
@@ -791,10 +804,9 @@ class GBMaker:
 
         Thin wrapper delegating to ``GBOpt.gbmaker.config.validate_exact_limit``.
         """
-        try:
-            return validate_exact_limit(value, name)
-        except GBMakerConstructionValueError as exc:
-            raise GBMakerValueError(str(exc)) from exc
+        return GBMaker.__translate_construction_error(
+            validate_exact_limit, value, name
+        )
 
     @staticmethod
     def __reduce_integer_row(row: np.ndarray) -> np.ndarray:
@@ -3016,9 +3028,8 @@ class GBMaker:
 
         Thin wrapper delegating to the single pure implementation in
         ``GBOpt.gbmaker.config._validate_scalar`` (also used by
-        ``normalize_legacy_config`` for the legacy constructor), translating its
-        ``GBMakerConstructionTypeError``/``GBMakerConstructionValueError`` back to the
-        established public ``GBMakerTypeError``/``GBMakerValueError``.
+        ``normalize_legacy_config`` for the legacy constructor), via
+        ``__translate_construction_error``.
 
         :param value: The value to validate.
         :param expected_types: Single type or tuple containing the valid types for
@@ -3036,19 +3047,15 @@ class GBMaker:
             the specified parameter.
         :return: The validated value.
         """
-        try:
-            return _validate_scalar(
-                value,
-                expected_types,
-                parameter_name,
-                nonnegative=positive,
-                expected_length=expected_length,
-                strictly_positive=strictly_positive,
-            )
-        except GBMakerConstructionTypeError as exc:
-            raise GBMakerTypeError(str(exc)) from exc
-        except GBMakerConstructionValueError as exc:
-            raise GBMakerValueError(str(exc)) from exc
+        return self.__translate_construction_error(
+            _validate_scalar,
+            value,
+            expected_types,
+            parameter_name,
+            nonnegative=positive,
+            expected_length=expected_length,
+            strictly_positive=strictly_positive,
+        )
 
     # Public methods
     def get_supercell(self, corners: np.ndarray) -> np.ndarray:
