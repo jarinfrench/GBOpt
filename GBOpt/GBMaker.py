@@ -6,12 +6,14 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from numbers import Number
 from typing import Any
 
 import numpy as np
 
 from GBOpt.BoundarySpec import (
+    BoundaryEmbedding,
     CSLApproxSpec,
     CSLExactSpec,
     FiveDOFSpec,
@@ -41,12 +43,7 @@ from GBOpt.gbmaker.dimension import (
     plan_dimensions,
     plan_periodic_spacing,
 )
-from GBOpt.gbmaker.geometry import (
-    _box_periodic_basis,
-    _complete_origin_atom_mask,
-    _scaled_periodic_basis_vector,
-    _triclinic_tilt_params,
-)
+from GBOpt.gbmaker.geometry import _triclinic_tilt_params
 from GBOpt.gbmaker.geometry import wrap_reduced_coordinate as _wrap_reduced_coordinate
 from GBOpt.gbmaker.orientation import (
     _decompose_misorientation,
@@ -94,6 +91,101 @@ class GBMakerTypeError(GBMakerError, TypeError):
 
 class GBMakerValueError(GBMakerError, ValueError):
     """Exception raised when an invalid value is assigned to a GBMaker attribute."""
+
+
+@dataclass
+class _MakerConfig:
+    """Canonical validated top-level ``GBMaker`` build configuration.
+
+    Grouping-only: every field arrives already validated by ``GBMaker``'s own
+    per-field validators (``__validate`` and its siblings), which are deliberately not
+    the same validation rules as ``GBOpt.gbmaker.types``'s own pipeline dataclasses
+    (``MaterialState``/``GBBuildConfig``) -- e.g. ``a0`` is accepted at exactly ``0``
+    here, matching the legacy setter's ``nonnegative`` check, where ``MaterialState``
+    requires it strictly positive (see ``CLAUDE.md``'s R04 ``positive=True`` history
+    and ``REFACTOR_CLEANUP.md``). This dataclass performs no independent validation of
+    its own and is mutated in place by property setters, matching the flat instance
+    attributes it replaces field-for-field.
+
+    :param radius: Atom radius (``a0 * unit_cell.radius``), computed once at
+        construction and, matching the pre-R10 flat ``self.__radius`` attribute it
+        replaces, never recomputed by any property setter (including ``a0``'s and
+        ``structure``'s) even though both change quantities it depends on.
+    """
+
+    a0: float
+    structure: str
+    unit_cell: UnitCell
+    gb_thickness: float
+    repeat_factor: list[int]
+    x_dim_min: float
+    interaction_distance: float
+    gb_id: int
+    epsilon: float
+    mismatch_tol: float | None
+    mismatch_max_cells: int
+    strain_grain: str
+    radius: float
+
+
+@dataclass
+class _BoundaryState:
+    """Canonical resolved orientation, periodicity, and vacuum-topology state.
+
+    Grouping-only, like ``_MakerConfig``: fields are mutated in place by the existing
+    private orchestration methods (``__assign_orientations``,
+    ``__calculate_periodic_spacing``, ``__update_dims``) exactly as the flat instance
+    attributes they replace were, so every field defaults to a placeholder and is
+    filled in during ``__init__`` in the same order the old flat assignments ran.
+    """
+
+    embedding: BoundaryEmbedding | None = None
+    misorientation: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    inclination: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    R_mis: np.ndarray = field(default_factory=lambda: np.eye(3))
+    R_incl: np.ndarray = field(default_factory=lambda: np.eye(3))
+    R_left: np.ndarray = field(default_factory=lambda: np.eye(3))
+    R_right: np.ndarray = field(default_factory=lambda: np.eye(3))
+    left_periodic_miller_rows: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3))
+    )
+    right_periodic_miller_rows: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3))
+    )
+    inplane_periodic: tuple[bool, bool] = (True, True)
+    left_x: float = 0.0
+    right_x: float = 0.0
+    x_dim: float = 0.0
+    y_dim: float = 0.0
+    z_dim: float = 0.0
+    spacing: dict = field(default_factory=dict)
+    # Maps axis name ("y" or "z") to commensurate repeat metadata when mismatch
+    # accommodation is active; empty when mismatch_tol is None.
+    strain_accommodation: dict[str, AxisAccommodation] = field(default_factory=dict)
+    vacuum_thickness: float = 0.0
+    normal_topology: BoundaryNormalTopology = BoundaryNormalTopology.PERIODIC_BICRYSTAL
+    box_dims: np.ndarray = field(default_factory=lambda: np.empty((3, 2)))
+
+
+@dataclass
+class _AssembledResult:
+    """Canonical cached bicrystal-assembly output.
+
+    Grouping-only, like ``_MakerConfig``/``_BoundaryState``: mirrors the four
+    structured atom arrays ``__generate_gb`` used to mirror onto separate flat
+    instance attributes (``__left_grain``/``__right_grain``/``__whole_system``/
+    ``__gb_region``). Not the pipeline's own ``GBOpt.gbmaker.types.BicrystalResult``
+    directly: that type also carries ``box_dims``/``normal_topology``/``gb_id`` (kept
+    on ``_BoundaryState``/``_MakerConfig`` here instead, since those are known before
+    the first bicrystal assembly ever runs) and is frozen, which would require
+    reconstructing a new instance on every ``vacuum_thickness``-setter incremental atom
+    shift rather than mutating the existing arrays' contents in place as today.
+    """
+
+    atoms: np.ndarray = field(default_factory=lambda: np.empty(0))
+    left_atoms: np.ndarray = field(default_factory=lambda: np.empty(0))
+    right_atoms: np.ndarray = field(default_factory=lambda: np.empty(0))
+    gb_region_atoms: np.ndarray = field(default_factory=lambda: np.empty(0))
 
 
 def _find_commensurate_pair(
@@ -228,10 +320,40 @@ class GBMaker:
         except GBMakerConstructionValueError as exc:
             raise GBMakerValueError(str(exc)) from exc
 
-        self.__a0 = config.material.a0
-        self.__structure = config.material.structure
-        self.__gb_thickness = config.gb_thickness
-        self.__epsilon = config.epsilon
+        unit_cell = config.material.unit_cell
+        if unit_cell is None:
+            # normalize_legacy_config always resolves a UnitCell via
+            # resolve_material_state; this is an assertion against that invariant, not
+            # a reachable runtime path, so a clear domain error beats a raw
+            # AttributeError below if it were ever violated.
+            raise GBMakerValueError("material.unit_cell was not resolved")
+
+        self._config = _MakerConfig(
+            a0=config.material.a0,
+            structure=config.material.structure,
+            unit_cell=unit_cell,
+            gb_thickness=config.gb_thickness,
+            repeat_factor=list(config.repeat_factor),
+            x_dim_min=config.x_dim_min,
+            interaction_distance=config.interaction_distance,
+            gb_id=config.gb_id,
+            epsilon=config.epsilon,
+            mismatch_tol=config.mismatch_tol,
+            mismatch_max_cells=config.mismatch_max_cells,
+            strain_grain=config.strain_grain,
+            radius=config.material.a0 * unit_cell.radius,
+        )
+        vacuum_thickness, normal_topology = _normalize_vacuum_topology(
+            config.vacuum,
+            tolerance=self._config.epsilon,
+        )
+        self._boundary = _BoundaryState(
+            embedding=_embedding,
+            vacuum_thickness=vacuum_thickness,
+            normal_topology=normal_topology,
+        )
+        self._result = _AssembledResult()
+
         self.__assign_orientations(
             self.__validate(
                 np.asarray(misorientation),
@@ -240,31 +362,11 @@ class GBMaker:
                 expected_length=5,
             )
         )
-        self.__repeat_factor = list(config.repeat_factor)
-        self.__x_dim_min = config.x_dim_min
-        self.__vacuum_thickness, self.__normal_topology = (
-            _normalize_vacuum_topology(
-                config.vacuum,
-                tolerance=self.__epsilon,
-            )
-        )
-        self.__interaction_distance = config.interaction_distance
-        self.__id = config.gb_id
-        self.__inplane_periodic = (True, True)
-        self.__embedding = _embedding
-        self.__mismatch_tol = config.mismatch_tol
-        self.__mismatch_max_cells = config.mismatch_max_cells
-        self.__strain_grain = config.strain_grain
-        # Maps axis name ("y" or "z") to commensurate repeat metadata when
-        # mismatch accommodation is active; empty when mismatch_tol is None.
-        self.__strain_accommodation: dict[str, AxisAccommodation] = {}
 
-        self.__unit_cell = config.material.unit_cell
-        self.__spacing = self.__calculate_periodic_spacing()  # periodic distances dict
+        self._boundary.spacing = self.__calculate_periodic_spacing()
         self.__update_dims()
 
-        self.__radius = config.material.a0 * self.__unit_cell.radius  # atom radius
-        self.__box_dims = self.__calculate_box_dimensions()
+        self._boundary.box_dims = self.__calculate_box_dimensions()
 
     @classmethod
     def _from_boundary_embedding(
@@ -583,10 +685,10 @@ class GBMaker:
             Note that misorientation is in the ZXZ Euler angle format.
         """
         (
-            self.__misorientation,
-            self.__inclination,
-            self.__Rmis,
-            self.__Rincl,
+            self._boundary.misorientation,
+            self._boundary.inclination,
+            self._boundary.R_mis,
+            self._boundary.R_incl,
         ) = self.__translate_construction_error(
             _decompose_misorientation, misorientation
         )
@@ -600,7 +702,10 @@ class GBMaker:
         """
         return np.array(
             _plan_box_dims(
-                self.__x_dim, self.__vacuum_thickness, self.__y_dim, self.__z_dim
+                self._boundary.x_dim,
+                self._boundary.vacuum_thickness,
+                self._boundary.y_dim,
+                self._boundary.z_dim,
             )
         )
 
@@ -615,10 +720,10 @@ class GBMaker:
         """
         return self.__translate_construction_error(
             MaterialState,
-            a0=self.__a0,
-            structure=self.__structure,
-            atom_types=tuple(self.__unit_cell.names()),
-            unit_cell=self.__unit_cell,
+            a0=self._config.a0,
+            structure=self._config.structure,
+            atom_types=tuple(self._config.unit_cell.names()),
+            unit_cell=self._config.unit_cell,
         )
 
     def __generate_gb(self) -> None:
@@ -632,8 +737,8 @@ class GBMaker:
         remains available only to the floating path. Exact decorated grains retain
         every enumerated site and are assembled without x-layer deletion.
 
-        :return: ``None``. Updates ``self.__left_grain``, ``self.__right_grain``,
-            ``self.__whole_system``, and ``self.__gb_region``.
+        :return: ``None``. Updates ``self._result``'s ``left_atoms``, ``right_atoms``,
+            ``atoms``, and ``gb_region_atoms``.
         :raises GBMakerValueError: If exact grain generation requires missing P/Q data,
             if float-path gap equalization lacks right-grain build metadata, if an
             exact grain crosses the central or periodic x boundary, or if a downstream
@@ -642,29 +747,29 @@ class GBMaker:
         result = self.__translate_construction_error(
             assemble_bicrystal,
             material=self.__material_state(),
-            embedding=self.__embedding,
-            R_left=self.__R_left,
-            R_right=self.__R_right,
-            left_periodic_miller_rows=self.__left_periodic_miller_rows,
-            right_periodic_miller_rows=self.__right_periodic_miller_rows,
-            left_x=self.__left_x,
-            right_x=self.__right_x,
-            x_dim=self.__x_dim,
-            vacuum_thickness=self.__vacuum_thickness,
-            inplane_periodic=self.__inplane_periodic,
-            inplane_box_lengths=(self.__y_dim, self.__z_dim),
-            epsilon=self.__epsilon,
-            strain_accommodation=self.__strain_accommodation,
-            gb_thickness=self.__gb_thickness,
-            box_dims=self.__box_dims,
-            normal_topology=self.__normal_topology,
-            gb_id=self.__id,
+            embedding=self._boundary.embedding,
+            R_left=self._boundary.R_left,
+            R_right=self._boundary.R_right,
+            left_periodic_miller_rows=self._boundary.left_periodic_miller_rows,
+            right_periodic_miller_rows=self._boundary.right_periodic_miller_rows,
+            left_x=self._boundary.left_x,
+            right_x=self._boundary.right_x,
+            x_dim=self._boundary.x_dim,
+            vacuum_thickness=self._boundary.vacuum_thickness,
+            inplane_periodic=self._boundary.inplane_periodic,
+            inplane_box_lengths=(self._boundary.y_dim, self._boundary.z_dim),
+            epsilon=self._config.epsilon,
+            strain_accommodation=self._boundary.strain_accommodation,
+            gb_thickness=self._config.gb_thickness,
+            box_dims=self._boundary.box_dims,
+            normal_topology=self._boundary.normal_topology,
+            gb_id=self._config.gb_id,
         )
 
-        self.__left_grain = result.left_atoms
-        self.__right_grain = result.right_atoms
-        self.__whole_system = result.atoms
-        self.__gb_region = result.gb_region_atoms
+        self._result.left_atoms = result.left_atoms
+        self._result.right_atoms = result.right_atoms
+        self._result.atoms = result.atoms
+        self._result.gb_region_atoms = result.gb_region_atoms
 
     def __calculate_periodic_spacing(self, threshold: float = None) -> dict:
         """
@@ -676,7 +781,7 @@ class GBMaker:
             directions for the given misorientation.
         """
         if threshold is None:
-            threshold = self.__a0 * 15
+            threshold = self._config.a0 * 15
 
         # Rotation-matrix and periodic-Miller-row assignment, and in-plane periodicity
         # determination, are a pure construction stage; see
@@ -684,18 +789,18 @@ class GBMaker:
         # routed through integer-row approximation there.
         orientation = self.__translate_construction_error(
             resolve_orientation,
-            np.hstack((self.__misorientation, self.__inclination)),
-            embedding=self.__embedding,
-            a0=self.__a0,
+            np.hstack((self._boundary.misorientation, self._boundary.inclination)),
+            embedding=self._boundary.embedding,
+            a0=self._config.a0,
             threshold=threshold,
         )
-        self.__Rmis = orientation.R_mis
-        self.__Rincl = orientation.R_incl
-        self.__R_left = orientation.R_left
-        self.__R_right = orientation.R_right
-        self.__left_periodic_miller_rows = orientation.left_periodic_miller_rows
-        self.__right_periodic_miller_rows = orientation.right_periodic_miller_rows
-        self.__inplane_periodic = orientation.inplane_periodic
+        self._boundary.R_mis = orientation.R_mis
+        self._boundary.R_incl = orientation.R_incl
+        self._boundary.R_left = orientation.R_left
+        self._boundary.R_right = orientation.R_right
+        self._boundary.left_periodic_miller_rows = orientation.left_periodic_miller_rows
+        self._boundary.right_periodic_miller_rows = orientation.right_periodic_miller_rows
+        self._boundary.inplane_periodic = orientation.inplane_periodic
 
         # Periodic-spacing and boundary-normal x-extent arithmetic is a pure
         # construction stage; see ``GBOpt.gbmaker.dimension.plan_periodic_spacing``.
@@ -703,19 +808,19 @@ class GBMaker:
         # (including, on the legacy/five-DOF path, its own threshold warning); this
         # only reapplies the resulting flags to the returned spacing values used for
         # box-dimension planning.
-        spacing, self.__left_x, self.__right_x, self.__x_dim = (
+        spacing, self._boundary.left_x, self._boundary.right_x, self._boundary.x_dim = (
             self.__translate_construction_error(
                 plan_periodic_spacing,
-                a0=self.__a0,
-                left_periodic_miller_rows=self.__left_periodic_miller_rows,
-                right_periodic_miller_rows=self.__right_periodic_miller_rows,
-                x_dim_min=self.__x_dim_min,
-                epsilon=self.__epsilon,
-                inplane_periodic=self.__inplane_periodic,
+                a0=self._config.a0,
+                left_periodic_miller_rows=self._boundary.left_periodic_miller_rows,
+                right_periodic_miller_rows=self._boundary.right_periodic_miller_rows,
+                x_dim_min=self._config.x_dim_min,
+                epsilon=self._config.epsilon,
+                inplane_periodic=self._boundary.inplane_periodic,
                 threshold=threshold,
                 legacy_periodicity_heuristic=(
-                    self.__embedding is None
-                    or self.__embedding.source == "five_dof"
+                    self._boundary.embedding is None
+                    or self._boundary.embedding.source == "five_dof"
                 ),
             )
         )
@@ -736,15 +841,15 @@ class GBMaker:
         """
         return self.__translate_construction_error(
             _triclinic_tilt_params,
-            inplane_periodic=self.__inplane_periodic,
-            left_periodic_miller_rows=self.__left_periodic_miller_rows,
-            right_periodic_miller_rows=self.__right_periodic_miller_rows,
-            R_left=self.__R_left,
-            R_right=self.__R_right,
-            conventional_basis=self.__unit_cell.conventional,
-            y_dim=self.__y_dim,
-            z_dim=self.__z_dim,
-            epsilon=self.__epsilon,
+            inplane_periodic=self._boundary.inplane_periodic,
+            left_periodic_miller_rows=self._boundary.left_periodic_miller_rows,
+            right_periodic_miller_rows=self._boundary.right_periodic_miller_rows,
+            R_left=self._boundary.R_left,
+            R_right=self._boundary.R_right,
+            conventional_basis=self._config.unit_cell.conventional,
+            y_dim=self._boundary.y_dim,
+            z_dim=self._boundary.z_dim,
+            epsilon=self._config.epsilon,
         )
 
     def __init_unit_cell(self, atom_types: str | tuple[str, ...]) -> UnitCell:
@@ -754,73 +859,8 @@ class GBMaker:
         :return: The unit cell initialized by structure.
         """
         unit_cell = UnitCell()
-        unit_cell.init_by_structure(self.__structure, self.__a0, atom_types)
+        unit_cell.init_by_structure(self._config.structure, self._config.a0, atom_types)
         return unit_cell
-
-    def __scaled_periodic_basis_vector(
-        self, period_vector: np.ndarray, box_length: float, axis_index: int
-    ) -> np.ndarray:
-        """
-        Scale a periodic basis vector so one axis projection matches the box length.
-
-        Thin wrapper delegating to
-        ``GBOpt.gbmaker.geometry._scaled_periodic_basis_vector``.
-
-        :param period_vector: Cartesian periodic basis vector.
-        :param box_length: Desired box length along the selected axis.
-        :param axis_index: Axis whose projection should match ``box_length``.
-        :return: Scaled periodic basis vector.
-        """
-        return self.__translate_construction_error(
-            _scaled_periodic_basis_vector, period_vector, box_length, axis_index
-        )
-
-    def __box_periodic_basis(self, primitive_periods: np.ndarray) -> np.ndarray:
-        """
-        Build the in-plane box basis from primitive periodic vectors.
-
-        Thin wrapper delegating to ``GBOpt.gbmaker.geometry._box_periodic_basis``.
-
-        :param primitive_periods: 2x3 array containing primitive y/z period vectors.
-        :return: 2x3 array containing the box basis vectors for y and z.
-        """
-        return self.__translate_construction_error(
-            _box_periodic_basis,
-            primitive_periods,
-            self.__inplane_periodic,
-            (self.__y_dim, self.__z_dim),
-            self.__epsilon,
-        )
-
-    def __complete_origin_atom_mask(
-        self,
-        atom_mask: np.ndarray,
-        origin_ids: np.ndarray,
-        basis_size: int,
-    ) -> np.ndarray:
-        """Promote an atom-level mask to a complete-origin atom mask.
-
-        Thin wrapper delegating to
-        ``GBOpt.gbmaker.geometry._complete_origin_atom_mask``.
-
-        An origin is retained only when exactly ``basis_size`` atoms are present for
-        that origin and every atom from that origin passes ``atom_mask``. The returned
-        mask is parallel to ``atom_mask`` and ``origin_ids``; retained atoms are marked
-        ``True``.
-
-        :param atom_mask: One-dimensional boolean atom-level mask.
-        :param origin_ids: One-dimensional integer array parallel to ``atom_mask``. Each
-            value identifies the conventional-cell origin that produced the
-            corresponding atom.
-        :param basis_size: Number of atoms expected in one complete origin group.
-        :return: Boolean atom-level mask that keeps only complete retained origins.
-        :raises GBMakerValueError: If the arrays are not one-dimensional and parallel,
-            if ``origin_ids`` is not integer-valued, or if ``basis_size`` is not a
-            positive integer.
-        """
-        return self.__translate_construction_error(
-            _complete_origin_atom_mask, atom_mask, origin_ids, basis_size
-        )
 
     def __update_dims(self) -> None:
         """Updates the y_dim and z_dim parameters after a relevant parameter has been
@@ -831,35 +871,36 @@ class GBMaker:
         ``GBOpt.gbmaker.dimension.plan_dimensions``.
         """
         use_exact = (
-            self.__embedding is not None
-            and self.__embedding.exact
-            and self.__embedding.P is not None
+            self._boundary.embedding is not None
+            and self._boundary.embedding.exact
+            and self._boundary.embedding.P is not None
         )
 
-        plan, (self.__repeat_factor[0], self.__repeat_factor[1]) = (
+        repeat_factor = self._config.repeat_factor
+        plan, (repeat_factor[0], repeat_factor[1]) = (
             self.__translate_construction_error(
                 plan_dimensions,
-                a0=self.__a0,
-                left_periodic_miller_rows=self.__left_periodic_miller_rows,
-                right_periodic_miller_rows=self.__right_periodic_miller_rows,
-                spacing_y=self.__spacing["y"],
-                spacing_z=self.__spacing["z"],
-                repeat_factor=tuple(self.__repeat_factor),
-                mismatch_tol=self.__mismatch_tol,
-                mismatch_max_cells=self.__mismatch_max_cells,
-                strain_grain=self.__strain_grain,
+                a0=self._config.a0,
+                left_periodic_miller_rows=self._boundary.left_periodic_miller_rows,
+                right_periodic_miller_rows=self._boundary.right_periodic_miller_rows,
+                spacing_y=self._boundary.spacing["y"],
+                spacing_z=self._boundary.spacing["z"],
+                repeat_factor=tuple(repeat_factor),
+                mismatch_tol=self._config.mismatch_tol,
+                mismatch_max_cells=self._config.mismatch_max_cells,
+                strain_grain=self._config.strain_grain,
                 require_exact_pair=use_exact,
-                interaction_distance=self.__interaction_distance,
-                x_dim=self.__x_dim,
-                vacuum_thickness=self.__vacuum_thickness,
-                normal_topology=self.__normal_topology,
-                epsilon=self.__epsilon,
+                interaction_distance=self._config.interaction_distance,
+                x_dim=self._boundary.x_dim,
+                vacuum_thickness=self._boundary.vacuum_thickness,
+                normal_topology=self._boundary.normal_topology,
+                epsilon=self._config.epsilon,
             )
         )
-        self.__strain_accommodation = dict(plan.accommodation)
-        self.__y_dim = float(plan.box_dims[1][1])
-        self.__z_dim = float(plan.box_dims[2][1])
-        self.__box_dims = np.array(plan.box_dims, dtype=float)
+        self._boundary.strain_accommodation = dict(plan.accommodation)
+        self._boundary.y_dim = float(plan.box_dims[1][1])
+        self._boundary.z_dim = float(plan.box_dims[2][1])
+        self._boundary.box_dims = np.array(plan.box_dims, dtype=float)
 
         self.__generate_gb()
 
@@ -915,7 +956,7 @@ class GBMaker:
             the supercell.
         """
         # Unit cell as structured array
-        unit_cell = self.__unit_cell.asarray()
+        unit_cell = self._config.unit_cell.asarray()
         supercell = np.tile(unit_cell, len(corners))
         translations = np.repeat(corners, len(unit_cell), axis=0)
         supercell["x"] += translations[:, 0]
@@ -929,7 +970,7 @@ class GBMaker:
 
         :param threshold: The maximum allowed value that any spacing can take
         """
-        self.__spacing = self.__calculate_periodic_spacing(threshold)
+        self._boundary.spacing = self.__calculate_periodic_spacing(threshold)
         self.__update_dims()
 
     def write_lammps(
@@ -961,8 +1002,8 @@ class GBMaker:
         if not isinstance(file_name, str):
             raise GBMakerTypeError("file_name must be of type str")
         if atoms is None and box_sizes is None:
-            atoms = self.__whole_system
-            box_sizes = self.__box_dims
+            atoms = self._result.atoms
+            box_sizes = self._boundary.box_dims
         elif (atoms is None and box_sizes is not None) or (
             atoms is not None and box_sizes is None
         ):
@@ -984,7 +1025,7 @@ class GBMaker:
             ct, st = math.cos(theta), math.sin(theta)
             Rx = np.array([[1, 0, 0], [0, ct, -st], [0, st, ct]])
             # Copy before rotating in place: 'atoms' may be the caller's own array (or
-            # self.__whole_system), which write_lammps must not mutate as a side effect.
+            # self._result.atoms), which write_lammps must not mutate as a side effect.
             atoms = atoms.copy()
             positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
             rotated_positions = (Rx @ positions.T).T
@@ -1002,7 +1043,7 @@ class GBMaker:
                 type_as_int=type_as_int,
                 precision=precision,
                 charges=charges,
-                type_map=self.__unit_cell.type_map,
+                type_map=self._config.unit_cell.type_map,
                 triclinic=triclinic,
             )
         except LammpsWriteError as exc:
@@ -1012,55 +1053,55 @@ class GBMaker:
     # automatically taken care of.
     @property
     def a0(self) -> float:
-        return self.__a0
+        return self._config.a0
 
     @a0.setter
     def a0(self, value: Number) -> None:
-        atom_types = tuple(self.__unit_cell.names())
-        self.__a0 = self.__validate(value, float, "a0", nonnegative=True)
-        self.__unit_cell = self.__init_unit_cell(atom_types)
+        atom_types = tuple(self._config.unit_cell.names())
+        self._config.a0 = self.__validate(value, float, "a0", nonnegative=True)
+        self._config.unit_cell = self.__init_unit_cell(atom_types)
         self.update_spacing()
 
     @property
     def epsilon(self) -> float:
-        return self.__epsilon
+        return self._config.epsilon
 
     @epsilon.setter
     def epsilon(self, value: Number) -> None:
-        self.__epsilon = self.__validate(
+        self._config.epsilon = self.__validate(
             value, Number, "epsilon", strictly_positive=True)
 
     @property
     def gb_thickness(self) -> float:
-        return self.__gb_thickness
+        return self._config.gb_thickness
 
     @gb_thickness.setter
     def gb_thickness(self, value: Number):
-        self.__gb_thickness = self.__validate(
+        self._config.gb_thickness = self.__validate(
             value, Number, "gb_thickness", nonnegative=True)
-        self.__box_dims = self.__calculate_box_dimensions()
+        self._boundary.box_dims = self.__calculate_box_dimensions()
 
     @property
     def id(self) -> int:
-        return self.__id
+        return self._config.gb_id
 
     @id.setter
     def id(self, value: int):
-        self.__id = self.__validate(value, int, "id", nonnegative=True)
+        self._config.gb_id = self.__validate(value, int, "id", nonnegative=True)
 
     @property
     def interaction_distance(self) -> float:
-        return self.__interaction_distance
+        return self._config.interaction_distance
 
     @interaction_distance.setter
     def interaction_distance(self, value: Number) -> None:
-        self.__interaction_distance = self.__validate(
+        self._config.interaction_distance = self.__validate(
             value, Number, "interaction_distance", nonnegative=True)
         self.__update_dims()
 
     @property
     def misorientation(self) -> np.ndarray:
-        return np.hstack((self.__misorientation, self.__inclination))
+        return np.hstack((self._boundary.misorientation, self._boundary.inclination))
 
     @misorientation.setter
     def misorientation(self, value: np.ndarray):
@@ -1070,129 +1111,131 @@ class GBMaker:
         self.__assign_orientations(misorientation)
         # Discard any active embedding so update_spacing uses the new Euler
         # angles rather than the stale embedding-derived rotation matrices.
-        self.__embedding = None
+        self._boundary.embedding = None
         self.update_spacing()
 
     @property
     def repeat_factor(self) -> int:
-        return self.__repeat_factor
+        return self._config.repeat_factor
 
     @repeat_factor.setter
     def repeat_factor(self, value: int):
-        self.__repeat_factor = self.__validate(
+        self._config.repeat_factor = self.__validate(
             value, (int, Sequence), "repeat_factor", nonnegative=True)
         self.__update_dims()
 
     @property
     def structure(self) -> str:
-        return self.__structure
+        return self._config.structure
 
     @structure.setter
     def structure(self, value: str) -> None:
-        self.__structure = self.__validate(value, str, "structure")
-        if {self.__structure, value}.issubset({"fluorite", "rocksalt", "zincblende"}):
+        self._config.structure = self.__validate(value, str, "structure")
+        if {self._config.structure, value}.issubset(
+            {"fluorite", "rocksalt", "zincblende"}
+        ):
             raise GBMakerValueError(
-                f"Cannot estimate conversion from {self.__structure} to {value}"
+                f"Cannot estimate conversion from {self._config.structure} to {value}"
             )
         else:
-            atom_types = tuple(set(self.__unit_cell.names()))
+            atom_types = tuple(set(self._config.unit_cell.names()))
 
-        self.__unit_cell = self.__init_unit_cell(atom_types)
+        self._config.unit_cell = self.__init_unit_cell(atom_types)
 
     @property
     def vacuum_thickness(self) -> float:
-        return self.__vacuum_thickness
+        return self._boundary.vacuum_thickness
 
     @vacuum_thickness.setter
     def vacuum_thickness(self, value: Number):
-        old_vacuum = self.__vacuum_thickness
+        old_vacuum = self._boundary.vacuum_thickness
         vacuum_value = self.__validate(
             value, Number, "vacuum_thickness", nonnegative=True
         )
-        self.__vacuum_thickness, self.__normal_topology = (
+        self._boundary.vacuum_thickness, self._boundary.normal_topology = (
             _normalize_vacuum_topology(
                 vacuum_value,
-                tolerance=self.__epsilon,
+                tolerance=self._config.epsilon,
             )
         )
-        delta = self.__vacuum_thickness - old_vacuum
-        self.__left_grain["x"] += delta
-        self.__right_grain["x"] += delta
-        self.__whole_system["x"] += delta
-        self.__gb_region["x"] += delta
-        self.__box_dims = self.__calculate_box_dimensions()
+        delta = self._boundary.vacuum_thickness - old_vacuum
+        self._result.left_atoms["x"] += delta
+        self._result.right_atoms["x"] += delta
+        self._result.atoms["x"] += delta
+        self._result.gb_region_atoms["x"] += delta
+        self._boundary.box_dims = self.__calculate_box_dimensions()
 
     @property
     def x_dim_min(self) -> np.ndarray:
-        return self.__x_dim_min
+        return self._config.x_dim_min
 
     @x_dim_min.setter
     def x_dim_min(self, value: Number):
-        self.__x_dim_min = self.__validate(
+        self._config.x_dim_min = self.__validate(
             value, Number, "x_dim_min", nonnegative=True)
         self.update_spacing()
-        self.__box_dims = self.__calculate_box_dimensions()
+        self._boundary.box_dims = self.__calculate_box_dimensions()
 
     # Additional getters for other class properties
     @property
     def inplane_periodic(self) -> tuple[bool, bool]:
         """Read-only view of the in-plane periodicity flags (y, z)."""
-        return tuple(bool(v) for v in self.__inplane_periodic)
+        return tuple(bool(v) for v in self._boundary.inplane_periodic)
 
     @property
     def normal_topology(self) -> BoundaryNormalTopology:
         """Explicit physical topology along the boundary normal"""
-        return self.__normal_topology
+        return self._boundary.normal_topology
 
     @property
     def uses_exact_construction(self) -> bool:
         """Read-only flag indicating exact integer P/Q construction is active."""
         return bool(
-            self.__embedding is not None
-            and self.__embedding.exact
-            and self.__embedding.P is not None
+            self._boundary.embedding is not None
+            and self._boundary.embedding.exact
+            and self._boundary.embedding.P is not None
         )
 
     @property
     def box_dims(self) -> np.ndarray:
-        return self.__box_dims
+        return self._boundary.box_dims
 
     @property
     def whole_system(self) -> np.ndarray:
-        return self.__whole_system
+        return self._result.atoms
 
     @property
     def left_grain(self) -> np.ndarray:
-        return self.__left_grain
+        return self._result.left_atoms
 
     @property
     def radius(self) -> float:
-        return self.__radius
+        return self._config.radius
 
     @property
     def right_grain(self) -> np.ndarray:
-        return self.__right_grain
+        return self._result.right_atoms
 
     @property
     def gb_plane_x(self) -> float:
-        return self.__vacuum_thickness + self.__left_x
+        return self._boundary.vacuum_thickness + self._boundary.left_x
 
     @property
     def spacing(self) -> dict:
-        return self.__spacing
+        return self._boundary.spacing
 
     @property
     def unit_cell(self) -> UnitCell:
-        return self.__unit_cell
+        return self._config.unit_cell
 
     @property
     def x_dim(self) -> float:
-        return self.__x_dim
+        return self._boundary.x_dim
 
     @property
     def y_dim(self) -> float:
-        return self.__y_dim
+        return self._boundary.y_dim
 
     @property
     def z_dim(self) -> float:
-        return self.__z_dim
+        return self._boundary.z_dim

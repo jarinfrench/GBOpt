@@ -66,20 +66,20 @@ def _build_bicrystal_from_gbmaker(gb: GBMaker):
     return build_bicrystal(
         material=gb._GBMaker__material_state(),
         misorientation=np.hstack(
-            (gb._GBMaker__misorientation, gb._GBMaker__inclination)
+            (gb._boundary.misorientation, gb._boundary.inclination)
         ),
-        embedding=gb._GBMaker__embedding,
-        x_dim_min=gb._GBMaker__x_dim_min,
-        vacuum_thickness=gb._GBMaker__vacuum_thickness,
-        normal_topology=gb._GBMaker__normal_topology,
-        interaction_distance=gb._GBMaker__interaction_distance,
-        gb_thickness=gb._GBMaker__gb_thickness,
-        gb_id=gb._GBMaker__id,
-        epsilon=gb._GBMaker__epsilon,
-        repeat_factor=tuple(gb._GBMaker__repeat_factor),
-        mismatch_tol=gb._GBMaker__mismatch_tol,
-        mismatch_max_cells=gb._GBMaker__mismatch_max_cells,
-        strain_grain=gb._GBMaker__strain_grain,
+        embedding=gb._boundary.embedding,
+        x_dim_min=gb._config.x_dim_min,
+        vacuum_thickness=gb._boundary.vacuum_thickness,
+        normal_topology=gb._boundary.normal_topology,
+        interaction_distance=gb._config.interaction_distance,
+        gb_thickness=gb._config.gb_thickness,
+        gb_id=gb._config.gb_id,
+        epsilon=gb._config.epsilon,
+        repeat_factor=tuple(gb._config.repeat_factor),
+        mismatch_tol=gb._config.mismatch_tol,
+        mismatch_max_cells=gb._config.mismatch_max_cells,
+        strain_grain=gb._config.strain_grain,
     )
 
 
@@ -316,7 +316,7 @@ def test_build_bicrystal_matches_legacy_gbmaker_construction_float_path():
     assert np.array_equal(result.atoms, gb.whole_system)
     assert np.array_equal(result.left_atoms, gb.left_grain)
     assert np.array_equal(result.right_atoms, gb.right_grain)
-    assert np.array_equal(result.gb_region_atoms, gb._GBMaker__gb_region)
+    assert np.array_equal(result.gb_region_atoms, gb._result.gb_region_atoms)
     assert np.array_equal(result.box_dims, gb.box_dims)
     assert result.normal_topology is gb.normal_topology
     assert result.gb_id == gb.id
@@ -343,7 +343,7 @@ def test_build_bicrystal_matches_gbmaker_construction_exact_path():
     assert np.array_equal(result.atoms, gb.whole_system)
     assert np.array_equal(result.left_atoms, gb.left_grain)
     assert np.array_equal(result.right_atoms, gb.right_grain)
-    assert np.array_equal(result.gb_region_atoms, gb._GBMaker__gb_region)
+    assert np.array_equal(result.gb_region_atoms, gb._result.gb_region_atoms)
     assert np.array_equal(result.box_dims, gb.box_dims)
 
 
