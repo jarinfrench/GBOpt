@@ -258,6 +258,35 @@ def _readonly_float_matrix(value: object, shape: tuple[int, ...], name: str) -> 
     return arr
 
 
+def _readonly_miller_matrix(value: object, name: str) -> np.ndarray:
+    """Return an owned read-only 3 by 3 object-dtype integer Miller-row matrix.
+
+    Object dtype is used, rather than a fixed-width NumPy integer dtype, so exact
+    large Miller indices from an exact P/Q boundary embedding are preserved rather
+    than silently overflowed or truncated.
+
+    :param value: Array-like input.
+    :param name: Field name for diagnostics.
+    :return: Read-only 3 by 3 object-dtype array of Python ``int`` entries.
+    :raises GBMakerConstructionValueError: If the shape is not 3 by 3 or an entry is
+        not an integer.
+    """
+    try:
+        arr = np.array(value, dtype=object, copy=True)
+    except (TypeError, ValueError) as exc:
+        raise GBMakerConstructionValueError(f"{name} must be a 3 by 3 array-like") from exc
+    if arr.shape != (3, 3):
+        raise GBMakerConstructionValueError(f"{name} must have shape (3, 3); got {arr.shape}")
+    for row in arr:
+        for entry in row:
+            if isinstance(entry, (bool, np.bool_)) or not isinstance(entry, (int, np.integer)):
+                raise GBMakerConstructionValueError(
+                    f"{name} entries must be integers; got {entry!r}"
+                )
+    arr.setflags(write=False)
+    return arr
+
+
 def _readonly_box_dims(value: object, name: str = "box_dims") -> np.ndarray:
     """Return an owned read-only 3 by 2 box-bounds array with ``lo < hi`` per axis.
 
@@ -428,22 +457,70 @@ class ResolvedBoundaryInput:
 
 @dataclass(frozen=True, slots=True)
 class OrientationState:
-    """Per-grain orientation state derived from a resolved boundary embedding.
+    """Per-grain orientation state resolved from a misorientation array and an
+    optional boundary embedding.
 
-    :param embedding: Canonical boundary embedding carrying left/right rotations and,
-        for exact construction paths, integer P/Q orientation matrices.
+    :param embedding: Boundary embedding carrying left/right rotations and, for exact
+        construction paths, integer P/Q orientation matrices. ``None`` on the legacy
+        Euler-angle construction path, which has no embedding.
+    :param misorientation: ZXZ misorientation Euler angles ``(alpha, beta, gamma)``
+        (radians).
+    :param inclination: Inclination rotations about y and z, ``(theta, phi)``
+        (radians).
+    :param R_mis: Misorientation rotation matrix derived from ``misorientation``.
+    :param R_incl: Inclination rotation matrix derived from ``inclination``.
+    :param R_left: Left-grain rotation matrix.
+    :param R_right: Right-grain rotation matrix.
+    :param left_periodic_miller_rows: Left-grain 3 by 3 integer periodic Miller-row
+        matrix. Row 0 is the boundary-normal (x) row; rows 1-2 are the in-plane (y, z)
+        primitive period rows. Exact P/Q rows are carried through unchanged; otherwise
+        this is an integer approximation of ``R_left``.
+    :param right_periodic_miller_rows: Right-grain counterpart of
+        ``left_periodic_miller_rows``, approximating or carrying through ``R_right``.
     :param inplane_periodic: Per-axis in-plane periodicity flags ``(y, z)``.
     :param normal_topology: Physical topology along the grain-boundary normal.
     """
 
-    embedding: BoundaryEmbedding
+    embedding: BoundaryEmbedding | None
+    misorientation: NDArray[np.float64] = field(default_factory=lambda: np.zeros(3))
+    inclination: NDArray[np.float64] = field(default_factory=lambda: np.zeros(2))
+    R_mis: NDArray[np.float64] = field(default_factory=lambda: np.eye(3))
+    R_incl: NDArray[np.float64] = field(default_factory=lambda: np.eye(3))
+    R_left: NDArray[np.float64] = field(default_factory=lambda: np.eye(3))
+    R_right: NDArray[np.float64] = field(default_factory=lambda: np.eye(3))
+    left_periodic_miller_rows: NDArray[np.object_] = field(
+        default_factory=lambda: np.eye(3, dtype=object)
+    )
+    right_periodic_miller_rows: NDArray[np.object_] = field(
+        default_factory=lambda: np.eye(3, dtype=object)
+    )
     inplane_periodic: tuple[bool, bool] = (True, True)
     normal_topology: BoundaryNormalTopology = BoundaryNormalTopology.PERIODIC_BICRYSTAL
 
     def __post_init__(self) -> None:
         """Validate and freeze orientation-state fields."""
-        if not isinstance(self.embedding, BoundaryEmbedding):
-            raise GBMakerConstructionTypeError("embedding must be a BoundaryEmbedding")
+        if self.embedding is not None and not isinstance(self.embedding, BoundaryEmbedding):
+            raise GBMakerConstructionTypeError("embedding must be a BoundaryEmbedding or None")
+        object.__setattr__(
+            self, "misorientation", _readonly_float_matrix(self.misorientation, (3,), "misorientation")
+        )
+        object.__setattr__(
+            self, "inclination", _readonly_float_matrix(self.inclination, (2,), "inclination")
+        )
+        object.__setattr__(self, "R_mis", _readonly_float_matrix(self.R_mis, (3, 3), "R_mis"))
+        object.__setattr__(self, "R_incl", _readonly_float_matrix(self.R_incl, (3, 3), "R_incl"))
+        object.__setattr__(self, "R_left", _readonly_float_matrix(self.R_left, (3, 3), "R_left"))
+        object.__setattr__(self, "R_right", _readonly_float_matrix(self.R_right, (3, 3), "R_right"))
+        object.__setattr__(
+            self,
+            "left_periodic_miller_rows",
+            _readonly_miller_matrix(self.left_periodic_miller_rows, "left_periodic_miller_rows"),
+        )
+        object.__setattr__(
+            self,
+            "right_periodic_miller_rows",
+            _readonly_miller_matrix(self.right_periodic_miller_rows, "right_periodic_miller_rows"),
+        )
         try:
             y_periodic, z_periodic = self.inplane_periodic
         except (TypeError, ValueError) as exc:

@@ -1413,20 +1413,6 @@ class TestGBMaker(unittest.TestCase):
         self.assertGreater(gbm.box_dims[0][1], 50.0)
 
     # Tests for private methods
-    def test_approximate_rotation_matrix_as_int(self):
-        rotation_matrix = np.array([[0.70710678, 0.5, 0.5],
-                                    [0.70710678, -0.5, -0.5],
-                                    [0.0, 0.70710678, -0.70710678]])
-
-        approx_matrix = self.gbm._GBMaker__approximate_rotation_matrix_as_int(
-            rotation_matrix)
-
-        expected_matrix = np.array([[7,  5,  5],
-                                    [7, -5, -5],
-                                    [0,  1, -1]])
-
-        np.testing.assert_array_equal(approx_matrix, expected_matrix)
-
     def test_approximate_update_spacing_is_deterministic_without_input_changes(self):
         gbm = self._make_approximate_fixture()
         original_spacing = gbm.spacing.copy()
@@ -1603,78 +1589,6 @@ class TestGBMaker(unittest.TestCase):
         gbm.misorientation = np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0])
         expected = gbm.vacuum_thickness + gbm._GBMaker__left_x
         self.assertAlmostEqual(gbm.gb_plane_x, expected, places=10)
-
-
-class TestGBMakerIntRotationHelpers(unittest.TestCase):
-    def setUp(self):
-        a0 = 3.61
-        theta = math.radians(36.868698)
-        misorientation = np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0])
-        self.gbm = _make_approximate_gb(
-            a0,
-            "fcc",
-            10.0,
-            misorientation,
-            "Cu",
-            repeat_factor=(3, 9),
-        )
-
-    # __reduce_integer_row
-    def test_reduce_integer_row_basic(self):
-        row = np.array([4, 6, 2])
-        result = self.gbm._GBMaker__reduce_integer_row(row)
-        np.testing.assert_array_equal(result, np.array([2, 3, 1]))
-
-    def test_reduce_integer_row_already_reduced(self):
-        row = np.array([1, 2, 3])
-        result = self.gbm._GBMaker__reduce_integer_row(row)
-        np.testing.assert_array_equal(result, np.array([1, 2, 3]))
-
-    def test_reduce_integer_row_all_zeros(self):
-        row = np.array([0, 0, 0])
-        result = self.gbm._GBMaker__reduce_integer_row(row)
-        np.testing.assert_array_equal(result, np.array([0, 0, 0]))
-
-    def test_reduce_integer_row_with_negatives(self):
-        row = np.array([-4, 6, -2])
-        result = self.gbm._GBMaker__reduce_integer_row(row)
-        np.testing.assert_array_equal(result, np.array([-2, 3, -1]))
-
-    # __row_angle_error_deg
-    def test_row_angle_error_parallel(self):
-        ref = np.array([1.0, 0.0, 0.0])
-        cand = np.array([5, 0, 0])
-        err = self.gbm._GBMaker__row_angle_error_deg(ref, cand)
-        self.assertAlmostEqual(err, 0.0, places=10)
-
-    def test_row_angle_error_perpendicular(self):
-        ref = np.array([1.0, 0.0, 0.0])
-        cand = np.array([0, 1, 0])
-        err = self.gbm._GBMaker__row_angle_error_deg(ref, cand)
-        self.assertAlmostEqual(err, 90.0, places=10)
-
-    def test_row_angle_error_antiparallel(self):
-        ref = np.array([1.0, 0.0, 0.0])
-        cand = np.array([-1, 0, 0])
-        err = self.gbm._GBMaker__row_angle_error_deg(ref, cand)
-        self.assertAlmostEqual(err, 180, places=10)
-
-    def test_row_angle_error_zero_vector(self):
-        ref = np.array([1.0, 0.0, 0.0])
-        cand = np.array([0, 0, 0])
-        err = self.gbm._GBMaker__row_angle_error_deg(ref, cand)
-        self.assertEqual(err, 180.0)
-
-    # __approximate_rotation_matrix_as_int - row error tolerance
-    def test_approx_matrix_sigma5_within_tolerance(self):
-        """Sigma5 [001] 36.87 - all rows must be within 0.5 of the float matrix."""
-        from scipy.spatial.transform import Rotation
-        theta = math.radians(36.869898)
-        R = Rotation.from_euler("z", theta).as_matrix()
-        approx = self.gbm._GBMaker__approximate_rotation_matrix_as_int(R)
-        for ref_row, approx_row in zip(R, approx.astype(float)):
-            err = self.gbm._GBMaker__row_angle_error_deg(ref_row, approx_row)
-            self.assertLessEqual(err, 0.5)
 
 
 class TestGBMakerScaledPeriodicBasisVector(unittest.TestCase):

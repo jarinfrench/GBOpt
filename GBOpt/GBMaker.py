@@ -11,7 +11,6 @@ from numbers import Number
 from typing import Any
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 from GBOpt.BoundarySpec import (
     CSLApproxSpec,
@@ -33,6 +32,12 @@ from GBOpt.gbmaker.config import (
     validate_mismatch_max_cells,
     validate_mismatch_tol,
     validate_strain_grain,
+)
+from GBOpt.gbmaker.orientation import (
+    _decompose_misorientation,
+    _reduce_integer_row,
+    _x_period,
+    resolve_orientation,
 )
 from GBOpt.gbmaker.types import (
     GBMakerConstructionTypeError,
@@ -528,10 +533,11 @@ class GBMaker:
 
         :param embedding: A BoundaryEmbedding produced by an input adapter. When
             ``embedding.exact`` is True and P/Q are present, the integer matrices are
-            used directly as the approx rotation matrices, bypassing
-            ``__approximate_rotation_matrix_as_int``. When ``embedding.exact`` is False,
-            R_left/R_right are used on the existing floating-point approximation path.
-            ``embedding.coherent`` sets ``inplane_periodic``.
+            used directly as the approx rotation matrices, bypassing integer-row
+            approximation (see ``GBOpt.gbmaker.orientation.resolve_orientation``).
+            When ``embedding.exact`` is False, R_left/R_right are used on the existing
+            floating-point approximation path. ``embedding.coherent`` sets
+            ``inplane_periodic``.
         :param a0: Crystal lattice parameter (Angstroms).
         :param structure: Crystal structure string.
         :param atom_types: Atom type string or tuple of strings.
@@ -812,118 +818,35 @@ class GBMaker:
     def __reduce_integer_row(row: np.ndarray) -> np.ndarray:
         """Reduce an integer row by its GCD.
 
+        Thin wrapper delegating to ``GBOpt.gbmaker.orientation._reduce_integer_row``,
+        kept for the geometry call sites (exact-repeat and box-basis direction
+        reduction) that have not yet moved out of ``GBMaker`` themselves.
+
         :param row: Integer row vector
         :return: GCD-reduced integer row vector
         """
-        reduced = np.asarray(row, dtype=int).copy()
-        non_zero = np.abs(reduced[reduced != 0])
-        if not non_zero.size:
-            return reduced
-        gcd = np.gcd.reduce(non_zero)
-        if gcd > 1:
-            reduced //= gcd
-        return reduced
-
-    @staticmethod
-    def __row_angle_error_deg(reference: np.ndarray, candidate: np.ndarray) -> float:
-        """Compute the angular error in degrees between two vectors.
-
-        :param reference: Reference float vector.
-        :param candidate: Candidate integer vector.
-        :return: Angle between the two vectors in degrees
-        """
-        ref_norm = np.linalg.norm(reference)
-        cand_norm = np.linalg.norm(candidate)
-        if np.isclose(ref_norm, 0) or np.isclose(cand_norm, 0):
-            return 180.0
-        cosine = np.dot(reference, candidate) / (ref_norm * cand_norm)
-        return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+        return _reduce_integer_row(row)
 
     # Private class methods
-    def __approximate_rotation_row_as_int(
-        self,
-        row: np.ndarray,
-        angle_tol_deg: float = 0.5,
-        max_scale: int = 10000,
-    ) -> np.ndarray:
-        """Approximate one floating-point rotation row by an integer Miller row.
-
-        Searches integer scale factors ``k`` from one through ``max_scale`` and rounds
-        ``k * row`` to the nearest integer row. Each candidate is primitive reduced, and
-        the first candidate within ``angle_tol_deg`` is returned after retaining the
-        smallest angular-error candidate encountered so far.
-
-        :param row: Floating-point row vector to approximate.
-        :param angle_tol_deg: Maximum allowed angular error in degrees. Keyword
-            parameter, optional, defaults to ``0.5``.
-        :param max_scale: Maximum integer scale factor to try. Keyword parameter,
-            optional, defaults to ``10000``.
-        :return: Primitive integer row approximating ``row``.
-        """
-        row = np.asarray(row, dtype=np.float64)
-        best: np.ndarray | None = None
-        best_err = 180.0
-        batch_size = 1000
-
-        for k_start in range(1, max_scale + 1, batch_size):
-            k_end = min(k_start + batch_size, max_scale + 1)
-
-            for k in range(k_start, k_end):
-                candidate = self.__reduce_integer_row(np.round(row * k).astype(int))
-                err = self.__row_angle_error_deg(row, candidate)
-
-                if best is None or err < best_err or (
-                    err == best_err
-                    and np.linalg.norm(candidate) < np.linalg.norm(best)
-                ):
-                    best_err = err
-                    best = candidate
-
-                if best_err <= angle_tol_deg:
-                    break
-
-            if best_err <= angle_tol_deg:
-                break
-
-        return best if best is not None else np.round(row).astype(int)
-
-    def __approximate_rotation_matrix_as_int(
-        self, m: np.ndarray, precision: float = 5
-    ) -> np.ndarray:
-        """Approximate a rotation matrix in integer format given the original matrix and
-        the desired precision.
-
-        :param m: The matrix to approximate
-        :param precision: Decimal precision to use during calculations, defaults to 5
-        :return: Integer approximation of the rotation matrix m
-        """
-
-        max_scale = max(1000, 10**max(int(precision)-1, 0))
-        return np.vstack(
-            [
-                self.__approximate_rotation_row_as_int(
-                    row, angle_tol_deg=0.5, max_scale=max_scale
-                )
-                for row in np.asarray(m, dtype=np.float64)
-            ]
-        ).astype(int)
-
     def __assign_orientations(self, misorientation: np.ndarray) -> None:
         """ Private method to separate the misorientation and inclination from the
         passed in misorientation array.
+
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.orientation._decompose_misorientation``.
 
         :param misorientation: Array containing the misorientation and inclination Euler
             angles. Misorientation is the first three, and inclination is the last two.
             Note that misorientation is in the ZXZ Euler angle format.
         """
-        self.__misorientation = misorientation[:3]
-        self.__inclination = misorientation[3:]
-        self.__Rmis = Rotation.from_euler(
-            "ZXZ", misorientation[:3]).as_matrix()
-        self.__Rincl = (
-            Rotation.from_euler("z", misorientation[4])
-            * Rotation.from_euler("y", misorientation[3])
-        ).as_matrix()
+        (
+            self.__misorientation,
+            self.__inclination,
+            self.__Rmis,
+            self.__Rincl,
+        ) = self.__translate_construction_error(
+            _decompose_misorientation, misorientation
+        )
 
     def __calculate_box_dimensions(self) -> np.ndarray:
         """Private method to calculate the box dimensions
@@ -1619,34 +1542,24 @@ class GBMaker:
         if threshold is None:
             threshold = self.__a0 * 15
 
-        if self.__embedding is not None:
-            # Exact or approximate path driven by a BoundaryEmbedding.
-            self.__R_left = self.__embedding.R_left
-            self.__R_right = self.__embedding.R_right
-            if self.__embedding.exact and self.__embedding.P is not None:
-                # Exact embeddings already carry validated integer P/Q rows. Store them
-                # as object-dtype Python ints so large Miller indices are preserved.
-                # Norms must be computed with explicit Python-int arithmetic rather than
-                # np.linalg.norm, since NumPy linalg/ufuncs do not reliably support
-                # object-dtype arrays.
-                self.__left_periodic_miller_rows = np.asarray(
-                    self.__embedding.P, dtype=object)
-                self.__right_periodic_miller_rows = np.asarray(
-                    self.__embedding.Q, dtype=object)
-            else:
-                self.__left_periodic_miller_rows = self.__approximate_rotation_matrix_as_int(
-                    self.__R_left).astype(object)
-                self.__right_periodic_miller_rows = self.__approximate_rotation_matrix_as_int(
-                    self.__R_right).astype(object)
-        else:
-            # Legacy path: derive rotation matrices from Euler angles.
-            self.__R_left = self.__Rincl
-            self.__R_right = np.dot(self.__Rincl, self.__Rmis)
-            # We store the approximate matrices as objects to allow for large numbers
-            self.__left_periodic_miller_rows = self.__approximate_rotation_matrix_as_int(
-                self.__R_left).astype(object)
-            self.__right_periodic_miller_rows = self.__approximate_rotation_matrix_as_int(
-                self.__R_right).astype(object)
+        # Rotation-matrix and periodic-Miller-row assignment, and in-plane periodicity
+        # determination, are a pure construction stage; see
+        # ``GBOpt.gbmaker.orientation.resolve_orientation``. Exact P/Q rows are never
+        # routed through integer-row approximation there.
+        orientation = self.__translate_construction_error(
+            resolve_orientation,
+            np.hstack((self.__misorientation, self.__inclination)),
+            embedding=self.__embedding,
+            a0=self.__a0,
+            threshold=threshold,
+        )
+        self.__Rmis = orientation.R_mis
+        self.__Rincl = orientation.R_incl
+        self.__R_left = orientation.R_left
+        self.__R_right = orientation.R_right
+        self.__left_periodic_miller_rows = orientation.left_periodic_miller_rows
+        self.__right_periodic_miller_rows = orientation.right_periodic_miller_rows
+        self.__inplane_periodic = orientation.inplane_periodic
 
         # The periodic distance in each direction is the lattice parameter multiplied by
         # norm of the Miller indices in that direction. This is determined using the
@@ -1683,29 +1596,21 @@ class GBMaker:
             }
         )
 
+        # In-plane periodicity was already resolved by ``resolve_orientation`` above
+        # (including, on the legacy/five-DOF path, its own threshold warning); this
+        # only reapplies the resulting flags to the returned spacing values used for
+        # box-dimension planning.
         if self.__embedding is not None and self.__embedding.source != "five_dof":
             # Trust non-legacy spec adapters directly. FiveDOFSpec keeps the
             # legacy threshold heuristic below until exactification replaces
             # its approximate-only embedding path.
-            coherent = self.__embedding.coherent
-            self.__inplane_periodic = (coherent, coherent)
-            if not coherent:
+            if not all(self.__inplane_periodic):
                 for axis in ("y", "z"):
                     spacing[axis] = min(spacing[axis], threshold)
         else:
-            inplane_periodic = []
-            for key, val in spacing.items():
-                if key == 'x':
-                    continue
-                is_periodic = val <= threshold
-                inplane_periodic.append(is_periodic)
+            for axis, is_periodic in zip(("y", "z"), self.__inplane_periodic):
                 if not is_periodic:
-                    spacing[key] = threshold
-                    warnings.warn(
-                        f"Required {key}-spacing {val:.4f} A exceeds threshold "
-                        f"{threshold:.4f} A; boundary is non-periodic along {key}."
-                    )
-            self.__inplane_periodic = tuple(inplane_periodic)
+                    spacing[axis] = threshold
 
         return spacing
 
@@ -1771,6 +1676,8 @@ class GBMaker:
     def __x_period(self, periodic_miller_rows: np.ndarray) -> float:
         """Return one full x-period length for a grain.
 
+        Thin wrapper delegating to ``GBOpt.gbmaker.orientation._x_period``.
+
         The x-period is the distance between equivalent crystallographic repeats along
         the boundary-normal direction. It is computed from the first integer periodic
         Miller row as ``a0 * ||periodic_miller_rows[0]||``.
@@ -1781,7 +1688,9 @@ class GBMaker:
         :raises GBMakerValueError: If row 0 is not a nonzero three-component integer
             Miller row.
         """
-        return self.__a0 * _miller_row_norm(periodic_miller_rows[0])
+        return self.__translate_construction_error(
+            _x_period, periodic_miller_rows, self.__a0
+        )
 
     def __generate_grain_result(
         self,
@@ -3265,14 +3174,7 @@ class GBMaker:
         misorientation = self.__validate(
             value, np.ndarray, "misorientation", expected_length=5
         )
-        self.__misorientation = misorientation[:3]
-        self.__inclination = misorientation[3:]
-        self.__Rmis = Rotation.from_euler(
-            "ZXZ", misorientation[:3]).as_matrix()
-        self.__Rincl = (
-            Rotation.from_euler("z", misorientation[4])
-            * Rotation.from_euler("y", misorientation[3])
-        ).as_matrix()
+        self.__assign_orientations(misorientation)
         # Discard any active embedding so update_spacing uses the new Euler
         # angles rather than the stale embedding-derived rotation matrices.
         self.__embedding = None
