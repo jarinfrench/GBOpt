@@ -13,13 +13,20 @@ minimum in-plane dimension enforcement, and final simulation-box dimensions. GBM
 keeps its own ``__validate`` instance method and per-field static validators for
 property setters, but those are thin wrappers over the pure functions here, so there is
 a single implementation of each validation rule; the same is true of GBMaker's
-remaining orientation- and dimension-related private methods and ``orientation``'s/
-``dimension``'s underscore-prefixed helpers (row reduction, angular error, integer-row
-approximation, misorientation decomposition, commensurate-pair search, per-axis
-accommodation planning), which are not promoted here but are imported directly by
-``GBOpt.GBMaker``, the same way it already imports ``config``'s ``_validate_scalar``.
-No geometry-kernel or grain-generation logic has moved into this package yet; that
-extraction happens incrementally in later roadmap issues (R07 through R09).
+remaining orientation-, dimension-, and geometry-related private methods and
+``orientation``'s/``dimension``'s/``geometry``'s underscore-prefixed helpers (row
+reduction, angular error, integer-row approximation, misorientation decomposition,
+commensurate-pair search, per-axis accommodation planning, reduced-coordinate wrapping
+and tolerance, periodic/selection basis construction, box-coordinate transforms,
+complete-origin masking/filtering/clipping/deduplication), which are not promoted here
+but are imported directly by ``GBOpt.GBMaker``, the same way it already imports
+``config``'s ``_validate_scalar``. ``geometry`` is a leaf with respect to its
+``gbmaker`` siblings (it depends only on ``types``); ``orientation`` and ``dimension``
+now import their shared ``_miller_row_norm`` from it instead of each carrying a private
+copy. Exact- and float-path grain enumeration
+(``__build_exact_grain``/``__generate_grain_result`` and the builder orchestration that
+calls the geometry kernels) has not moved into this package yet; that extraction
+happens in R08/R09.
 """
 
 from .config import (

@@ -16,20 +16,23 @@ unextracted call sites, the same way it already imports ``gbmaker.config``'s
 never routed through the float re-approximation path; only the legacy Euler-angle
 path and non-exact embeddings use integer-row approximation. No supercell
 construction, strain accommodation, or final box-dimension planning belongs here.
+
+``_miller_row_norm`` is imported from ``gbmaker.geometry``, the canonical
+implementation as of R07 (previously a private copy here; see ``REFACTOR_CLEANUP.md``
+for the R05/R06/R07 history of that duplication).
 """
 
 from __future__ import annotations
 
-import math
 import warnings
-from collections.abc import Sequence
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation
 
 from GBOpt.BoundarySpec import BoundaryEmbedding
-from GBOpt.gbmaker.types import GBMakerConstructionValueError, OrientationState
+from GBOpt.gbmaker.geometry import _miller_row_norm
+from GBOpt.gbmaker.types import OrientationState
 
 
 def _reduce_integer_row(row: np.ndarray) -> np.ndarray:
@@ -127,46 +130,6 @@ def _approximate_rotation_matrix_as_int(
             for row in np.asarray(m, dtype=np.float64)
         ]
     ).astype(int)
-
-
-def _miller_row_norm(row: Sequence[object] | np.ndarray) -> float:
-    """Return the Euclidean norm of a nonzero integer Miller-index row.
-
-    Computes ``sqrt(h*h + k*k + l*l)`` using Python ``int`` arithmetic for the squared
-    norm. This avoids fixed-width NumPy integer overflow and avoids object-dtype NumPy
-    ufuncs.
-
-    Duplicates ``GBOpt.GBMaker._miller_row_norm``: that copy still has call sites
-    outside the orientation stage (exact-repeat and box-basis geometry, R07/R08
-    territory), and this module cannot import it back from ``GBOpt.GBMaker`` without a
-    circular import. See ``REFACTOR_CLEANUP.md`` for the planned consolidation.
-
-    :param row: Nonzero integer Miller-index row ``(h, k, l)``.
-    :return: Euclidean norm of the Miller-index row.
-    :raises GBMakerConstructionValueError: If ``row`` is not a three-component integer
-        row or if the row is zero.
-    """
-    values = tuple(row)
-    if len(values) != 3:
-        raise GBMakerConstructionValueError(
-            f"Miller-index row must have exactly three components; got {values!r}."
-        )
-
-    integers: list[int] = []
-    for value in values:
-        if isinstance(value, (bool, np.bool_)) or not isinstance(
-            value, (int, np.integer)
-        ):
-            raise GBMakerConstructionValueError(
-                f"Miller-index row components must be integers; got {values!r}."
-            )
-        integers.append(int(value))
-
-    squared_norm = sum(value * value for value in integers)
-    if squared_norm == 0:
-        raise GBMakerConstructionValueError("Miller-index row must be nonzero.")
-
-    return math.sqrt(squared_norm)
 
 
 def _x_period(periodic_miller_rows: np.ndarray, a0: float) -> float:

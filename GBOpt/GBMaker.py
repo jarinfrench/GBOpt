@@ -41,6 +41,22 @@ from GBOpt.gbmaker.dimension import (
     plan_dimensions,
     plan_periodic_spacing,
 )
+from GBOpt.gbmaker.geometry import (
+    _box_periodic_basis,
+    _cartesian_from_box_coordinates,
+    _clip_complete_origins_to_cartesian_box,
+    _complete_origin_atom_mask,
+    _deduplicate_complete_origins,
+    _filter_complete_origins,
+    _miller_row_norm,
+    _reduced_box_coordinates,
+    _reduced_coordinate_tolerance,
+    _scaled_periodic_basis_vector,
+    _select_complete_origins_in_box_basis,
+    _selection_basis_vectors,
+    _x_index_range,
+)
+from GBOpt.gbmaker.geometry import wrap_reduced_coordinate as _wrap_reduced_coordinate
 from GBOpt.gbmaker.orientation import (
     _decompose_misorientation,
     _reduce_integer_row,
@@ -157,56 +173,19 @@ def wrap_reduced_coordinate(reduced_coord: np.ndarray, tol: float = 1e-8) -> np.
     """
     Wrap reduced coordinates into [0, 1) and snap both periodic faces to 0.
 
+    Thin wrapper delegating to ``GBOpt.gbmaker.geometry.wrap_reduced_coordinate``,
+    kept as a module-level compatibility alias since existing code imports
+    ``GBOpt.GBMaker.wrap_reduced_coordinate`` directly.
+
     :param reduced_coord: Reduced coordinates to wrap.
     :param tol: Tolerance in reduced-coordinate units. Optional, defaults to 1e-8
     :return: Wrapped reduced coordinates in [0, 1).
+    :raises GBMakerValueError: If ``tol`` is not finite or is negative.
     """
-    if not math.isfinite(tol):
-        raise GBMakerValueError("Reduced-coordinate tolerance must be finite.")
-    if tol < 0:
-        raise GBMakerValueError("Reduced-coordinate tolerance must be non-negative.")
-
-    wrapped = np.mod(np.asarray(reduced_coord, dtype=np.float64), 1.0)
-    return np.where(
-        (wrapped < tol) | ((1.0 - wrapped) < tol),
-        0.0,
-        wrapped,
-    )
-
-
-def _miller_row_norm(row: Sequence[object] | np.ndarray) -> float:
-    """Return the Euclidean norm of a nonzero integer Miller-index row.
-
-    Computes ``sqrt(h*h + k*k + l*l)`` using Python ``int`` arithmetic for the squared
-    norm. This avoids fixed-width NumPy integer overflow and avoids object-dtype NumPy
-    ufuncs.
-
-    :param row: Nonzero integer Miller-index row ``(h, k, l)``.
-    :return: Euclidean norm of the Miller-index row.
-    :raises GBMakerValueError: If ``row`` is not a three-component integer row or if the
-        row is zero.
-    """
-    values = tuple(row)
-    if len(values) != 3:
-        raise GBMakerValueError(
-            f"Miller-index row must have exactly three components; got {values!r}."
-        )
-
-    integers: list[int] = []
-    for value in values:
-        if isinstance(value, (bool, np.bool_)) or not isinstance(
-            value, (int, np.integer)
-        ):
-            raise GBMakerValueError(
-                f"Miller-index row components must be integers; got {values!r}."
-            )
-        integers.append(int(value))
-
-    squared_norm = sum(value * value for value in integers)
-    if squared_norm == 0:
-        raise GBMakerValueError("Miller-index row must be nonzero.")
-
-    return math.sqrt(squared_norm)
+    try:
+        return _wrap_reduced_coordinate(reduced_coord, tol)
+    except GBMakerConstructionValueError as exc:
+        raise GBMakerValueError(str(exc)) from exc
 
 
 class GBMaker:
@@ -716,9 +695,15 @@ class GBMaker:
             raise GBMakerValueError(str(exc)) from exc
 
         a0 = self.__a0
-        x_period = a0 * _miller_row_norm(supercell[0])
-        y_period = a0 * _miller_row_norm(supercell[1])
-        z_period = a0 * _miller_row_norm(supercell[2])
+        x_period = a0 * self.__translate_construction_error(
+            _miller_row_norm, supercell[0]
+        )
+        y_period = a0 * self.__translate_construction_error(
+            _miller_row_norm, supercell[1]
+        )
+        z_period = a0 * self.__translate_construction_error(
+            _miller_row_norm, supercell[2]
+        )
 
         tol = 1e-6
 
@@ -1647,13 +1632,13 @@ class GBMaker:
         """
         Convert the Cartesian epsilon to reduced-coordinate units for a basis vector.
 
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.geometry._reduced_coordinate_tolerance``.
+
         :param basis_vector: Cartesian basis vector used to define the coordinate scale.
         :return: Reduced-coordinate tolerance corresponding to ``self.__epsilon``.
         """
-        basis_vector = np.asarray(basis_vector, dtype=np.float64)
-        basis_length = np.linalg.norm(basis_vector)
-
-        return self.__epsilon / basis_length
+        return _reduced_coordinate_tolerance(basis_vector, self.__epsilon)
 
     def __scaled_periodic_basis_vector(
         self, period_vector: np.ndarray, box_length: float, axis_index: int
@@ -1661,62 +1646,40 @@ class GBMaker:
         """
         Scale a periodic basis vector so one axis projection matches the box length.
 
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.geometry._scaled_periodic_basis_vector``.
+
         :param period_vector: Cartesian periodic basis vector.
         :param box_length: Desired box length along the selected axis.
         :param axis_index: Axis whose projection should match ``box_length``.
         :return: Scaled periodic basis vector.
         """
-
-        period_vector = np.asarray(period_vector, dtype=np.float64)
-        box_length = float(box_length)
-        if box_length <= 0.0:
-            raise GBMakerValueError("box_length must be strictly positive.")
-        axis_index = int(axis_index)
-
-        # We ignore overflow/invalid values because the check immediately after catches
-        # those states and raises a GBMakerValueError
-        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
-            scale = box_length / period_vector[axis_index]
-            scaled_vector = period_vector * scale
-        if not np.all(np.isfinite(scaled_vector)):
-            raise GBMakerValueError("Scaled periodic basis vector must be finite.")
-        return scaled_vector
+        return self.__translate_construction_error(
+            _scaled_periodic_basis_vector, period_vector, box_length, axis_index
+        )
 
     def __box_periodic_basis(self, primitive_periods: np.ndarray) -> np.ndarray:
         """
         Build the in-plane box basis from primitive periodic vectors.
 
+        Thin wrapper delegating to ``GBOpt.gbmaker.geometry._box_periodic_basis``.
+
         :param primitive_periods: 2x3 array containing primitive y/z period vectors.
         :return: 2x3 array containing the box basis vectors for y and z.
         """
-        primitive_periods = np.asarray(primitive_periods, dtype=np.float64)
-
-        inplane_periodic = self.__inplane_periodic
-        box_lengths = (self.__y_dim, self.__z_dim)
-        box_basis = np.zeros((2, 3), dtype=np.float64)
-
-        for row_index, (is_periodic, box_length) in enumerate(
-            zip(inplane_periodic, box_lengths)
-        ):
-            if not is_periodic:
-                continue
-
-            axis_index = row_index + 1
-            axis_projection = primitive_periods[row_index, axis_index]
-            if np.isclose(axis_projection, 0.0, atol=self.__epsilon, rtol=0.0):
-                raise GBMakerValueError(
-                    "primitive_periods must have a non-zero projection on the "
-                    "selected box axis."
-                )
-            box_basis[row_index] = self.__scaled_periodic_basis_vector(
-                primitive_periods[row_index], box_length, axis_index
-            )
-
-        return box_basis
+        return self.__translate_construction_error(
+            _box_periodic_basis,
+            primitive_periods,
+            self.__inplane_periodic,
+            (self.__y_dim, self.__z_dim),
+            self.__epsilon,
+        )
 
     def __selection_basis_vectors(self, primitive_periods: np.ndarray) -> np.ndarray:
         """
         Build the canonical in-plane selection basis for y/z box coordinates.
+
+        Thin wrapper delegating to ``GBOpt.gbmaker.geometry._selection_basis_vectors``.
 
         Periodic axes use the box-periodic basis vectors; non-periodic axes fall back
         to the corresponding Cartesian unit vectors.
@@ -1724,15 +1687,13 @@ class GBMaker:
         :param primitive_periods: 2x3 array containing primitive y/z period vectors.
         :return: 2x3 array containing the y/z selection basis vectors.
         """
-        selection_basis = self.__box_periodic_basis(primitive_periods)
-        inplane_periodic = self.__inplane_periodic
-
-        for row_index, is_periodic in enumerate(inplane_periodic):
-            if is_periodic:
-                continue
-            selection_basis[row_index, row_index + 1] = 1.0
-
-        return selection_basis
+        return self.__translate_construction_error(
+            _selection_basis_vectors,
+            primitive_periods,
+            self.__inplane_periodic,
+            (self.__y_dim, self.__z_dim),
+            self.__epsilon,
+        )
 
     def __x_index_range(
         self,
@@ -1742,6 +1703,8 @@ class GBMaker:
     ) -> np.ndarray:
         """
         Build a conservative contiguous lattice-index range along the x-period vector.
+
+        Thin wrapper delegating to ``GBOpt.gbmaker.geometry._x_index_range``.
 
         The x-period direction is derived in lattice space as the cross product of the
         two in-plane primitive periods expressed in the rotated unit-cell basis. The
@@ -1755,77 +1718,23 @@ class GBMaker:
         :return: Contiguous integer array of lattice indices along the x-period
             direction.
         """
-        primitive_periods = np.asarray(primitive_periods, dtype=np.float64)
-        rotated_unit_cell_basis = np.asarray(
-            rotated_unit_cell_basis, dtype=np.float64
+        return self.__translate_construction_error(
+            _x_index_range,
+            primitive_periods,
+            rotated_unit_cell_basis,
+            x_bounds,
+            self.__inplane_periodic,
+            (self.__y_dim, self.__z_dim),
+            self.__epsilon,
         )
-        x_bounds = np.asarray(x_bounds, dtype=np.float64)
-
-        determinant = np.linalg.det(rotated_unit_cell_basis)
-        if np.isclose(determinant, 0.0, atol=self.__epsilon, rtol=0.0):
-            raise GBMakerValueError(
-                "rotated_unit_cell_basis must form an invertible 3x3 basis."
-            )
-
-        reduced_periods = np.linalg.solve(
-            rotated_unit_cell_basis.T, primitive_periods.T
-        ).T
-        x_direction_lattice = np.cross(reduced_periods[0], reduced_periods[1])
-        if np.linalg.norm(x_direction_lattice) <= self.__epsilon:
-            raise GBMakerValueError(
-                "primitive_periods must define distinct in-plane directions."
-            )
-
-        rounded_direction = np.rint(x_direction_lattice)
-        if np.allclose(
-            x_direction_lattice, rounded_direction, atol=self.__epsilon, rtol=0.0
-        ) and np.any(rounded_direction):
-            x_direction_lattice = self.__reduce_integer_row(
-                rounded_direction.astype(int)
-            ).astype(np.float64)
-
-        x_period_vector = x_direction_lattice @ rotated_unit_cell_basis
-        x_projection = float(x_period_vector[0])
-        if np.isclose(x_projection, 0.0, atol=self.__epsilon, rtol=0.0):
-            raise GBMakerValueError(
-                "x-period direction must have a non-zero projection on x."
-            )
-        if x_projection < 0.0:
-            x_projection = -x_projection
-
-        box_basis = self.__box_periodic_basis(primitive_periods)
-        box_corners_x = np.array(
-            [
-                0.0,
-                box_basis[0, 0],
-                box_basis[1, 0],
-                box_basis[0, 0] + box_basis[1, 0],
-            ],
-            dtype=np.float64,
-        )
-        cell_corners_x = np.array(
-            [
-                np.sum(
-                    rotated_unit_cell_basis[np.array(mask, dtype=bool), 0],
-                    dtype=np.float64,
-                )
-                for mask in np.ndindex((2, 2, 2))
-            ],
-            dtype=np.float64,
-        )
-
-        x_offset_min = float(np.min(box_corners_x) + np.min(cell_corners_x))
-        x_offset_max = float(np.max(box_corners_x) + np.max(cell_corners_x))
-
-        n_min = math.floor((x_bounds[0] - x_offset_max) / x_projection) - 1
-        n_max = math.ceil((x_bounds[1] - x_offset_min) / x_projection) + 1
-        return np.arange(n_min, n_max + 1, dtype=int)
 
     def __reduced_box_coordinates(
         self, cartesian_coordinates: np.ndarray, box_basis: np.ndarray
     ) -> np.ndarray:
         """
         Convert Cartesian coordinates to mixed box coordinates ``[x_cart, u_y, u_z]``.
+
+        Thin wrapper delegating to ``GBOpt.gbmaker.geometry._reduced_box_coordinates``.
 
         The mixed basis is ``[e_x, A_y, A_z]`` where ``e_x`` is the Cartesian x-axis
         and ``A_y``/``A_z`` are the in-plane box basis vectors.
@@ -1834,26 +1743,9 @@ class GBMaker:
         :param box_basis: 2x3 array containing ``A_y`` and ``A_z``.
         :return: Mixed box coordinates with shape ``(..., 3)``.
         """
-        cartesian_coordinates = np.asarray(cartesian_coordinates, dtype=np.float64)
-        box_basis = np.asarray(box_basis, dtype=np.float64)
-
-        yz_basis = box_basis[:, 1:].T
-        determinant = np.linalg.det(yz_basis)
-        if np.isclose(determinant, 0.0, atol=self.__epsilon, rtol=0.0):
-            raise GBMakerValueError(
-                "box_basis y/z projections must form an invertible 2x2 basis."
-            )
-
-        yz_coordinates = cartesian_coordinates[..., 1:]
-        reduced_yz = np.linalg.solve(
-            yz_basis, yz_coordinates.reshape(-1, 2).T
-        ).T.reshape(yz_coordinates.shape)
-        x_cart = (
-            cartesian_coordinates[..., 0]
-            - reduced_yz[..., 0] * box_basis[0, 0]
-            - reduced_yz[..., 1] * box_basis[1, 0]
+        return self.__translate_construction_error(
+            _reduced_box_coordinates, cartesian_coordinates, box_basis, self.__epsilon
         )
-        return np.concatenate((x_cart[..., np.newaxis], reduced_yz), axis=-1)
 
     def __cartesian_from_box_coordinates(
         self, box_coordinates: np.ndarray, box_basis: np.ndarray
@@ -1861,21 +1753,14 @@ class GBMaker:
         """
         Convert mixed box coordinates ``[x_cart, u_y, u_z]`` to Cartesian coordinates.
 
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.geometry._cartesian_from_box_coordinates``.
+
         :param box_coordinates: Mixed box coordinates with shape ``(..., 3)``.
         :param box_basis: 2x3 array containing ``A_y`` and ``A_z``.
         :return: Cartesian coordinates with shape ``(..., 3)``.
         """
-        box_coordinates = np.asarray(box_coordinates, dtype=np.float64)
-        box_basis = np.asarray(box_basis, dtype=np.float64)
-
-        cartesian_coordinates = np.array(box_coordinates, copy=True)
-        cartesian_coordinates[..., 0] += np.tensordot(
-            box_coordinates[..., 1:], box_basis[:, 0], axes=([-1], [0])
-        )
-        cartesian_coordinates[..., 1:] = np.tensordot(
-            box_coordinates[..., 1:], box_basis[:, 1:], axes=([-1], [0])
-        )
-        return cartesian_coordinates
+        return _cartesian_from_box_coordinates(box_coordinates, box_basis)
 
     def __complete_origin_atom_mask(
         self,
@@ -1885,14 +1770,13 @@ class GBMaker:
     ) -> np.ndarray:
         """Promote an atom-level mask to a complete-origin atom mask.
 
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.geometry._complete_origin_atom_mask``.
+
         An origin is retained only when exactly ``basis_size`` atoms are present for
         that origin and every atom from that origin passes ``atom_mask``. The returned
         mask is parallel to ``atom_mask`` and ``origin_ids``; retained atoms are marked
         ``True``.
-
-        A fast grouped-origin path is used when the input already consists of
-        contiguous, unique complete-origin groups. Otherwise, the method falls back to
-        an origin-ID count.
 
         :param atom_mask: One-dimensional boolean atom-level mask.
         :param origin_ids: One-dimensional integer array parallel to ``atom_mask``. Each
@@ -1904,54 +1788,9 @@ class GBMaker:
             if ``origin_ids`` is not integer-valued, or if ``basis_size`` is not a
             positive integer.
         """
-        atom_mask = np.asarray(atom_mask)
-        origin_ids = np.asarray(origin_ids)
-
-        if atom_mask.ndim != 1:
-            raise GBMakerValueError("atom_mask must be a one-dimensional array.")
-        if not np.issubdtype(atom_mask.dtype, np.bool_):
-            raise GBMakerValueError("atom_mask must be a boolean array.")
-
-        if origin_ids.ndim != 1:
-            raise GBMakerValueError("origin_ids must be a one-dimensional array.")
-        if not np.issubdtype(origin_ids.dtype, np.integer):
-            raise GBMakerValueError("origin_ids must contain integer values.")
-
-        if len(atom_mask) != len(origin_ids):
-            raise GBMakerValueError("atom_mask and origin_ids must have equal length.")
-
-        if isinstance(basis_size, (bool, np.bool_)) or not isinstance(
-            basis_size, (int, np.integer)
-        ):
-            raise GBMakerValueError(
-                f"basis_size must be a positive integer; got {basis_size!r}."
-            )
-
-        basis_size = int(basis_size)
-        if basis_size < 1:
-            raise GBMakerValueError(
-                f"basis_size must be a positive integer; got {basis_size!r}."
-            )
-
-        if len(atom_mask) == 0:
-            return atom_mask.copy()
-
-        if len(atom_mask) % basis_size == 0:
-            grouped_ids = origin_ids.reshape(-1, basis_size)
-            group_ids = grouped_ids[:, 0]
-            grouped_complete = np.all(grouped_ids == group_ids[:, None])
-            grouped_unique = len(np.unique(group_ids)) == len(group_ids)
-
-            if grouped_complete and grouped_unique:
-                grouped_mask = atom_mask.reshape(-1, basis_size)
-                return np.repeat(np.all(grouped_mask, axis=1), basis_size)
-
-        unique_ids, inverse = np.unique(origin_ids, return_inverse=True)
-        total_counts = np.bincount(inverse, minlength=len(unique_ids))
-        pass_counts = np.bincount(inverse[atom_mask], minlength=len(unique_ids))
-
-        keep_origin = (total_counts == basis_size) & (pass_counts == basis_size)
-        return keep_origin[inverse]
+        return self.__translate_construction_error(
+            _complete_origin_atom_mask, atom_mask, origin_ids, basis_size
+        )
 
     def __filter_complete_origins(
         self,
@@ -1962,9 +1801,7 @@ class GBMaker:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Filter atoms and origin IDs while preserving complete origin groups.
 
-        Converts ``atom_mask`` into a complete-origin mask using
-        ``__complete_origin_atom_mask``. An origin is kept only when every one of its
-        ``basis_size`` atoms passes the input mask. The returned arrays are copies.
+        Thin wrapper delegating to ``GBOpt.gbmaker.geometry._filter_complete_origins``.
 
         :param atoms: Structured atom array to filter.
         :param origin_ids: Integer origin-ID array parallel to ``atoms``.
@@ -1972,18 +1809,11 @@ class GBMaker:
         :param basis_size: Number of atoms expected in one complete origin group.
         :return: ``(filtered_atoms, filtered_origin_ids)``.
         :raises GBMakerValueError: If ``atoms`` and ``origin_ids`` are not parallel, or
-            if ``__complete_origin_atom_mask`` rejects the mask, origin IDs, or basis
-            size.
+            if complete-origin masking rejects the mask, origin IDs, or basis size.
         """
-        if len(atoms) != len(origin_ids):
-            raise GBMakerValueError("atoms and origin_ids must have equal length.")
-
-        keep_atoms = self.__complete_origin_atom_mask(
-            atom_mask,
-            origin_ids,
-            basis_size,
+        return self.__translate_construction_error(
+            _filter_complete_origins, atoms, origin_ids, atom_mask, basis_size
         )
-        return atoms[keep_atoms].copy(), origin_ids[keep_atoms].copy()
 
     def __clip_complete_origins_to_cartesian_box(
         self,
@@ -1993,6 +1823,9 @@ class GBMaker:
         basis_size: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Clip atoms to the Cartesian grain box by complete origin groups.
+
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.geometry._clip_complete_origins_to_cartesian_box``.
 
         Atoms are tested against the half-open x interval ``[x_bounds[0], x_bounds[1])``
         using the instance tolerance. Non-periodic in-plane axes are also clipped to
@@ -2012,62 +1845,16 @@ class GBMaker:
         :raises GBMakerValueError: If ``x_bounds`` is not a finite increasing two-value
             interval, or if complete-origin filtering rejects the inputs.
         """
-        try:
-            x_bounds = np.asarray(x_bounds, dtype=np.float64)
-        except (TypeError, ValueError) as exc:
-            raise GBMakerValueError(
-                f"x_bounds must be a finite two-value interval; got {x_bounds!r}."
-            ) from exc
-
-        if x_bounds.shape != (2,):
-            raise GBMakerValueError(
-                f"x_bounds must be a finite two-value interval; got {x_bounds!r}."
-            )
-        if not np.all(np.isfinite(x_bounds)) or x_bounds[1] <= x_bounds[0]:
-            raise GBMakerValueError(
-                f"x_bounds must be a finite increasing interval; got {x_bounds!r}."
-            )
-
-        inside_box = (
-            (atoms["x"] >= x_bounds[0] - self.__epsilon)
-            & (atoms["x"] < x_bounds[1] - self.__epsilon)
-        )
-
-        axis_names = ("y", "z")
-        axis_dims = (self.__y_dim, self.__z_dim)
-
-        for axis_name, axis_dim, is_periodic in zip(
-            axis_names,
-            axis_dims,
-            self.__inplane_periodic,
-        ):
-            if is_periodic:
-                continue
-
-            inside_box &= (
-                (atoms[axis_name] >= -self.__epsilon)
-                & (atoms[axis_name] < axis_dim)
-            )
-
-        clipped_atoms, clipped_origin_ids = self.__filter_complete_origins(
+        return self.__translate_construction_error(
+            _clip_complete_origins_to_cartesian_box,
             atoms,
             origin_ids,
-            inside_box,
+            x_bounds,
             basis_size,
+            self.__inplane_periodic,
+            (self.__y_dim, self.__z_dim),
+            self.__epsilon,
         )
-
-        for axis_name, is_periodic in zip(axis_names, self.__inplane_periodic):
-            if is_periodic:
-                continue
-
-            clipped_atoms[axis_name] = np.where(
-                (clipped_atoms[axis_name] < 0.0)
-                & (clipped_atoms[axis_name] >= -self.__epsilon),
-                0.0,
-                clipped_atoms[axis_name],
-            )
-
-        return clipped_atoms, clipped_origin_ids
 
     def __deduplicate_complete_origins(
         self,
@@ -2076,6 +1863,9 @@ class GBMaker:
         basis_size: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Remove duplicate complete-origin groups by full atom signatures.
+
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.geometry._deduplicate_complete_origins``.
 
         Each origin group is expected to contain exactly ``basis_size`` contiguous
         atoms with a single origin ID. Duplicate groups are identified by the full
@@ -2092,68 +1882,12 @@ class GBMaker:
             positive integer, or if the atom array cannot be reshaped into complete
             contiguous origin groups.
         """
-        origin_ids = np.asarray(origin_ids)
-
-        if origin_ids.ndim != 1:
-            raise GBMakerValueError("origin_ids must be a one-dimensional array.")
-        if not np.issubdtype(origin_ids.dtype, np.integer):
-            raise GBMakerValueError("origin_ids must contain integer values.")
-
-        if isinstance(basis_size, (bool, np.bool_)) or not isinstance(
-            basis_size, (int, np.integer)
-        ):
-            raise GBMakerValueError(
-                f"basis_size must be a positive integer; got {basis_size!r}."
-            )
-
-        basis_size = int(basis_size)
-        if basis_size < 1:
-            raise GBMakerValueError(
-                f"basis_size must be a positive integer; got {basis_size!r}."
-            )
-
-        if len(atoms) != len(origin_ids):
-            raise GBMakerValueError("atoms and origin_ids must have equal length.")
-
-        if len(atoms) == 0:
-            return atoms.copy(), origin_ids.copy()
-
-        if len(atoms) % basis_size != 0:
-            raise GBMakerValueError(
-                "Complete-origin deduplication requires full origin groups."
-            )
-
-        n_origins = len(atoms) // basis_size
-        grouped_origin_ids = origin_ids.reshape(n_origins, basis_size)
-        if not np.all(grouped_origin_ids == grouped_origin_ids[:, :1]):
-            raise GBMakerValueError(
-                "Complete-origin deduplication requires contiguous origin groups."
-            )
-
-        positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
-        quantized = np.round(positions / self.__epsilon).astype(np.int64)
-
-        signature_dtype = np.dtype(
-            [
-                ("name", atoms.dtype["name"], (basis_size,)),
-                ("position", np.int64, (basis_size, 3)),
-            ]
-        )
-        signatures = np.empty(n_origins, dtype=signature_dtype)
-        signatures["name"] = atoms["name"].reshape(n_origins, basis_size)
-        signatures["position"] = quantized.reshape(n_origins, basis_size, 3)
-
-        _, unique_group_indices = np.unique(signatures, return_index=True)
-
-        keep_groups = np.zeros(n_origins, dtype=bool)
-        keep_groups[np.sort(unique_group_indices)] = True
-
-        grouped_atoms = atoms.reshape(n_origins, basis_size)
-        grouped_ids = origin_ids.reshape(n_origins, basis_size)
-
-        return (
-            grouped_atoms[keep_groups].reshape(-1).copy(),
-            grouped_ids[keep_groups].reshape(-1).copy(),
+        return self.__translate_construction_error(
+            _deduplicate_complete_origins,
+            atoms,
+            origin_ids,
+            basis_size,
+            self.__epsilon,
         )
 
     def __filter_float_result_complete_origins(
@@ -2228,6 +1962,9 @@ class GBMaker:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Select and wrap in-plane coordinates while preserving complete origins.
 
+        Thin wrapper delegating to
+        ``GBOpt.gbmaker.geometry._select_complete_origins_in_box_basis``.
+
         Builds the y/z selection basis from ``primitive_periods`` and filters atoms into
         the in-plane simulation box. Periodic in-plane axes are selected in reduced
         coordinates and wrapped onto the periodic box. Non-periodic in-plane axes are
@@ -2250,157 +1987,16 @@ class GBMaker:
             if the selection basis is singular, or if complete-origin filtering rejects
             the inputs.
         """
-        try:
-            x_bounds = np.asarray(x_bounds, dtype=np.float64)
-        except (TypeError, ValueError) as exc:
-            raise GBMakerValueError(
-                f"x_bounds must be a finite two-value interval; got {x_bounds!r}."
-            ) from exc
-
-        if x_bounds.shape != (2,):
-            raise GBMakerValueError(
-                f"x_bounds must be a finite two-value interval; got {x_bounds!r}."
-            )
-        if not np.all(np.isfinite(x_bounds)) or x_bounds[1] <= x_bounds[0]:
-            raise GBMakerValueError(
-                f"x_bounds must be a finite increasing interval; got {x_bounds!r}."
-            )
-
-        selection_basis = self.__selection_basis_vectors(primitive_periods)
-        positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
-        inplane_periodic = self.__inplane_periodic
-
-        if np.allclose(selection_basis[:, 0], 0.0, atol=self.__epsilon, rtol=0.0):
-            inside_box = np.ones(len(atoms), dtype=bool)
-            for row_index, is_periodic in enumerate(inplane_periodic):
-                axis = row_index + 1
-                period = selection_basis[row_index, axis]
-                coord = positions[:, axis]
-
-                if is_periodic:
-                    tol = self.__reduced_coordinate_tolerance(
-                        selection_basis[row_index]
-                    )
-                    reduced_coord = coord / period
-                    inside_box &= (
-                        (reduced_coord >= -tol)
-                        & (reduced_coord < 1.0 + tol)
-                    )
-
-            selected_atoms, selected_origin_ids = self.__filter_complete_origins(
-                atoms,
-                origin_ids,
-                inside_box,
-                basis_size,
-            )
-            if len(selected_atoms) == 0:
-                return selected_atoms, selected_origin_ids
-
-            for row_index, is_periodic in enumerate(inplane_periodic):
-                if not is_periodic:
-                    continue
-
-                axis_name = ("y", "z")[row_index]
-                axis = row_index + 1
-                period = selection_basis[row_index, axis]
-                tol = self.__reduced_coordinate_tolerance(selection_basis[row_index])
-
-                wrapped = np.mod(selected_atoms[axis_name], period)
-                selected_atoms[axis_name] = np.where(
-                    (wrapped < tol * period) | ((period - wrapped) < tol * period),
-                    0.0,
-                    wrapped,
-                )
-
-            inside_x = (
-                (selected_atoms["x"] >= x_bounds[0] - self.__epsilon)
-                & (selected_atoms["x"] < x_bounds[1] - self.__epsilon)
-            )
-            return self.__filter_complete_origins(
-                selected_atoms,
-                selected_origin_ids,
-                inside_x,
-                basis_size,
-            )
-
-        box_coordinates = self.__reduced_box_coordinates(positions, selection_basis)
-
-        inside_box = np.ones(len(atoms), dtype=bool)
-        axis_dims = (self.__y_dim, self.__z_dim)
-
-        for row_index, (axis_dim, is_periodic) in enumerate(
-            zip(axis_dims, inplane_periodic)
-        ):
-            reduced_axis = box_coordinates[:, row_index + 1]
-
-            if is_periodic:
-                tol = self.__reduced_coordinate_tolerance(selection_basis[row_index])
-                inside_box &= (
-                    (reduced_axis >= -tol)
-                    & (reduced_axis < 1.0 + tol)
-                )
-            else:
-                inside_box &= (
-                    (reduced_axis >= -self.__epsilon)
-                    & (reduced_axis < axis_dim)
-                )
-
-        selected_atoms, selected_origin_ids = self.__filter_complete_origins(
+        return self.__translate_construction_error(
+            _select_complete_origins_in_box_basis,
             atoms,
             origin_ids,
-            inside_box,
+            primitive_periods,
+            x_bounds,
             basis_size,
-        )
-        if len(selected_atoms) == 0:
-            return selected_atoms, selected_origin_ids
-
-        selected_mask = self.__complete_origin_atom_mask(
-            inside_box,
-            origin_ids,
-            basis_size,
-        )
-        selected_box_coordinates = box_coordinates[selected_mask].copy()
-
-        for row_index, is_periodic in enumerate(inplane_periodic):
-            coordinate_index = row_index + 1
-
-            if is_periodic:
-                tol = self.__reduced_coordinate_tolerance(selection_basis[row_index])
-                selected_box_coordinates[:, coordinate_index] = wrap_reduced_coordinate(
-                    selected_box_coordinates[:, coordinate_index],
-                    tol,
-                )
-                continue
-
-            selected_box_coordinates[:, coordinate_index] = np.where(
-                (
-                    (selected_box_coordinates[:, coordinate_index] < 0.0)
-                    & (
-                        selected_box_coordinates[:, coordinate_index]
-                        >= -self.__epsilon
-                    )
-                ),
-                0.0,
-                selected_box_coordinates[:, coordinate_index],
-            )
-
-        wrapped_positions = self.__cartesian_from_box_coordinates(
-            selected_box_coordinates,
-            selection_basis,
-        )
-        selected_atoms["x"], selected_atoms["y"], selected_atoms["z"] = (
-            wrapped_positions.T
-        )
-
-        inside_x = (
-            (selected_atoms["x"] >= x_bounds[0] - self.__epsilon)
-            & (selected_atoms["x"] < x_bounds[1] - self.__epsilon)
-        )
-        return self.__filter_complete_origins(
-            selected_atoms,
-            selected_origin_ids,
-            inside_x,
-            basis_size,
+            self.__inplane_periodic,
+            (self.__y_dim, self.__z_dim),
+            self.__epsilon,
         )
 
     def __grain_strain_scales(self, grain_side: str) -> tuple[float, float]:
