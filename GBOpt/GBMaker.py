@@ -22,11 +22,8 @@ from GBOpt.crystallography._limits import (
     DEFAULT_MAX_PQ_DETERMINANT,
     DEFAULT_MAX_PRIMITIVE_AREA_INDEX,
 )
-from GBOpt.gbmaker.approximate_grain import (
-    build_approximate_grain,
-    filter_grain_result_complete_origins,
-    trim_grain_result_to_upper_x,
-)
+from GBOpt.gbmaker.approximate_grain import filter_grain_result_complete_origins
+from GBOpt.gbmaker.assembly import assemble_bicrystal
 from GBOpt.gbmaker.config import (
     _validate_scalar,
     normalize_legacy_config,
@@ -45,7 +42,6 @@ from GBOpt.gbmaker.dimension import (
     plan_dimensions,
     plan_periodic_spacing,
 )
-from GBOpt.gbmaker.exact_grain import build_exact_grain
 from GBOpt.gbmaker.geometry import (
     _box_periodic_basis,
     _complete_origin_atom_mask,
@@ -54,14 +50,12 @@ from GBOpt.gbmaker.geometry import (
 from GBOpt.gbmaker.geometry import wrap_reduced_coordinate as _wrap_reduced_coordinate
 from GBOpt.gbmaker.orientation import (
     _decompose_misorientation,
-    _x_period,
     resolve_orientation,
 )
 from GBOpt.gbmaker.types import (
     AxisAccommodation,
     GBMakerConstructionTypeError,
     GBMakerConstructionValueError,
-    GrainBuildRequest,
     GrainBuildResult,
     MaterialState,
 )
@@ -612,9 +606,8 @@ class GBMaker:
         """Return the current crystal identity as a ``MaterialState``.
 
         Thin wrapper constructing a ``GBOpt.gbmaker.types.MaterialState`` from current
-        instance state, for the ``GrainBuildRequest`` contract consumed by
-        ``GBOpt.gbmaker.exact_grain.build_exact_grain`` and
-        ``GBOpt.gbmaker.approximate_grain.build_approximate_grain``.
+        instance state, for ``GBOpt.gbmaker.assembly.assemble_bicrystal``'s ``material``
+        argument.
 
         :return: Current material identity.
         """
@@ -626,479 +619,50 @@ class GBMaker:
             unit_cell=self.__unit_cell,
         )
 
-    def __grain_build_request(
-        self,
-        R_grain: np.ndarray,
-        periodic_matrix: np.ndarray,
-        x_length: float,
-        x_offset: float,
-        grain_side: str,
-        *,
-        exact: bool,
-    ) -> GrainBuildRequest:
-        """Build the ``GrainBuildRequest`` shared by both grain-build paths.
+    def __generate_gb(self) -> None:
+        """Generate the left grain, right grain, combined GB atom array, and GB region.
 
-        Thin wrapper collecting the instance state ``GBOpt.gbmaker.exact_grain`` and
-        ``GBOpt.gbmaker.approximate_grain`` need but do not read from ``self``
-        directly, including the explicit exact-path repeat counts a mismatch
-        accommodation supplies (``GrainBuildRequest.y_repeats``/``z_repeats``).
+        Thin wrapper delegating to ``GBOpt.gbmaker.assembly.assemble_bicrystal``, which
+        builds each grain using the exact integer path when a coherent exact boundary
+        embedding with integer P/Q matrices is available (otherwise the floating-point
+        grain-generation path), equalizes the periodic x gap, concatenates the grains,
+        and selects the grain-boundary-region window. Periodic x-gap equalization
+        remains available only to the floating path. Exact decorated grains retain
+        every enumerated site and are assembled without x-layer deletion.
 
-        :param R_grain: Proper rotation matrix for this grain.
-        :param periodic_matrix: 3x3 integer orientation matrix: the canonical P/Q
-            matrix on the exact path, or the periodic Miller-row matrix on the
-            approximate path.
-        :param x_length: Equalized x-slab thickness for this grain (Angstroms).
-        :param x_offset: Lab x-coordinate of the grain's lower face (Angstroms).
-        :param grain_side: Grain side, either ``"left"`` or ``"right"``.
-        :param exact: Keyword argument, required. Whether this request targets the
-            exact decorated-site path.
-        :return: Grain build request for this grain.
-        :raises GBMakerValueError: If ``grain_side`` is not ``"left"`` or ``"right"``,
-            or if any field fails ``GrainBuildRequest`` validation.
+        :return: ``None``. Updates ``self.__left_grain``, ``self.__right_grain``,
+            ``self.__whole_system``, and ``self.__gb_region``.
+        :raises GBMakerValueError: If exact grain generation requires missing P/Q data,
+            if float-path gap equalization lacks right-grain build metadata, if an
+            exact grain crosses the central or periodic x boundary, or if a downstream
+            grain-generation stage fails.
         """
-        if grain_side not in {"left", "right"}:
-            raise GBMakerValueError(
-                f"grain_side must be 'left' or 'right'; got {grain_side!r}."
-            )
-
-        y_scale, z_scale = self.__grain_strain_scales(grain_side)
-
-        y_accommodation = self.__strain_accommodation.get("y")
-        z_accommodation = self.__strain_accommodation.get("z")
-        y_repeats = None
-        z_repeats = None
-        if exact and y_accommodation is not None:
-            y_repeats = (
-                y_accommodation.left_repeats
-                if grain_side == "left"
-                else y_accommodation.right_repeats
-            )
-        if exact and z_accommodation is not None:
-            z_repeats = (
-                z_accommodation.left_repeats
-                if grain_side == "left"
-                else z_accommodation.right_repeats
-            )
-
-        return self.__translate_construction_error(
-            GrainBuildRequest,
+        result = self.__translate_construction_error(
+            assemble_bicrystal,
             material=self.__material_state(),
-            rotation=R_grain,
-            periodic_matrix=periodic_matrix,
-            grain_side=grain_side,
-            x_offset=x_offset,
-            x_length=x_length,
+            embedding=self.__embedding,
+            R_left=self.__R_left,
+            R_right=self.__R_right,
+            left_periodic_miller_rows=self.__left_periodic_miller_rows,
+            right_periodic_miller_rows=self.__right_periodic_miller_rows,
+            left_x=self.__left_x,
+            right_x=self.__right_x,
+            x_dim=self.__x_dim,
+            vacuum_thickness=self.__vacuum_thickness,
             inplane_periodic=self.__inplane_periodic,
             inplane_box_lengths=(self.__y_dim, self.__z_dim),
             epsilon=self.__epsilon,
-            y_scale=y_scale,
-            z_scale=z_scale,
-            y_repeats=y_repeats,
-            z_repeats=z_repeats,
-            exact=exact,
+            strain_accommodation=self.__strain_accommodation,
+            gb_thickness=self.__gb_thickness,
+            box_dims=self.__box_dims,
+            normal_topology=self.__normal_topology,
+            gb_id=self.__id,
         )
 
-    def __build_exact_grain(
-        self,
-        R_grain: np.ndarray,
-        P_or_Q: np.ndarray,
-        x_length: float,
-        x_offset: float,
-        grain_side: str,
-    ) -> np.ndarray:
-        """Build one grain from exact decorated repeated-supercell sites.
-
-        Thin wrapper delegating to ``GBOpt.gbmaker.exact_grain.build_exact_grain``.
-
-        :param R_grain: Proper rotation matrix for this grain.
-        :param P_or_Q: 3x3 canonical integer orientation matrix.
-        :param x_length: Equalized x-slab thickness (Angstroms).
-        :param x_offset: Lab x-coordinate of the grain's lower face (Angstroms).
-        :param grain_side: Grain side, either ``"left"`` or ``"right"``.
-        :return: Structured atom array for the complete decorated grain.
-        :raises GBMakerValueError: If rational basis metadata is unavailable, exact
-            enumeration violates a population invariant, or final coordinates are
-            non-finite or outside the intended grain box.
-        """
-
-        def _call() -> GrainBuildResult:
-            request = self.__grain_build_request(
-                R_grain, P_or_Q, x_length, x_offset, grain_side, exact=True
-            )
-            return build_exact_grain(request)
-
-        return self.__translate_construction_error(_call).atoms
-
-    def __grain_x_bounds(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return initial lab-frame x bounds for the left and right grains.
-
-        :return: ``(left_bounds, right_bounds)``, where each array contains ``[x_min,
-            x_max]`` in Angstroms.
-        """
-        left_bounds = np.array(
-            [
-                self.__vacuum_thickness,
-                self.__left_x + self.__vacuum_thickness,
-            ],
-            dtype=np.float64,
-        )
-        right_bounds = np.array(
-            [
-                self.__left_x + self.__vacuum_thickness,
-                self.__x_dim + self.__vacuum_thickness,
-            ],
-            dtype=np.float64,
-        )
-        return left_bounds, right_bounds
-
-    def __use_exact_grain_generation(self) -> bool:
-        """Return whether the exact integer grain-generation path should be used.
-
-        :return: ``True`` when the current embedding is exact, coherent, and carries
-            both integer P and Q orientation matrices.
-        :raises GBMakerValueError: If an exact coherent embedding is present but does
-            not carry both P and Q.
-        """
-        if self.__embedding is None:
-            return False
-
-        if not (self.__embedding.exact and self.__embedding.coherent):
-            return False
-
-        if self.__embedding.P is None or self.__embedding.Q is None:
-            raise GBMakerValueError(
-                "Exact coherent grain generation requires both embedding.P and "
-                "embedding.Q."
-            )
-
-        return True
-
-    def __generate_exact_grains(
-        self,
-        left_bounds: np.ndarray,
-        right_bounds: np.ndarray,
-    ) -> None:
-        """Generate both grains using exact decorated-site enumeration.
-
-        :param left_bounds: Length-2 x-bound array for the left grain.
-        :param right_bounds: Length-2 x-bound array for the right grain.
-        :return: ``None``. Updates ``self.__left_grain`` and ``self.__right_grain``.
-        :raises GBMakerValueError: If the exact embedding is missing P or Q, rational
-            basis metadata is unavailable, exact site enumeration fails, exact
-            populations disagree with the unit-cell basis, or either grain produces
-            invalid Cartesian coordinates.
-        """
-        if (
-            self.__embedding is None
-            or self.__embedding.P is None
-            or self.__embedding.Q is None
-        ):
-            raise GBMakerValueError(
-                "Exact grain generation requires an embedding with both P and Q."
-            )
-
-        self.__left_grain = self.__build_exact_grain(
-            self.__R_left,
-            self.__embedding.P,
-            self.__left_x,
-            left_bounds[0],
-            "left",
-        )
-        self.__right_grain = self.__build_exact_grain(
-            self.__R_right,
-            self.__embedding.Q,
-            self.__right_x,
-            right_bounds[0],
-            "right",
-        )
-
-    def __generate_float_grains(
-        self,
-        left_bounds: np.ndarray,
-        right_effective_bounds: np.ndarray,
-    ) -> tuple[GrainBuildResult, np.ndarray, bool, float]:
-        """Generate both grains using the floating-point path.
-
-        For ``vacuum=0``, trims one complete right-grain x period from the high-x side
-        when enough thickness remains. The trim is origin-complete so multi-species
-        conventional-cell groups are preserved.
-
-        :param left_bounds: Length-2 x-bound array for the left grain.
-        :param right_effective_bounds: Length-2 right-grain x-bound array. The upper
-            bound may be reduced if the vacuum-zero trim is applied.
-        :return: ``(right_float_result, right_effective_bounds, vacuum0_trim_applied,
-            x_period_right)``.
-        """
-        left_float_result = self.__generate_grain_result(
-            self.__R_left,
-            self.__left_periodic_miller_rows,
-            left_bounds,
-            grain_side="left",
-        )
-        self.__left_grain = left_float_result.atoms
-
-        x_period_right = self.__x_period(self.__right_periodic_miller_rows)
-        vacuum0_trim_applied = False
-
-        right_float_result = self.__generate_grain_result(
-            self.__R_right,
-            self.__right_periodic_miller_rows,
-            right_effective_bounds,
-            grain_side="right",
-        )
-
-        right_width = right_effective_bounds[1] - right_effective_bounds[0]
-        if (
-            self.__vacuum_thickness == 0
-            and right_width > x_period_right * (1.0 + self.__epsilon)
-        ):
-            new_upper = right_effective_bounds[1] - x_period_right
-            trial_result = self.__trim_float_result_to_upper_x(
-                right_float_result,
-                new_upper,
-            )
-
-            if len(trial_result.atoms) == 0:
-                warnings.warn(
-                    "Vacuum=0 trim would remove all atoms from the right grain. "
-                    "Skipping trim to preserve a non-empty grain.",
-                    UserWarning,
-                    stacklevel=3,
-                )
-            else:
-                right_float_result = trial_result
-                right_effective_bounds[1] = new_upper
-                vacuum0_trim_applied = True
-
-        self.__right_grain = right_float_result.atoms
-
-        return (
-            right_float_result,
-            right_effective_bounds,
-            vacuum0_trim_applied,
-            x_period_right,
-        )
-
-    def __current_gap_metrics(
-        self,
-        left_bounds: np.ndarray,
-        right_effective_bounds: np.ndarray,
-    ) -> tuple[float, float, float, float]:
-        """Return current central and periodic x-gap metrics.
-
-        :param left_bounds: Effective left-grain x bounds.
-        :param right_effective_bounds: Effective right-grain x bounds.
-        :return: ``(central_gap, periodic_gap, left_min_x, right_max_x)``.
-        """
-        left_min_x = float(np.min(self.__left_grain["x"]))
-        left_max_x = float(np.max(self.__left_grain["x"]))
-        right_min_x = float(np.min(self.__right_grain["x"]))
-        right_max_x = float(np.max(self.__right_grain["x"]))
-
-        central_gap = right_min_x - left_max_x
-        periodic_gap = (
-            right_effective_bounds[1] - right_max_x
-        ) + (left_min_x - left_bounds[0])
-
-        return central_gap, periodic_gap, left_min_x, right_max_x
-
-    def __equalize_float_periodic_gap(
-        self,
-        *,
-        central_gap: float,
-        left_min_x: float,
-        right_max_x: float,
-        left_bounds: np.ndarray,
-        right_effective_bounds: np.ndarray,
-        right_float_result: GrainBuildResult,
-        x_period_right: float,
-    ) -> None:
-        """Equalize the periodic gap by removing whole right-grain x periods.
-
-        Removal is performed through complete-origin filtering so atom groups from the
-        same conventional-cell origin are not split.
-
-        :param central_gap: Current central GB gap (Angstroms).
-        :param left_min_x: Minimum left-grain x coordinate (Angstroms).
-        :param right_max_x: Maximum right-grain x coordinate before equalization
-            (Angstroms).
-        :param left_bounds: Effective left-grain x bounds.
-        :param right_effective_bounds: Effective right-grain x bounds.
-        :param right_float_result: Right-grain float build result to trim.
-        :param x_period_right: Right-grain x period (Angstroms).
-        :return: ``None``. May update ``self.__right_grain``.
-        """
-        excess = right_max_x - (right_effective_bounds[1] - central_gap)
-        n_remove = max(1, math.ceil(excess / x_period_right))
-        new_upper = right_effective_bounds[1] - n_remove * x_period_right
-
-        if new_upper <= right_effective_bounds[0]:
-            warnings.warn(
-                f"Gap equalization would remove all atoms from the right grain "
-                f"({n_remove} x-periods; right_x = "
-                f"{right_effective_bounds[1] - right_effective_bounds[0]:.4f} A, "
-                f"x_period = {x_period_right:.4f} A). Skipping equalization to "
-                "preserve a non-empty grain.",
-                UserWarning,
-                stacklevel=3,
-            )
-            return
-
-        grain_width = right_effective_bounds[1] - right_effective_bounds[0]
-        if n_remove * x_period_right > grain_width / 2.0:
-            warnings.warn(
-                f"Gap equalization removed {n_remove} x-period(s) "
-                f"({n_remove * x_period_right:.4f} A), more than half the right "
-                "grain. The resulting bicrystal may be unusable.",
-                UserWarning,
-                stacklevel=3,
-            )
-
-        trial_result = self.__trim_float_result_to_upper_x(
-            right_float_result,
-            new_upper,
-        )
-
-        if len(trial_result.atoms) == 0:
-            warnings.warn(
-                f"Gap equalization would remove all atoms from the right grain "
-                f"({n_remove} x-periods; right_x = "
-                f"{right_effective_bounds[1] - right_effective_bounds[0]:.4f} A, "
-                f"x_period = {x_period_right:.4f} A). Skipping equalization to "
-                "preserve a non-empty grain.",
-                UserWarning,
-                stacklevel=3,
-            )
-            return
-
-        self.__right_grain = trial_result.atoms
-
-        final_periodic_gap = (
-            right_effective_bounds[1] - float(np.max(self.__right_grain["x"]))
-        ) + (left_min_x - left_bounds[0])
-
-        if final_periodic_gap < central_gap - self.__epsilon:
-            warnings.warn(
-                f"Float gap equalization: periodic_gap "
-                f"({final_periodic_gap:.4f} A) < central_gap "
-                f"({central_gap:.4f} A). Stoichiometry preserved; matching would "
-                "require splitting an origin or deleting the right grain.",
-                UserWarning,
-                stacklevel=3,
-            )
-
-    def __equalize_periodic_gap(
-        self,
-        *,
-        left_bounds: np.ndarray,
-        right_effective_bounds: np.ndarray,
-        use_exact: bool,
-        right_float_result: GrainBuildResult | None,
-        vacuum0_trim_applied: bool,
-        x_period_right: float | None,
-    ) -> None:
-        """Handle a periodic x-gap mismatch for the selected construction path.
-
-        The floating path retains its existing complete-origin trimming behavior. The
-        exact decorated-site path never deletes atomic layers merely to reverse
-        projected central/periodic gap ordering. Both projected gaps must nevertheless
-        remain nonnegative within the Cartesian tolerance.
-
-        :param left_bounds: Effective left-grain x bounds.
-        :param right_effective_bounds: Effective right-grain x bounds.
-        :param use_exact: Whether the exact decorated-site path was used.
-        :param right_float_result: Right-grain build metadata for the float path.
-        :param vacuum0_trim_applied: Whether the vacuum-zero pre-trim was applied.
-        :param x_period_right: Right-grain x period for the float path.
-        :return: ``None``. May update ``self.__right_grain``.
-        :raises GBMakerValueError: If an exact grain crosses the central or periodic x
-            boundary, or if required float metadata is missing.
-        """
-
-        (
-            central_gap,
-            periodic_gap,
-            left_min_x,
-            right_max_x,
-        ) = self.__current_gap_metrics(left_bounds, right_effective_bounds)
-
-        if use_exact:
-            if (
-                central_gap < -self.__epsilon
-                or periodic_gap < -self.__epsilon
-            ):
-                raise GBMakerValueError(
-                    "Exact decorated-site construction produced an invalid x-boundary "
-                    f"overlap: central_gap={central_gap:.8f} A, "
-                    f"periodic_gap={periodic_gap:.8f} A."
-                )
-            return
-
-        if periodic_gap >= central_gap - self.__epsilon:
-            return
-
-        if self.__vacuum_thickness == 0 and vacuum0_trim_applied:
-            return
-
-        if right_float_result is None or x_period_right is None:
-            raise GBMakerValueError(
-                "Float gap equalization requires a right-grain float build result "
-                "and right-grain x period."
-            )
-
-        self.__equalize_float_periodic_gap(
-            central_gap=central_gap,
-            left_min_x=left_min_x,
-            right_max_x=right_max_x,
-            left_bounds=left_bounds,
-            right_effective_bounds=right_effective_bounds,
-            right_float_result=right_float_result,
-            x_period_right=x_period_right,
-        )
-
-    def __generate_gb(self) -> None:
-        """Generate the left grain, right grain, and combined GB atom array.
-
-        Builds each grain using the exact integer path when a coherent exact boundary
-        embedding with integer P/Q matrices is available; otherwise uses the
-        floating-point grain-generation path. Periodic x-gap equalization remains
-        available only to the floating path. Exact decorated grains retain every
-        enumerated site and are assembled without x-layer deletion.
-
-        :return: ``None``. Updates ``self.__left_grain``, ``self.__right_grain``, and
-            ``self.__whole_system``.
-        :raises GBMakerValueError: If exact grain generation requires missing P/Q data,
-            if float-path gap equalization lacks right-grain build metadata, or if a
-            downstream grain-generation helper fails.
-        """
-        left_bounds, right_bounds = self.__grain_x_bounds()
-        right_effective_bounds = right_bounds.copy()
-
-        use_exact = self.__use_exact_grain_generation()
-        right_float_result: GrainBuildResult | None = None
-        vacuum0_trim_applied = False
-        x_period_right: float | None = None
-
-        if use_exact:
-            self.__generate_exact_grains(left_bounds, right_bounds)
-        else:
-            (
-                right_float_result,
-                right_effective_bounds,
-                vacuum0_trim_applied,
-                x_period_right,
-            ) = self.__generate_float_grains(left_bounds, right_effective_bounds)
-
-        self.__equalize_periodic_gap(
-            left_bounds=left_bounds,
-            right_effective_bounds=right_effective_bounds,
-            use_exact=use_exact,
-            right_float_result=right_float_result,
-            vacuum0_trim_applied=vacuum0_trim_applied,
-            x_period_right=x_period_right,
-        )
-
-        self.__whole_system = np.hstack((self.__left_grain, self.__right_grain))
+        self.__left_grain = result.left_atoms
+        self.__right_grain = result.right_atoms
+        self.__whole_system = result.atoms
+        self.__gb_region = result.gb_region_atoms
 
     def __calculate_periodic_spacing(self, threshold: float = None) -> dict:
         """
@@ -1215,86 +779,6 @@ class GBMaker:
         unit_cell.init_by_structure(self.__structure, self.__a0, atom_types)
         return unit_cell
 
-    def __x_period(self, periodic_miller_rows: np.ndarray) -> float:
-        """Return one full x-period length for a grain.
-
-        Thin wrapper delegating to ``GBOpt.gbmaker.orientation._x_period``.
-
-        The x-period is the distance between equivalent crystallographic repeats along
-        the boundary-normal direction. It is computed from the first integer periodic
-        Miller row as ``a0 * ||periodic_miller_rows[0]||``.
-
-        :param periodic_miller_rows: Three-row integer periodic Miller matrix for one
-            grain. Row 0 defines the boundary-normal x-period.
-        :return: Boundary-normal x-period in Angstroms.
-        :raises GBMakerValueError: If row 0 is not a nonzero three-component integer
-            Miller row.
-        """
-        return self.__translate_construction_error(
-            _x_period, periodic_miller_rows, self.__a0
-        )
-
-    def __generate_grain_result(
-        self,
-        R_grain: np.ndarray,
-        periodic_miller_rows: np.ndarray,
-        x_bounds: np.ndarray,
-        *,
-        grain_side: str,
-    ) -> GrainBuildResult:
-        """Generate one grain using the floating-point lattice-enumeration path.
-
-        Thin wrapper delegating to
-        ``GBOpt.gbmaker.approximate_grain.build_approximate_grain``.
-
-        An earlier revision of this method accepted ``grain_side: str | None = None``
-        to apply no strain when unset; both current call sites always supply
-        ``"left"``/``"right"``, and ``GrainBuildRequest.grain_side`` requires a
-        concrete value, so this now requires one too -- see ``REFACTOR_CLEANUP.md``
-        for the R08 note recording this intentional signature tightening.
-
-        :param R_grain: Proper rotation matrix for this grain.
-        :param periodic_miller_rows: Three-row integer periodic Miller matrix for this
-            grain. Rows 1 and 2 define the primitive in-plane y/z period vectors used by
-            the floating-point selection basis.
-        :param x_bounds: Length-2 array-like containing the lower and upper x bounds for
-            this grain in the lab frame (Angstroms).
-        :param grain_side: Keyword argument, required. Grain side, either ``"left"``
-            or ``"right"``.
-        :return: Float-path grain build result containing the atom array, parallel
-            origin-ID array, and conventional-cell basis size.
-        :raises GBMakerValueError: If ``grain_side`` is invalid, if selection or
-            clipping cannot preserve complete origin groups, or if no complete origins
-            remain after filtering.
-        """
-        x_bounds = np.asarray(x_bounds, dtype=np.float64)
-        x_offset = float(x_bounds[0])
-        x_length = float(x_bounds[1] - x_bounds[0])
-
-        def _call() -> GrainBuildResult:
-            request = self.__grain_build_request(
-                R_grain,
-                periodic_miller_rows,
-                x_length,
-                x_offset,
-                grain_side,
-                exact=False,
-            )
-            return build_approximate_grain(request)
-
-        return self.__translate_construction_error(_call)
-
-    def __set_gb_region(self):
-        """
-        Identifies the atoms in the GB region based on the gb thickness.
-        """
-        x_gb = self.__vacuum_thickness + self.__left_x
-        left_cut = x_gb - self.__gb_thickness / 2.0
-        right_cut = x_gb + self.__gb_thickness / 2.0
-        left_gb = self.__left_grain[self.__left_grain['x'] > left_cut]
-        right_gb = self.__right_grain[self.__right_grain['x'] < right_cut]
-        self.__gb_region = np.hstack((left_gb, right_gb))
-
     def __scaled_periodic_basis_vector(
         self, period_vector: np.ndarray, box_length: float, axis_index: int
     ) -> np.ndarray:
@@ -1380,64 +864,6 @@ class GBMaker:
             filter_grain_result_complete_origins, result, atom_mask
         )
 
-    def __trim_float_result_to_upper_x(
-        self,
-        result: GrainBuildResult,
-        upper_x: float,
-    ) -> GrainBuildResult:
-        """Trim a float-path grain to an upper x bound by complete origins.
-
-        Thin wrapper delegating to
-        ``GBOpt.gbmaker.approximate_grain.trim_grain_result_to_upper_x``.
-
-        :param result: Float-path grain build result to trim.
-        :param upper_x: Upper x bound in Angstroms.
-        :return: Trimmed float-path grain build result.
-        :raises GBMakerValueError: If ``upper_x`` is not finite or if complete-origin
-            filtering rejects the result metadata.
-        """
-        return self.__translate_construction_error(
-            trim_grain_result_to_upper_x, result, upper_x, self.__epsilon
-        )
-
-    def __grain_strain_scales(self, grain_side: str) -> tuple[float, float]:
-        """Return lab-frame in-plane strain scale factors for one grain.
-
-        The returned scale factors are applied to the rotated lab-frame y and z
-        coordinates of atoms in the selected grain. Axes without mismatch accommodation
-        use scale factor ``1.0``.
-
-        :param grain_side: Grain side, either ``"left"`` or ``"right"``.
-        :return: ``(y_scale, z_scale)`` for the selected grain.
-        :raises GBMakerValueError: If ``grain_side`` is not ``"left"`` or ``"right"``.
-        """
-        if grain_side not in {"left", "right"}:
-            raise GBMakerValueError(
-                f"grain_side must be 'left' or 'right'; got {grain_side!r}."
-            )
-
-        y_accommodation = self.__strain_accommodation.get("y")
-        z_accommodation = self.__strain_accommodation.get("z")
-
-        y_scale = 1.0
-        z_scale = 1.0
-
-        if y_accommodation is not None:
-            y_scale = (
-                y_accommodation.left_scale
-                if grain_side == "left"
-                else y_accommodation.right_scale
-            )
-
-        if z_accommodation is not None:
-            z_scale = (
-                z_accommodation.left_scale
-                if grain_side == "left"
-                else z_accommodation.right_scale
-            )
-
-        return y_scale, z_scale
-
     def __update_dims(self) -> None:
         """Updates the y_dim and z_dim parameters after a relevant parameter has been
         changed.
@@ -1478,7 +904,6 @@ class GBMaker:
         self.__box_dims = np.array(plan.box_dims, dtype=float)
 
         self.__generate_gb()
-        self.__set_gb_region()
 
     def __validate(
         self,

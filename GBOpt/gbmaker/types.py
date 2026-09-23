@@ -910,22 +910,43 @@ class GrainBuildResult:
 class BicrystalResult:
     """Fully assembled bicrystal produced by grain construction and merging.
 
+    An earlier revision of this type carried only the combined ``atoms`` array. Once
+    R09 wired it up from real ``GBOpt.gbmaker.assembly.assemble_bicrystal`` call sites,
+    that single field turned out to conflate what real callers need separately:
+    ``GBOpt.GBMaker`` mirrors the left grain, right grain, combined system, and
+    GB-region selection onto four distinct instance attributes (``__left_grain``,
+    ``__right_grain``, ``__whole_system``, ``__gb_region``) for its own properties and
+    for downstream LAMMPS-writer/manipulator code, so ``left_atoms``/``right_atoms``/
+    ``gb_region_atoms`` were added alongside the combined ``atoms`` array rather than
+    forcing callers to re-derive them.
+
     :param atoms: Structured atom array for the combined left and right grains.
+    :param left_atoms: Structured atom array for the left grain alone.
+    :param right_atoms: Structured atom array for the right grain alone.
+    :param gb_region_atoms: Structured atom array for the atoms within the
+        grain-boundary region window.
     :param box_dims: Read-only 3 by 2 simulation-box bounds (Angstroms).
     :param normal_topology: Physical topology along the grain-boundary normal.
     :param gb_id: Grain-boundary identifier carried onto the assembled result.
     """
 
     atoms: np.ndarray = field(repr=False)
+    left_atoms: np.ndarray = field(repr=False)
+    right_atoms: np.ndarray = field(repr=False)
+    gb_region_atoms: np.ndarray = field(repr=False)
     box_dims: NDArray[np.floating] = field(repr=False)
     normal_topology: BoundaryNormalTopology
     gb_id: int
 
     def __post_init__(self) -> None:
         """Validate and freeze bicrystal-result fields."""
-        atoms = np.asarray(self.atoms)
-        if atoms.ndim != 1:
-            raise GBMakerConstructionValueError("atoms must be a one-dimensional array")
+        for name in ("atoms", "left_atoms", "right_atoms", "gb_region_atoms"):
+            value = np.asarray(getattr(self, name))
+            if value.ndim != 1:
+                raise GBMakerConstructionValueError(
+                    f"{name} must be a one-dimensional array"
+                )
+            object.__setattr__(self, name, value)
         object.__setattr__(self, "box_dims", _readonly_box_dims(self.box_dims))
         if not isinstance(self.normal_topology, BoundaryNormalTopology):
             raise GBMakerConstructionTypeError(

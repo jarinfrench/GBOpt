@@ -399,6 +399,9 @@ def test_grain_build_result_rejects_nonpositive_basis_size() -> None:
 def test_bicrystal_result_normalizes_valid_fields() -> None:
     result = BicrystalResult(
         atoms=_atoms(4),
+        left_atoms=_atoms(2),
+        right_atoms=_atoms(2),
+        gb_region_atoms=_atoms(2),
         box_dims=_box_dims(),
         normal_topology=BoundaryNormalTopology.SINGLE_INTERFACE_SLAB,
         gb_id=3,
@@ -410,6 +413,9 @@ def test_bicrystal_result_normalizes_valid_fields() -> None:
 def test_bicrystal_result_accepts_zero_gb_id() -> None:
     result = BicrystalResult(
         atoms=_atoms(4),
+        left_atoms=_atoms(2),
+        right_atoms=_atoms(2),
+        gb_region_atoms=_atoms(2),
         box_dims=_box_dims(),
         normal_topology=BoundaryNormalTopology.PERIODIC_BICRYSTAL,
         gb_id=0,
@@ -421,7 +427,23 @@ def test_bicrystal_result_rejects_negative_gb_id() -> None:
     with pytest.raises(GBMakerConstructionValueError):
         BicrystalResult(
             atoms=_atoms(4),
+            left_atoms=_atoms(2),
+            right_atoms=_atoms(2),
+            gb_region_atoms=_atoms(2),
             box_dims=_box_dims(),
             normal_topology=BoundaryNormalTopology.PERIODIC_BICRYSTAL,
             gb_id=-1,
+        )
+
+
+def test_bicrystal_result_rejects_non_1d_left_atoms() -> None:
+    with pytest.raises(GBMakerConstructionValueError):
+        BicrystalResult(
+            atoms=_atoms(4),
+            left_atoms=_atoms(4).reshape(2, 2),
+            right_atoms=_atoms(2),
+            gb_region_atoms=_atoms(2),
+            box_dims=_box_dims(),
+            normal_topology=BoundaryNormalTopology.PERIODIC_BICRYSTAL,
+            gb_id=1,
         )

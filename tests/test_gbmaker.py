@@ -34,6 +34,7 @@ from GBOpt.GBMaker import (
     _find_commensurate_pair,
     wrap_reduced_coordinate,
 )
+from GBOpt.gbmaker.assembly import _grain_strain_scales
 from GBOpt.gbmaker.geometry import (
     _cartesian_from_box_coordinates,
     _reduced_box_coordinates,
@@ -1644,8 +1645,8 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                     @ rotated_unit_cell_basis
                 )
 
-                y_scale, z_scale = gb._GBMaker__grain_strain_scales(
-                    grain_name
+                y_scale, z_scale = _grain_strain_scales(
+                    grain_name, gb._GBMaker__strain_accommodation
                 )
                 primitive_periods *= np.array(
                     [1.0, y_scale, z_scale],
