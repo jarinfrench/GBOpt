@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import math
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -39,11 +38,12 @@ from GBOpt.gbmaker.dimension import (
     _find_commensurate_pair as _plan_find_commensurate_pair,
 )
 from GBOpt.gbmaker.dimension import (
+    _normalize_vacuum_topology,
     _plan_box_dims,
     plan_dimensions,
     plan_periodic_spacing,
 )
-from GBOpt.gbmaker.geometry import _triclinic_tilt_params
+from GBOpt.gbmaker.geometry import _rotate_atoms_about_x, _triclinic_tilt_params
 from GBOpt.gbmaker.geometry import wrap_reduced_coordinate as _wrap_reduced_coordinate
 from GBOpt.gbmaker.orientation import (
     _decompose_misorientation,
@@ -63,22 +63,6 @@ from GBOpt.UnitCell import UnitCell
 _LEGACY_CONSTRUCTOR_DEPRECATION = (
     "GBMaker(...) is deprecated; use GBMaker.from_boundary_spec(...)."
 )
-
-
-def _normalize_vacuum_topology(
-    vacuum: float,
-    *,
-    tolerance: float,
-) -> tuple[float, BoundaryNormalTopology]:
-    """Normalize vacuum thickness and its boundary-normal topology.
-
-    :param vacuum: Validated nonnegative vacuum thickness in angstroms.
-    :param tolerance: Keyword argument, required. Coordinate tolerance in angstroms.
-    :return: Normalized vacuum thickness and explicit topology.
-    """
-    if np.isclose(vacuum, 0.0, atol=tolerance, rtol=0.0):
-        return 0.0, BoundaryNormalTopology.PERIODIC_BICRYSTAL
-    return float(vacuum), BoundaryNormalTopology.SINGLE_INTERFACE_SLAB
 
 
 class GBMakerError(Exception):
@@ -948,22 +932,6 @@ class GBMaker:
         )
 
     # Public methods
-    def get_supercell(self, corners: np.ndarray) -> np.ndarray:
-        """Generates a supercell of lattice sites.
-
-        :param corners: Array containing the position of the corners of the unit cells.
-        :return: Structured numpy array containing the atom data (type and position) for
-            the supercell.
-        """
-        # Unit cell as structured array
-        unit_cell = self._config.unit_cell.asarray()
-        supercell = np.tile(unit_cell, len(corners))
-        translations = np.repeat(corners, len(unit_cell), axis=0)
-        supercell["x"] += translations[:, 0]
-        supercell["y"] += translations[:, 1]
-        supercell["z"] += translations[:, 2]
-        return supercell
-
     def update_spacing(self, threshold: float = None) -> None:
         """Update the periodic spacing based on the rotation matrix and the optional
         threshold parameter.
@@ -1022,14 +990,9 @@ class GBMaker:
             cell[1, 0] = xy
             cell[2, 0] = xz
             cell[2, 1] = yz
-            ct, st = math.cos(theta), math.sin(theta)
-            Rx = np.array([[1, 0, 0], [0, ct, -st], [0, st, ct]])
-            # Copy before rotating in place: 'atoms' may be the caller's own array (or
+            # Returns a new array: 'atoms' may be the caller's own array (or
             # self._result.atoms), which write_lammps must not mutate as a side effect.
-            atoms = atoms.copy()
-            positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
-            rotated_positions = (Rx @ positions.T).T
-            atoms["x"], atoms["y"], atoms["z"] = rotated_positions.T
+            atoms = _rotate_atoms_about_x(atoms, theta)
 
         try:
             structure = StructureData(atoms, cell, origin)

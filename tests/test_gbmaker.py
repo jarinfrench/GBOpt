@@ -1054,12 +1054,6 @@ class TestGBMaker(unittest.TestCase):
         self.assertEqual(box_dims.shape, (3, 2))
 
     # Tests for public methods
-    def test_get_supercell(self):
-        corners = np.array([[0, 0, 0], [10, 10, 10]])
-        supercell = self.gbm.get_supercell(corners)
-        self.assertTrue(isinstance(supercell, np.ndarray))
-        self.assertGreater(supercell.shape[0], 0)
-
     def test_write_lammps(self):
         atoms = self.gbm.whole_system
         box_sizes = self.gbm.box_dims

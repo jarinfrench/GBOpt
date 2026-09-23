@@ -5,7 +5,8 @@ import math
 import numpy as np
 import pytest
 
-from GBOpt.gbmaker.dimension import _find_commensurate_pair
+from GBOpt.BoundaryTopology import BoundaryNormalTopology
+from GBOpt.gbmaker.dimension import _find_commensurate_pair, _normalize_vacuum_topology
 from GBOpt.gbmaker.types import GBMakerConstructionValueError
 
 # --------------------------------------------------------------------------------------
@@ -211,3 +212,32 @@ def test_find_commensurate_pair_rejects_invalid_max_n(max_n):
         match=r"max_n must be a positive integer",
     ):
         _find_commensurate_pair(1.0, 1.0, max_n=max_n)
+
+
+# --------------------------------------------------------------------------------------
+# Vacuum/topology normalization
+# --------------------------------------------------------------------------------------
+
+
+def test_normalize_vacuum_topology_zero_vacuum_is_periodic_bicrystal():
+    vacuum, topology = _normalize_vacuum_topology(0.0, tolerance=1e-10)
+    assert vacuum == 0.0
+    assert topology is BoundaryNormalTopology.PERIODIC_BICRYSTAL
+
+
+def test_normalize_vacuum_topology_within_tolerance_snaps_to_zero():
+    vacuum, topology = _normalize_vacuum_topology(5e-11, tolerance=1e-10)
+    assert vacuum == 0.0
+    assert topology is BoundaryNormalTopology.PERIODIC_BICRYSTAL
+
+
+def test_normalize_vacuum_topology_nonzero_vacuum_is_single_interface_slab():
+    vacuum, topology = _normalize_vacuum_topology(10.0, tolerance=1e-10)
+    assert vacuum == 10.0
+    assert topology is BoundaryNormalTopology.SINGLE_INTERFACE_SLAB
+
+
+def test_normalize_vacuum_topology_just_outside_tolerance_is_single_interface_slab():
+    vacuum, topology = _normalize_vacuum_topology(2e-10, tolerance=1e-10)
+    assert vacuum == 2e-10
+    assert topology is BoundaryNormalTopology.SINGLE_INTERFACE_SLAB

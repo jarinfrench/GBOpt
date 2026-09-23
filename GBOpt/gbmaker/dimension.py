@@ -467,6 +467,22 @@ def _plan_box_dims(
     )
 
 
+def _normalize_vacuum_topology(
+    vacuum: float,
+    *,
+    tolerance: float,
+) -> tuple[float, BoundaryNormalTopology]:
+    """Normalize vacuum thickness and its boundary-normal topology.
+
+    :param vacuum: Validated nonnegative vacuum thickness in angstroms.
+    :param tolerance: Keyword argument, required. Coordinate tolerance in angstroms.
+    :return: Normalized vacuum thickness and explicit topology.
+    """
+    if np.isclose(vacuum, 0.0, atol=tolerance, rtol=0.0):
+        return 0.0, BoundaryNormalTopology.PERIODIC_BICRYSTAL
+    return float(vacuum), BoundaryNormalTopology.SINGLE_INTERFACE_SLAB
+
+
 def plan_periodic_spacing(
     *,
     a0: float,

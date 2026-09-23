@@ -957,3 +957,25 @@ def _triclinic_tilt_params(
     yz = float(ct * A3_lab[1] - st * A3_lab[2])
 
     return xy, xz, yz, theta
+
+
+def _rotate_atoms_about_x(atoms: np.ndarray, theta: float) -> np.ndarray:
+    """Rotate a structured atom array's positions about the x-axis.
+
+    Used to pre-rotate atom coordinates into the lab frame for LAMMPS
+    restricted-triclinic output, where ``theta`` is the angle
+    ``_triclinic_tilt_params`` computes to bring the box's b-vector into the
+    xy-plane. Does not mutate ``atoms``.
+
+    :param atoms: Structured atom array with ``"x"``/``"y"``/``"z"`` fields.
+    :param theta: Rotation angle about the x-axis (radians).
+    :return: New structured atom array with rotated positions; all other fields
+        unchanged.
+    """
+    ct, st = math.cos(theta), math.sin(theta)
+    Rx = np.array([[1.0, 0.0, 0.0], [0.0, ct, -st], [0.0, st, ct]])
+    rotated = atoms.copy()
+    positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
+    rotated_positions = (Rx @ positions.T).T
+    rotated["x"], rotated["y"], rotated["z"] = rotated_positions.T
+    return rotated

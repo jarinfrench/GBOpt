@@ -1,5 +1,7 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
+import math
+
 import numpy as np
 import pytest
 
@@ -10,6 +12,7 @@ from GBOpt.gbmaker.geometry import (
     _clip_complete_origins_to_cartesian_box,
     _reduced_box_coordinates,
     _reduced_coordinate_tolerance,
+    _rotate_atoms_about_x,
     _scaled_periodic_basis_vector,
     _selection_basis_vectors,
     _triclinic_tilt_params,
@@ -525,3 +528,34 @@ def test_triclinic_tilt_params_selects_right_grain_when_its_y_period_row_is_larg
 
     expected = (0.0, 4.0, 8.620436566990362, -1.2793395323170296)
     assert result == pytest.approx(expected, abs=1e-12)
+
+
+# --------------------------------------------------------------------------------------
+# _rotate_atoms_about_x
+# --------------------------------------------------------------------------------------
+
+
+def test_rotate_atoms_about_x_zero_theta_is_identity():
+    atoms = np.array(
+        [("Cu", 1.0, 2.0, 3.0), ("Cu", -1.0, 0.5, -0.5)], dtype=Atom.atom_dtype
+    )
+    rotated = _rotate_atoms_about_x(atoms, 0.0)
+    np.testing.assert_allclose(rotated["x"], atoms["x"])
+    np.testing.assert_allclose(rotated["y"], atoms["y"])
+    np.testing.assert_allclose(rotated["z"], atoms["z"])
+
+
+def test_rotate_atoms_about_x_quarter_turn_maps_y_to_z():
+    atoms = np.array([("Cu", 5.0, 1.0, 0.0)], dtype=Atom.atom_dtype)
+    rotated = _rotate_atoms_about_x(atoms, math.pi / 2)
+    # x is invariant under a rotation about the x-axis; y -> z, z -> -y at theta=pi/2.
+    np.testing.assert_allclose(rotated["x"], [5.0], atol=1e-12)
+    np.testing.assert_allclose(rotated["y"], [0.0], atol=1e-12)
+    np.testing.assert_allclose(rotated["z"], [1.0], atol=1e-12)
+
+
+def test_rotate_atoms_about_x_does_not_mutate_input():
+    atoms = np.array([("Cu", 1.0, 2.0, 3.0)], dtype=Atom.atom_dtype)
+    original = atoms.copy()
+    _rotate_atoms_about_x(atoms, math.pi / 4)
+    np.testing.assert_array_equal(atoms, original)
