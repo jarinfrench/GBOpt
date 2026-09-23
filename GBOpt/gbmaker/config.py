@@ -19,7 +19,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Sequence
 from numbers import Number
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 
@@ -43,12 +43,10 @@ from .material import resolve_material_state
 from .types import (
     _VALID_BOUNDARY_MODES,
     _VALID_STRAIN_GRAIN,
-    BoundaryMode,
     GBBuildConfig,
     GBMakerConstructionTypeError,
     GBMakerConstructionValueError,
     ResolvedBoundaryInput,
-    StrainGrainPolicy,
 )
 
 
@@ -356,7 +354,7 @@ def normalize_legacy_config(
     return GBBuildConfig(
         material=material,
         gb_thickness=gb_thickness,
-        repeat_factor=cast("tuple[int, int]", tuple(validated_repeat_factor)),
+        repeat_factor=tuple(validated_repeat_factor),
         x_dim_min=x_dim_min,
         vacuum=vacuum,
         interaction_distance=interaction_distance,
@@ -364,7 +362,7 @@ def normalize_legacy_config(
         epsilon=epsilon,
         mismatch_tol=mismatch_tol,
         mismatch_max_cells=mismatch_max_cells,
-        strain_grain=cast(StrainGrainPolicy, strain_grain),
+        strain_grain=strain_grain,
     )
 
 
@@ -487,7 +485,7 @@ def resolve_boundary_input(
 
     return ResolvedBoundaryInput(
         embedding=embedding,
-        mode=cast(BoundaryMode, mode),
+        mode=mode,
         max_primitive_area_index=max_primitive_area_index,
         max_pq_determinant=max_pq_determinant,
     )

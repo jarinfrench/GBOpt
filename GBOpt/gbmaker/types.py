@@ -19,7 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from numbers import Integral, Real
 from types import MappingProxyType
-from typing import Literal, TypeAlias, cast
+from typing import Literal, TypeAlias
 
 import numpy as np
 from numpy.typing import NDArray
@@ -202,7 +202,7 @@ def _require_strain_grain(value: object) -> StrainGrainPolicy:
         raise GBMakerConstructionValueError(
             f"strain_grain must be one of {expected}; got {value!r}"
         )
-    return cast(StrainGrainPolicy, value)
+    return value
 
 
 def _require_boundary_mode(value: object) -> BoundaryMode:
@@ -217,7 +217,7 @@ def _require_boundary_mode(value: object) -> BoundaryMode:
         raise GBMakerConstructionValueError(
             f"mode must be one of {expected}; got {value!r}"
         )
-    return cast(BoundaryMode, value)
+    return value
 
 
 def _require_grain_side(value: object) -> GrainSide:
@@ -232,7 +232,7 @@ def _require_grain_side(value: object) -> GrainSide:
         raise GBMakerConstructionValueError(
             f"grain_side must be one of {expected}; got {value!r}"
         )
-    return cast(GrainSide, value)
+    return value
 
 
 def _readonly_float_matrix(value: object, shape: tuple[int, ...], name: str) -> np.ndarray:
