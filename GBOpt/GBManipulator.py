@@ -31,12 +31,6 @@ from GBOpt.BoundaryTopology import (
     BoundaryNormalTopology,
     normalize_boundary_normal_topology,
 )
-from GBOpt.FileGrainOwnership import (
-    LammpsAtomData,
-    LammpsDataError,
-    read_lammps_data_file,
-    read_lammps_dump_file,
-)
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GrainOwnership import (
     LEFT_GRAIN_LABEL,
@@ -49,6 +43,8 @@ from GBOpt.interface.types import (
     InterfaceCandidateTypeError,
     InterfaceCandidateValueError,
 )
+from GBOpt.io import StructureData
+from GBOpt.io.lammps import LammpsDataError, read_structure_file
 from GBOpt.UnitCell import UnitCell
 
 # TODO: Generalize to interfaces, not just GBs
@@ -649,6 +645,12 @@ class ParentFileNotFoundError(ParentError, FileNotFoundError):
 class ParentCorruptedFileError(ParentError):
     """
     Exception raised in the Parent class when an error occurs while reading a snapshot.
+
+    As of R13, this is the single exception Parent's file-backed construction raises
+    for any structure-file reading failure -- malformed/unsupported file content,
+    missing required data, or an invalid type mapping -- since these are all reported
+    by ``GBOpt.io.lammps``'s readers as one flat ``LammpsDataError``, which no longer
+    distinguishes them the way Parent's own removed file-syntax parsing once did.
     """
 
 
@@ -656,6 +658,10 @@ class ParentFileMissingDataError(ParentError):
     """
     Exception raised when data is missing from a snapshot that is otherwise formatted
     correctly.
+
+    As of R13, Parent no longer raises this directly -- ``ParentCorruptedFileError``
+    covers every structure-file reading failure (see its docstring). Retained only so
+    existing ``except ParentFileMissingDataError`` callers keep importing successfully.
     """
 
 
@@ -684,6 +690,21 @@ class ParentsProxyTypeError(ParentsProxyError, TypeError):
     """
 
 
+def _box_dims_from_structure(structure: StructureData) -> np.ndarray:
+    """Derive legacy orthogonal box bounds from a neutral structure's diagonal cell.
+
+    Assumes ``structure.cell`` is diagonal, as every ``GBOpt.io.lammps`` reader
+    produces; the same assumption and conversion ``GBOpt.io.lammps.compat`` uses to
+    reconstruct ``LammpsAtomData.box_dims``.
+
+    :param structure: Neutral structure snapshot with a diagonal cell.
+    :return: A ``(3, 2)`` array of ``[lower, upper]`` bounds per axis.
+    """
+    widths = np.diagonal(structure.cell)
+    lower = structure.origin
+    return np.stack([lower, lower + widths], axis=1)
+
+
 class Parent:
     """Legacy compatibility state used by :class:`GBManipulator` inputs.
 
@@ -703,7 +724,6 @@ class Parent:
         construction without explicit ownership uses deprecated coordinate-based grain
         inference.
     """
-    __num_to_name = {val: key for key, val in Atom._numbers.items()}
 
     def __init__(
         self,
@@ -734,7 +754,57 @@ class Parent:
                 type_dict,
                 grain_ownership,
             )
+        self.__finish_init()
 
+    @classmethod
+    def from_structure(
+        cls,
+        structure: StructureData,
+        *,
+        unit_cell: UnitCell,
+        gb_thickness: float = 10,
+        grain_ownership: GrainOwnership | None = None,
+    ) -> "Parent":
+        """Construct a Parent directly from neutral structure data.
+
+        This is the canonical construction seam: ``Parent(filename, ...)`` selects a
+        reader for the file's format, produces a :class:`~GBOpt.io.StructureData`, and
+        delegates to this method rather than parsing LAMMPS file syntax itself.
+
+        :param structure: Neutral structure snapshot, typically produced by a
+            ``GBOpt.io.lammps`` reader.
+        :param unit_cell: Keyword argument, required. Nominal unit cell of the bulk
+            structure.
+        :param gb_thickness: Keyword argument, optional, defaults to ``10``. Thickness
+            of the GB region, given in angstroms.
+        :param grain_ownership: Keyword argument, optional, defaults to ``None``.
+            Explicit persistent grain ownership. Without it, construction falls back to
+            deprecated coordinate-based grain inference (see the class docstring).
+        :return: A fully constructed Parent.
+        :raises ParentValueError: If ``unit_cell`` is not given or ``grain_ownership``
+            is not a ``GrainOwnership`` instance.
+        :raises GrainOwnershipError: If ``grain_ownership`` is inconsistent with
+            ``structure``.
+        """
+        if grain_ownership is not None and not isinstance(
+            grain_ownership, GrainOwnership
+        ):
+            raise ParentValueError("grain_ownership must be a GrainOwnership instance")
+        if not unit_cell:
+            raise ParentValueError("Unit cell must be specified for files")
+        if gb_thickness is None:  # defaults to 10 if passed in as None.
+            gb_thickness = 10
+        obj = cls.__new__(cls)
+        obj.__init_from_structure_data(structure, unit_cell, gb_thickness, grain_ownership)
+        obj.__finish_init()
+        return obj
+
+    def __finish_init(self) -> None:
+        """Derive GB-region membership shared by every construction path.
+
+        :raises AttributeError: If called before a construction path has populated this
+            Parent's whole-system, grain, and geometry state.
+        """
         x_gb = self.__gb_plane_x
         left_cut = x_gb - self.__gb_thickness / 2.0
         right_cut = x_gb + self.__gb_thickness / 2.0
@@ -863,21 +933,70 @@ class Parent:
         """
         Method for initializing the Parent using a file.
 
+        Selects a ``GBOpt.io.lammps`` reader by the file's own content (LAMMPS dump or
+        LAMMPS data format) and delegates the resulting neutral structure to
+        :meth:`from_structure`; this method itself does no LAMMPS file-syntax parsing.
+
         :param system_file: Filename of the atom structure file. Currently allowed
-            formats: LAMMPS dump file, LAMMPS input file.
+            formats: LAMMPS dump file, LAMMPS input (data) file.
         :param unit_cell: Nominal unit cell of the bulk structure.
         :param gb_thickness: Thickness of the GB region, given in angstroms.
         :param type_dict: Conversion from type number to type name, optional. Note that
             if this is not provided and the snapshot does not indicate the atom names,
             atom names are assumed started from "H".
-        :raises ParentValueError: Exception raised if unit_cell is not passed in or the
-            file format of the file is unrecognized, or the file has less than 10 lines.
+        :raises ParentValueError: Exception raised if unit_cell is not passed in.
         :raises ParentFileNotFoundError: Exception raised if the specified file is not
             found.
+        :raises ParentCorruptedFileError: Exception raised if the file's format is
+            unrecognized, or its content, type mapping, geometry, or topology is
+            malformed, ambiguous, or unsupported. See that exception's docstring for why
+            this single exception now covers every reader failure.
         """
-
         if not unit_cell:
             raise ParentValueError("Unit cell must be specified for files")
+        if not isfile(system_file):
+            raise ParentFileNotFoundError(f"{system_file} does not exist.")
+        try:
+            structure = read_structure_file(system_file, type_dict=type_dict)
+        except LammpsDataError as exc:
+            raise ParentCorruptedFileError(
+                f"Unable to read {system_file} as a supported LAMMPS structure file: "
+                f"{exc}"
+            ) from exc
+
+        if grain_ownership is None:
+            warnings.warn(
+                "File-backed Parent initialization without explicit grain "
+                "ownership is deprecated because gb_plane_x and grain "
+                "membership must be inferred from coordinates. Supply "
+                "grain_ownership with explicit interface metadata instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+        self.__init_from_structure_data(structure, unit_cell, gb_thickness, grain_ownership)
+
+    def __init_from_structure_data(
+        self,
+        structure: StructureData,
+        unit_cell: UnitCell,
+        gb_thickness: float,
+        grain_ownership: GrainOwnership | None,
+    ) -> None:
+        """Populate this Parent's file-backed state from neutral structure data.
+
+        With ``grain_ownership`` supplied, persistent grain identity is restored
+        explicitly (see :meth:`__init_from_owned_structure`). Without it, grain
+        membership and ``gb_plane_x`` are inferred from the box x-midpoint -- the
+        deprecated legacy fallback documented on the class.
+
+        :param structure: Neutral structure snapshot to construct from.
+        :param unit_cell: Nominal unit cell of the bulk structure.
+        :param gb_thickness: Thickness of the GB region, given in angstroms.
+        :param grain_ownership: Explicit persistent grain ownership, or ``None`` for the
+            legacy geometric fallback.
+        :raises GrainOwnershipError: If ``grain_ownership`` is inconsistent with
+            ``structure``.
+        """
         self.__unit_cell = unit_cell
         self.__gb_thickness = gb_thickness
         self.__inplane_periodic = (True, True)
@@ -885,96 +1004,53 @@ class Parent:
         self.__grain_ownership = None
         self.__initial_atom_ids = None
         self.__normal_topology = BoundaryNormalTopology.UNKNOWN
-        if not isfile(system_file):
-            raise ParentFileNotFoundError(f"{system_file} does not exist.")
-        # We need to first identify what type of file it is. Since filenames can be just
-        # about anything, we do this by checking the first few lines of the file.
-        head = []
-        try:
-            # The 10 here is arbitrary. We may need to look into making this more robust.
-            with open(system_file) as f:
-                head = [next(f) for _ in range(10)]
-        except StopIteration as e:
-            raise ParentValueError(
-                f"Unable to determine format of {system_file}. File too short. {e}")
 
-        keywords = {
-            self.__init_from_lammps_dump: [
-                "ITEM: TIMESTEP",
-                "ITEM: NUMBER OF ATOMS",
-                "ITEM: BOX BOUNDS",
-                "ITEM: ATOMS",
-            ],
-            self.__init_from_lammps_input: [
-                "atoms",
-                "bonds",
-                "angles",
-                "dihedrals",
-                "impropers",
-                "atom types",
-                "bond types",
-                "angle types",
-                "dihedral types",
-                "improper types",
-                "xlo xhi",
-                "ylo yhi",
-                "zlo zhi",
-                "xy xz yz",
-                "avec",
-                "bvec",
-                "cvec",
-                "abc origin",
-            ]
-        }
+        if grain_ownership is not None:
+            self.__init_from_owned_structure(structure, grain_ownership)
+            return
 
-        for method, file_keywords in keywords.items():
-            if any(keyword in line for keyword in file_keywords for line in head):
-                if grain_ownership is None:
-                    warnings.warn(
-                        "File-backed Parent initialization without explicit grain "
-                        "ownership is deprecated because gb_plane_x and grain "
-                        "membership must be inferred from coordinates. Supply "
-                        "grain_ownership with explicit interface metadata instead.",
-                        DeprecationWarning,
-                        stacklevel=3,
-                    )
-                method(
-                    system_file,
-                    unit_cell,
-                    gb_thickness,
-                    type_dict,
-                    grain_ownership,
-                )
-                break
-        else:
-            raise ParentValueError(f"Unknown file format for {system_file}")
+        box_dims = _box_dims_from_structure(structure)
+        self.__whole_system = np.array(structure.atoms, copy=True)
+        self.__box_dims = box_dims
+        self.__x_dim = float(box_dims[0, 1] - box_dims[0, 0])
+        self.__y_dim = float(box_dims[1, 1] - box_dims[1, 0])
+        self.__z_dim = float(box_dims[2, 1] - box_dims[2, 0])
+        # TODO: Need a more robust calculation of where the GB is located.
+        grain_cutoff = (box_dims[0, 1] - box_dims[0, 0]) / 2 + box_dims[0, 0]
+        mask = self.__whole_system["x"] < grain_cutoff
+        self.__left_grain = self.__whole_system[mask]
+        self.__right_grain = self.__whole_system[~mask]
+        self.__gb_plane_x = (
+            max(self.__left_grain["x"]) + min(self.__right_grain["x"])) / 2
+        self.__left_grain_x_bounds = np.array(
+            [box_dims[0, 0], self.__gb_plane_x], dtype=float
+        )
+        self.__right_grain_x_bounds = np.array(
+            [self.__gb_plane_x, box_dims[0, 1]], dtype=float
+        )
 
-        if self.__grain_ownership is None:
-            self.__left_grain_x_bounds = np.array(
-                [self.__box_dims[0, 0], self.__gb_plane_x], dtype=float
-            )
-            self.__right_grain_x_bounds = np.array(
-                [self.__gb_plane_x, self.__box_dims[0, 1]], dtype=float
-            )
-
-    def __init_from_owned_snapshot(
+    def __init_from_owned_structure(
         self,
-        snapshot: LammpsAtomData,
+        structure: StructureData,
         grain_ownership: GrainOwnership,
     ) -> None:
         """Restore a file-backed parent from explicit ownership and parsed rows.
 
-        :param snapshot: Parsed LAMMPS snapshot in file-row order.
+        :param structure: Neutral structure snapshot in file-row order.
         :param grain_ownership: Explicit ownership keyed by serialization-local IDs.
         :raises GrainOwnershipError: If IDs, geometry, or topology are inconsistent.
         """
-        aligned = grain_ownership.aligned_to(snapshot.atom_ids)
-        file_ids = snapshot.atom_ids
+        file_ids = structure.external_ids
+        # Every GBOpt.io.lammps reader always populates external_ids for LAMMPS data
+        # and dump formats; GBOpt.io.lammps.compat._to_lammps_atom_data relies on the
+        # same invariant.
+        assert file_ids is not None
+        aligned = grain_ownership.aligned_to(file_ids)
         order = np.argsort(file_ids, kind="stable")
         sorted_ids = file_ids[order]
         ownership = aligned.aligned_to(sorted_ids)
-        atoms = snapshot.atoms[order]
-        box_dims = snapshot.box_dims
+        atoms = structure.atoms[order]
+        box_dims = _box_dims_from_structure(structure)
         tolerance = ownership.coordinate_tolerance
         left_bounds = ownership.left_grain_x_bounds
         right_bounds = ownership.right_grain_x_bounds
@@ -993,12 +1069,12 @@ class Parent:
             raise GrainOwnershipError(
                 "physical grain x bounds must lie inside the file box"
             )
-        if snapshot.boundary_periodic is not None:
+        if structure.periodicity is not None:
             expected = (
                 ownership.periodic_outer_x_interface,
                 *ownership.inplane_periodic,
             )
-            if snapshot.boundary_periodic != expected:
+            if structure.periodicity != expected:
                 raise GrainOwnershipError(
                     "file boundary topology does not match explicit ownership"
                 )
@@ -1037,313 +1113,6 @@ class Parent:
             coordinate_tolerance=self.__coordinate_tolerance,
             normal_topology=self.__normal_topology,
         )
-
-    def __init_from_lammps_dump(
-        self,
-        system_file: str,
-        unit_cell: UnitCell,
-        gb_thickness: float,
-        type_dict: dict | None,
-        grain_ownership: GrainOwnership | None = None,
-    ) -> None:
-        """
-        Method for initializing the Parent using a LAMMPS dump file.
-
-        :param system_file: Filename of the dump file.
-        :param unit_cell: Nominal unit cell of the bulk structure.
-        :param gb_thickness: Thickness of the GB region, given in angstroms.
-        :param type_dict: Conversion from type number to type name, optional. Note that
-            if this is not provided and the snapshot does not indicate the atom names,
-            atom names are assumed started from "H".
-        :param file_keywords: List of keywords used to identify different sections of
-            the file.
-        :raises ParentCorruptedFileError: Exception raised if the file is not formatted
-            correctly.
-        :raises ParentFileMissingDataError: Exception raised if the file is otherwise
-            formatted correctly, but is missing required data.
-        """
-        if grain_ownership is not None:
-            try:
-                snapshot = read_lammps_dump_file(
-                    system_file,
-                    type_dict=type_dict,
-                )
-                self.__init_from_owned_snapshot(snapshot, grain_ownership)
-            except (LammpsDataError, GrainOwnershipError) as exc:
-                raise ParentValueError(
-                    f"invalid explicit ownership for {system_file}"
-                ) from exc
-            return
-
-        skip_rows = 0
-        with open(system_file) as f:
-            line = f.readline()
-            skip_rows += 1
-            # skip to the box bounds
-            while not line.startswith("ITEM: BOX BOUNDS"):
-                line = f.readline()
-                skip_rows += 1
-                if not line:
-                    raise ParentCorruptedFileError(
-                        f"Box bounds not found in {system_file}")
-            skip_rows += 3
-            if len(line.split()) == 6:  # orthogonal box
-                x_dims = [float(i) for i in f.readline().split()]
-                y_dims = [float(i) for i in f.readline().split()]
-                z_dims = [float(i) for i in f.readline().split()]
-            elif len(line.split()) == 9:  # triclinic box, restricted format
-                xline = f.readline().split()
-                yline = f.readline().split()
-                zline = f.readline().split()
-                x_dims, _ = ([float(i) for i in xline[0:2]], float(xline[2]))
-                y_dims, _ = ([float(i) for i in yline[0:2]], float(yline[2]))
-                z_dims, _ = ([float(i) for i in zline[0:2]], float(zline[2]))
-            elif len(line.split()) == 8:  # triclinic box, general format
-                xline = f.readline().split()
-                yline = f.readline().split()
-                zline = f.readline().split()
-                origin = np.empty((3,))
-                A, origin[0] = (np.array([float(i)
-                                for i in xline[0:3]]), float(xline[3]))
-                B, origin[1] = (np.array([float(i)
-                                for i in yline[0:3]]), float(yline[3]))
-                C, origin[2] = (np.array([float(i)
-                                for i in zline[0:3]]), float(zline[3]))
-
-                a = np.array([np.linalg.norm(A), 0, 0])
-                Ahat = A / a[0]
-                b = np.array([np.dot(B, Ahat), np.cross(Ahat, B), 0])
-                AxB = np.cross(A, B)
-                AxBhat = AxB/np.linalg.norm(AxB)
-                c = np.array([np.dot(C, Ahat), np.dot(
-                    C, np.cross(AxBhat, Ahat)), np.abs(np.dot(C, AxBhat))])
-
-                x_dims = [origin[0], origin[0] + a[0]]
-                y_dims = [origin[1], origin[1] + a[1] + b[1]]
-                z_dims = [origin[2], origin[2] + c[2]]
-            else:
-                raise ParentCorruptedFileError(
-                    f"Box bounds corrupted in {system_file}")
-            if not (x_dims or y_dims or z_dims) or len(x_dims) != 2 or \
-                    len(y_dims) != 2 or len(z_dims) != 2:
-                raise ParentCorruptedFileError(
-                    f"Box bounds corrupted in {system_file}")
-            self.__box_dims = np.array([x_dims, y_dims, z_dims])
-            self.__x_dim = x_dims[1] - x_dims[0]
-            self.__y_dim = y_dims[1] - y_dims[0]
-            self.__z_dim = z_dims[1] - z_dims[0]
-            # TODO: Need a more robust calculation of where the GB is located. This calculation is duplicated.
-            grain_cutoff = (x_dims[1] - x_dims[0]) / 2 + x_dims[0]
-            line = f.readline()
-            skip_rows += 1
-            while not line.startswith("ITEM: ATOMS"):
-                line = f.readline()
-                skip_rows += 1
-                if not line:
-                    raise ParentCorruptedFileError(
-                        f"Atoms not found in {system_file}")
-            atom_attributes = line.split()[2:]
-            required_attributes = ["type", "x", "y", "z"]
-
-            if not all(i in atom_attributes for i in required_attributes):
-                raise ParentFileMissingDataError(
-                    f"One or more required attributes are missing.\n"
-                    f"Required: {required_attributes}, "
-                    f"available: {atom_attributes}")
-            required_attribute_indices = {attr: atom_attributes.index(
-                attr) for attr in required_attributes}
-
-            typelabel_in_attrs = "typelabel" in atom_attributes
-            if typelabel_in_attrs:
-                required_attribute_indices["typelabel"] = atom_attributes.index(
-                    "typelabel")
-            col_indices = [required_attribute_indices["typelabel"] if typelabel_in_attrs else required_attribute_indices["type"],
-                           required_attribute_indices["x"], required_attribute_indices["y"], required_attribute_indices["z"]]
-
-            id_to_name = {}
-            if type_dict:
-                if all(isinstance(key, int) and isinstance(val, str) for key, val in type_dict.items()):
-                    id_to_name = dict(type_dict)
-                elif all(isinstance(key, str) and isinstance(val, int) for key, val in type_dict.items()):
-                    id_to_name = {val: key for key, val in type_dict.items()}
-                else:
-                    raise ParentValueError(
-                        "type_dict must be a dict[str, int] or dict[int, str]."
-                    )
-
-            def convert_type(value):
-                if typelabel_in_attrs:
-                    return value
-                if id_to_name:
-                    type_id = int(value)
-                    if type_id not in id_to_name:
-                        raise ParentFileMissingDataError(
-                            f"Type id {type_id} not found in type mapping."
-                        )
-                    return id_to_name[type_id]
-                return self.__num_to_name[int(value)]
-            max_rows = 0
-            line = f.readline()  # read the next line to move the file pointer ahead.
-            while not line.startswith("ITEM"):
-                line = f.readline()
-                max_rows += 1
-                if not line:
-                    break
-
-        self.__whole_system = np.loadtxt(system_file, skiprows=skip_rows, max_rows=max_rows, converters={
-            col_indices[0]: convert_type}, usecols=tuple(col_indices), dtype=Atom.atom_dtype)
-        mask = self.__whole_system["x"] < grain_cutoff
-        self.__left_grain = self.__whole_system[mask]
-        self.__right_grain = self.__whole_system[~mask]
-        self.__gb_plane_x = (
-            max(self.__left_grain["x"]) + min(self.__right_grain["x"])) / 2
-
-    def __init_from_lammps_input(
-        self,
-        system_file: str,
-        unit_cell: UnitCell,
-        gb_thickness: float,
-        type_dict: dict | None,
-        grain_ownership: GrainOwnership | None = None,
-    ) -> None:
-        """
-        Method for initializing the Parent using a LAMMPS input file.
-
-        :param system_file: Filename of the LAMMPS input file.
-        :param unit_cell: Nominal unit cell of the bulk structure.
-        :param gb_thickness: Thickness of the GB region, given in angstroms.
-        :param type_dict: Conversion from type number to type name, optional. Note that
-            if this is not provided and the snapshot does not indicate the atom names,
-            atom names are assumed started from "H".
-        :param file_keywords: List of keywords used to identify different sections of
-            the file.
-        :raises ParentCorruptedFileError: Exception raised if the file is not formatted
-            correctly.
-        :raises ParentFileMissingDataError: Exception raised if the file is otherwise
-            formatted correctly, but is missing required data.
-        """
-        n_atoms = n_types = 0
-        x_dims = y_dims = z_dims = []
-        name_to_id = {}
-        id_to_name = {}
-        if type_dict:
-            if all(isinstance(key, str) and isinstance(val, int) for key, val in type_dict.items()):
-                name_to_id = dict(type_dict)
-                id_to_name = {val: key for key, val in type_dict.items()}
-            elif all(isinstance(key, int) and isinstance(val, str) for key, val in type_dict.items()):
-                id_to_name = dict(type_dict)
-                name_to_id = {val: key for key, val in type_dict.items()}
-            else:
-                raise ParentValueError(
-                    "type_dict must be a dict[str, int] or dict[int, str]."
-                )
-        skiprows = 0
-
-        if grain_ownership is not None:
-            try:
-                snapshot = read_lammps_data_file(
-                    system_file,
-                    type_dict=type_dict,
-                )
-                self.__init_from_owned_snapshot(snapshot, grain_ownership)
-            except (LammpsDataError, GrainOwnershipError) as exc:
-                raise ParentValueError(
-                    f"invalid explicit ownership for {system_file}"
-                ) from exc
-            return
-
-        with open(system_file) as f:
-            lines = iter(f)
-            # Skip header and blank lines
-            next(lines)
-            next(lines)
-            skiprows += 2
-
-            for line in lines:
-                skiprows += 1
-                line = line.strip()
-
-                if line.startswith("Atoms"):
-                    next(lines)  # Skip the blank line after "Atoms"
-                    skiprows += 1
-                    break
-
-                line_sp = line.split()
-
-                if "atoms" in line:
-                    n_atoms = int(line_sp[0])
-                elif "atom types" in line:
-                    n_types = int(line_sp[0])
-                elif "xlo xhi" in line:
-                    x_dims = [float(line_sp[0]), float(line_sp[1])]
-                elif "ylo yhi" in line:
-                    y_dims = [float(line_sp[0]), float(line_sp[1])]
-                elif "zlo zhi" in line:
-                    z_dims = [float(line_sp[0]), float(line_sp[1])]
-                elif "xy xz yz" in line:
-                    tilt = [float(line_sp[0]), float(line_sp[1]), float(line_sp[2])]
-                    self.__tilt = tilt
-                elif line == "Atom Type Labels":
-                    next(lines)  # Skip the blank line before the data
-                    skiprows += 1
-                    num_labels = 0
-
-                    for label_line in lines:
-                        skiprows += 1
-                        label_line = label_line.strip().split()
-                        if not label_line:
-                            break
-                        type_id = int(label_line[0])
-                        type_name = label_line[1]
-                        name_to_id[type_name] = type_id
-                        id_to_name[type_id] = type_name
-                        num_labels += 1
-
-                    if num_labels != n_types:
-                        raise ParentCorruptedFileError(
-                            "Number of labels does not equal number of atom types."
-                        )
-
-        def convert_type(value):
-            if isinstance(value, bytes):
-                value = value.decode()
-            value = value.strip()
-            try:
-                type_id = int(value)
-                if id_to_name:
-                    if type_id not in id_to_name:
-                        raise ParentFileMissingDataError(
-                            f"Type id {type_id} not found in type mapping."
-                        )
-                    return id_to_name[type_id]
-                return self.__num_to_name[type_id]
-            except ValueError:
-                return value
-        # We now have to make some assumptions about how the data is actually formatted.
-        # Here, we assume the following:
-        #  column 2: atom type (numeric, if "Atom Type Labels" not found previously, else string)
-        #  column 3: x position
-        #  column 4: y position
-        #  column 5: z position
-        self.__box_dims = np.array([x_dims, y_dims, z_dims])
-        self.__x_dim = x_dims[1] - x_dims[0]
-        self.__y_dim = y_dims[1] - y_dims[0]
-        self.__z_dim = z_dims[1] - z_dims[0]
-        # TODO: Need a more robust calculation of where the GB is located. This calculation is duplicated.
-        grain_cutoff = (x_dims[1] - x_dims[0]) / 2 + x_dims[0]
-        self.__whole_system = np.loadtxt(
-            system_file,
-            skiprows=skiprows,
-            max_rows=n_atoms,
-            converters={1: convert_type},
-            usecols=[1, 2, 3, 4],
-            dtype=Atom.atom_dtype,
-        )
-        mask = self.__whole_system["x"] < grain_cutoff
-        self.__left_grain = self.__whole_system[mask]
-        self.__right_grain = self.__whole_system[~mask]
-        self.__gb_plane_x = (
-            max(self.__left_grain["x"]) + min(self.__right_grain["x"])) / 2
 
     # Getters
 
