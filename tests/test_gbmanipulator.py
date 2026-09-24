@@ -344,7 +344,7 @@ def test_displace_along_soft_modes_preserves_multitype_numeric_roundtrip(tmp_pat
     )
     manipulator = GBManipulator(gb, seed=seed)
 
-    child = manipulator.displace_along_soft_modes(mesh_size=1, num_q=1)[0]
+    child = manipulator.displace_along_soft_modes(mesh_size=1, num_q=1)
 
     np.testing.assert_array_equal(child["name"], gb.whole_system["name"])
 
@@ -667,44 +667,50 @@ class TestGBManipulator(unittest.TestCase):
     def test_displace_along_soft_modes_base(self):
         # test the base case
         child = self.manipulator_tilt.displace_along_soft_modes()
-        self.assertEqual(len(child), 1)
         self.assertFalse(structured_array_equal(
-            child[0], self.manipulator_tilt.parents[0].whole_system))
+            child, self.manipulator_tilt.parents[0].whole_system))
 
     @pytest.mark.slow
     def test_displace_along_soft_modes_with_displacement_threshold(self):
         # test the case with a displacement threshold specified
         child = self.manipulator_tilt.displace_along_soft_modes(1.0)
-        self.assertEqual(len(child), 1)
         self.assertFalse(structured_array_equal(
-            child[0], self.manipulator_tilt.parents[0].whole_system))
+            child, self.manipulator_tilt.parents[0].whole_system))
 
     @pytest.mark.slow
     def test_displace_along_soft_modes_diff_mesh(self):
         # test differing mesh size
         child = self.manipulator_tilt.displace_along_soft_modes(mesh_size=2)
-        self.assertEqual(len(child), 1)
         self.assertFalse(structured_array_equal(
-            child[0], self.manipulator_tilt.parents[0].whole_system))
+            child, self.manipulator_tilt.parents[0].whole_system))
 
     @pytest.mark.slow
     def test_displace_along_soft_modes_num_q_vecs(self):
         # test number of q vectors
         child = self.manipulator_tilt.displace_along_soft_modes(num_q=4)
-        self.assertEqual(len(child), 1)
         self.assertFalse(structured_array_equal(
-            child[0], self.manipulator_tilt.parents[0].whole_system))
+            child, self.manipulator_tilt.parents[0].whole_system))
 
     @pytest.mark.slow
-    def test_displace_along_soft_modes_num_child_structures(self):
-        # test number of child structures
-        children = self.manipulator_tilt.displace_along_soft_modes(num_children=2)
-        self.assertEqual(len(children), 2)
+    def test_displace_along_soft_modes_selects_distinct_modes(self):
+        # test that two explicit mode_index calls produce equivalent per-mode
+        # behavior to what num_children=2 previously produced in one call
+        child0 = self.manipulator_tilt.displace_along_soft_modes(mode_index=0)
+        child1 = self.manipulator_tilt.displace_along_soft_modes(mode_index=1)
         self.assertFalse(structured_array_equal(
-            children[0], self.manipulator_tilt.parents[0].whole_system))
+            child0, self.manipulator_tilt.parents[0].whole_system))
         self.assertFalse(structured_array_equal(
-            children[1], self.manipulator_tilt.parents[0].whole_system))
-        self.assertFalse(structured_array_equal(children[0], children[1]))
+            child1, self.manipulator_tilt.parents[0].whole_system))
+        self.assertFalse(structured_array_equal(child0, child1))
+
+    def test_displace_along_soft_modes_negative_mode_index_raises(self):
+        with self.assertRaises(GBManipulatorValueError):
+            self.manipulator_tilt.displace_along_soft_modes(mode_index=-1)
+
+    @pytest.mark.slow
+    def test_displace_along_soft_modes_out_of_range_mode_index_raises(self):
+        with self.assertRaises(GBManipulatorValueError):
+            self.manipulator_tilt.displace_along_soft_modes(mode_index=10_000)
 
     @pytest.mark.slow
     def test_displace_along_soft_modes_simple_case(self):
@@ -726,7 +732,7 @@ class TestGBManipulator(unittest.TestCase):
         )
 
         parent = manipulator.parents[0]
-        child = manipulator.displace_along_soft_modes()[0]
+        child = manipulator.displace_along_soft_modes()
 
         parent_positions = np.column_stack(
             (
@@ -1767,7 +1773,7 @@ def test_displace_along_soft_modes_uses_irreducible_cartesian_q_points(monkeypat
         manipulator.displace_along_soft_modes(
             mesh_size=2,
             num_q=4,
-            num_children=1,
+            mode_index=0,
         )
 
     assert len(captured_q) == 3
@@ -2067,13 +2073,13 @@ def test_displace_along_soft_modes_subtracts_selected_displacement(monkeypatch):
 
     added = manipulator.displace_along_soft_modes(
         num_q=1,
-        num_children=1,
-    )[0]
+        mode_index=0,
+    )
     subtracted = manipulator.displace_along_soft_modes(
         num_q=1,
-        num_children=1,
+        mode_index=0,
         subtract_displacement=True,
-    )[0]
+    )
 
     parent_positions = np.column_stack(
         (

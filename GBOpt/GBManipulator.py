@@ -3391,11 +3391,11 @@ class GBManipulator:
         *,
         mesh_size: int = 4,
         num_q: int = 1,
-        num_children: int = 1,
+        mode_index: int = 0,
         subtract_displacement: bool = False,
     ) -> np.ndarray:
         """
-        Displace atoms along soft phonon modes.
+        Displace atoms along a single selected soft phonon mode.
 
         :param threshold: Maximum displacement of atoms allowed, optional, defaults to 1.5
             times the ideal bond length.
@@ -3404,12 +3404,13 @@ class GBManipulator:
         :param num_q: Keyword argument. Specifies the number of unique q points to use
             when calculating the dynamical matrix and determining the displacements.
             Optional. Defaults to 50.
-        :param num_children: Keyword argument. Specifies the number of children to
-            create from the parent structure. Optional. Defaults to 1.
+        :param mode_index: Keyword argument. Selects which non-acoustic soft mode to
+            displace along, ordered from softest (0) to next-softest (1), and so on.
+            Optional. Defaults to 0.
         :param subtract_displacement: Keyword argument. Flag for subtracting, rather
             than adding the displacements from the eigenvectors to the original
             positions. Optional. Defaults to False (adds the displacements).
-        :return: *num_children* grain boundary structures.
+        :return: The grain boundary structure displaced along the selected mode.
         """
         if threshold is not None and threshold < 0:
             raise GBManipulatorValueError("d_max must be a positive float value.")
@@ -3417,8 +3418,8 @@ class GBManipulator:
             raise GBManipulatorValueError("mesh_size must be >= 1.")
         if num_q < 1:
             raise GBManipulatorValueError("num_q must be >= 1.")
-        if num_children < 1:
-            raise GBManipulatorValueError("num_children must be >= 1.")
+        if mode_index < 0:
+            raise GBManipulatorValueError("mode_index must be >= 0.")
         parent = self.__parents[0]
         atoms = Atom.as_array(parent.whole_system)
         positions = atoms[:, 1:]
@@ -3448,10 +3449,19 @@ class GBManipulator:
 
         sparse_threshold = 10000
 
+        # Number of softest eigenvectors that must be computed per q point in order
+        # to be able to select mode_index once the modes are sorted globally below.
+        num_modes_needed = mode_index + 1
+        if num_modes_needed > 3 * n_atoms:
+            raise GBManipulatorValueError(
+                f"mode_index={mode_index} is out of range: at most "
+                f"{3 * n_atoms} mode(s) can be computed for this system."
+            )
+
         # initialize the arrays to save the eigenvalues (frequencies) and eigenvectors
         # (displacements)
-        freqs = np.zeros((num_q, num_children))
-        disps = np.zeros((num_q, num_children, 3 * n_atoms))
+        freqs = np.zeros((num_q, num_modes_needed))
+        disps = np.zeros((num_q, num_modes_needed, 3 * n_atoms))
 
         # For each unique q point, calculate the dynamical matrix and the associated
         # eigenvalues and eigenvectors.
@@ -3464,25 +3474,26 @@ class GBManipulator:
                 sparse_matrix = sps.csc_matrix(dynamical_matrix)
                 # scipy.sparse.linalg.eigsh can only calculate a small subset of the
                 # eigenvalues and eigenvectors of a sparse matrix. Therefore, if the
-                # number of children specified (which specifies how many eigenvectors we
+                # number of modes needed (which specifies how many eigenvectors we
                 # need) is larger than 3 * n_atoms - 1, we cannot use this method, and
                 # would need to fall back to calculating the eigenvalues using a dense
                 # matrix, but that might be prohibitively expensive if we have reached
                 # this point. TODO: Will need testing.
-                if num_children >= 3 * n_atoms - 1 != num_children:
+                if num_modes_needed >= 3 * n_atoms - 1 != num_modes_needed:
                     raise GBManipulatorValueError(
-                        "Cannot generate the specified number of children.")
+                        "Cannot generate the requested soft mode.")
                 freq_vals, disp_vals = sps.linalg.eigsh(
-                    sparse_matrix, k=num_children, which="SA")
-            freqs[i] = freq_vals[:num_children]
+                    sparse_matrix, k=num_modes_needed, which="SA")
+            freqs[i] = freq_vals[:num_modes_needed]
             # The eigvec associated with the Nth eigfreq for the ith q vector is saved
             # in the (start + N)th index
-            disps[i, :, :] = np.real(disp_vals)[:, :num_children].T
+            disps[i, :, :] = np.real(disp_vals)[:, :num_modes_needed].T
 
         # Now that we have all of the frequencies for a variety of q points, we can
-        # identify the N largest instabilities and use the associated displacements to
-        # create the N child structures. We first filter out the frequencies at or near
-        # 0, as these are associated with translational or rotational (acoustic) modes
+        # identify the softest instabilities and use the associated displacements to
+        # create the selected child structure. We first filter out the frequencies at
+        # or near 0, as these are associated with translational or rotational
+        # (acoustic) modes
 
         # TODO: Look into combining the eigenvectors of the multiple q points. Weighted averages or using principle component analysis might work well in this regard.
         non_acoustic_indices = np.where(~np.isclose(freqs, 0))
@@ -3495,9 +3506,11 @@ class GBManipulator:
         saved_disps = disps[non_acoustic_indices[0][sorted_filtered_freq_indices],
                             non_acoustic_indices[1][sorted_filtered_freq_indices], :]
 
-        # We are going to be creating num_children separate systems based on the
-        # eigen displacements. We initialize this here.
-        pos = np.zeros((num_children, *positions.shape))
+        if mode_index >= len(saved_disps):
+            raise GBManipulatorValueError(
+                f"mode_index={mode_index} is out of range: only "
+                f"{len(saved_disps)} non-acoustic soft mode(s) available."
+            )
 
         # minimum allowable distance before atoms are "too close"
         d_min = 2 * parent.unit_cell.radius
@@ -3511,17 +3524,13 @@ class GBManipulator:
             dists = np.linalg.norm(positions[atom_idx] - neighbor_positions, axis=1)
             precomputed_distances[i] = np.min(dists) - d_min
 
-        # We now need to perform the displacement. We check to make sure that the
-        # displacement does not cause atoms to overlap. We do this for each child that
-        # we want to generate from this analysis.
-        for mode_index in range(num_children):
-            pos[mode_index] = np.copy(positions)
-            disp_vector = saved_disps[mode_index].reshape(-1, 3)
-            disp_magnitude = np.linalg.norm(disp_vector, axis=1)
+        # We now need to perform the displacement for the selected mode. We check to
+        # make sure that the displacement does not cause atoms to overlap.
+        pos = np.copy(positions)
+        disp_vector = saved_disps[mode_index].reshape(-1, 3)
+        disp_magnitude = np.linalg.norm(disp_vector, axis=1)
 
-            if np.any(disp_magnitude == 0):
-                continue
-
+        if not np.any(disp_magnitude == 0):
             # Any True value here is a possible overlap between two atoms after the
             # displacement suggested in disp_vector.
             overlap_condition = precomputed_distances < disp_magnitude
@@ -3533,22 +3542,14 @@ class GBManipulator:
                 safe_displacements[overlap_condition] = overlapped_atoms / overlap_disps
 
             adjusted_displacements = disp_vector * safe_displacements[:, None]
-            pos[mode_index, parent.gb_indices] = positions[parent.gb_indices] + \
+            pos[parent.gb_indices] = positions[parent.gb_indices] + \
                 adjusted_displacements * (-1 if subtract_displacement else 1)
 
-            non_gb_indices = np.setdiff1d(
-                np.arange(positions.shape[0]), parent.gb_indices)
-
-            pos[mode_index, non_gb_indices] = positions[non_gb_indices]
-
-        structured_pos = []
-        for child in pos:
-            structured_p = np.zeros((len(atoms)), dtype=Atom.atom_dtype)
-            structured_p["name"] = parent.whole_system["name"]
-            structured_p["x"] = child[:, 0]
-            structured_p["y"] = child[:, 1]
-            structured_p["z"] = child[:, 2]
-            structured_pos.append(structured_p)
+        structured_pos = np.zeros((len(atoms)), dtype=Atom.atom_dtype)
+        structured_pos["name"] = parent.whole_system["name"]
+        structured_pos["x"] = pos[:, 0]
+        structured_pos["y"] = pos[:, 1]
+        structured_pos["z"] = pos[:, 2]
         return structured_pos
 
     def apply_group_symmetry(self, group: str) -> np.ndarray:
