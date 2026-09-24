@@ -45,6 +45,15 @@ from GBOpt.interface.types import (
 )
 from GBOpt.io import StructureData
 from GBOpt.io.lammps import LammpsDataError, read_structure_file
+from GBOpt.manipulation import (
+    Manipulation,
+    ManipulationArityError,
+    ManipulationConfigurationError,
+    ManipulationContext,
+    ManipulationRegistry,
+    ManipulationResult,
+    default_registry,
+)
 from GBOpt.UnitCell import UnitCell
 
 # TODO: Generalize to interfaces, not just GBs
@@ -1747,6 +1756,113 @@ class GBManipulator:
             labels = self.__concatenated_labels(parent, len(parent.whole_system))
         self.__set_candidate_labels(labels, len(parent.whole_system))
         return parent._to_interface_candidate(parent.whole_system, labels)
+
+    def __current_parent_candidates(self) -> tuple[InterfaceCandidate, ...]:
+        """Return this manipulator's own current parent(s) as immutable candidates.
+
+        Reuses each parent's own geometry (boundary-normal topology, physical box and
+        grain bounds, coordinate tolerance) exactly as ``make_parent_candidate`` does for
+        a single parent, so this seam threads the same interface state through to a
+        manipulation operation without recomputing or otherwise touching it. Unlike
+        ``make_parent_candidate``, this does not update ``__candidate_grain_labels``:
+        the produced candidates are inputs to an operation, not a new "current"
+        single-parent candidate this manipulator itself is tracking.
+
+        :return: One candidate per active parent, in parent order.
+        :raises GBManipulatorValueError: If a parent's boundary-normal topology is
+            unknown.
+        """
+        parents = [self.__parents[0]] if self.__one_parent else list(self.__parents)
+        candidates = []
+        for parent in parents:
+            if parent.normal_topology is BoundaryNormalTopology.UNKNOWN:
+                raise GBManipulatorValueError(
+                    "a parent candidate requires known boundary-normal topology"
+                )
+            labels = parent.grain_labels
+            if labels is None:
+                labels = self.__concatenated_labels(parent, len(parent.whole_system))
+            candidates.append(parent._to_interface_candidate(parent.whole_system, labels))
+        return tuple(candidates)
+
+    def apply(
+        self,
+        manipulation: Manipulation,
+        *,
+        seed: int | None = None,
+        **params: object,
+    ) -> ManipulationResult:
+        """Run ``manipulation`` against this manipulator's current parent(s).
+
+        This is a generic facade seam: it converts this manipulator's own parent state
+        into immutable candidates (preserving interface topology, ownership labels,
+        physical grain bounds, and interface-separation state exactly as the rest of this
+        class already constructs them via ``_to_interface_candidate``), checks the
+        operation's declared arity against the number of parents actually available, and
+        executes it. No built-in manipulation algorithm is routed through this seam; it
+        exists so an operation defined outside ``GBOpt`` can run against real manipulator
+        state.
+
+        :param manipulation: Operation to execute; may be defined outside GBOpt.
+        :param seed: Keyword argument, optional, defaults to ``None``. When given, used
+            to construct a fresh, independent ``np.random.Generator`` for this call
+            (``seed=0`` is a valid, deterministic seed, unlike this class's own
+            constructor). When omitted, this manipulator's own random-number generator
+            is used, and its state advances as a result of the call, matching every
+            other randomized method on this class.
+        :param params: Additional operation-specific keyword parameters, forwarded to
+            the operation unmodified.
+        :return: The operation's result.
+        :raises ManipulationConfigurationError: If ``manipulation.arity`` is not a
+            positive integer.
+        :raises ManipulationArityError: If ``manipulation.arity`` does not match the
+            number of parents this manipulator currently has.
+        :raises GBManipulatorValueError: If a parent's boundary-normal topology is
+            unknown.
+        """
+        parents = self.__current_parent_candidates()
+        arity = manipulation.arity
+        if not isinstance(arity, int) or isinstance(arity, bool) or arity < 1:
+            raise ManipulationConfigurationError(
+                f"{manipulation.name!r} arity must be a positive integer"
+            )
+        if arity != len(parents):
+            raise ManipulationArityError(
+                f"{manipulation.name!r} requires {arity} parent(s); this manipulator "
+                f"currently provides {len(parents)}"
+            )
+        rng = self.__rng if seed is None else np.random.default_rng(seed)
+        context = ManipulationContext(parents=parents, rng=rng, params=params)
+        return manipulation.execute(context)
+
+    def apply_named(
+        self,
+        name: str,
+        *,
+        seed: int | None = None,
+        registry: ManipulationRegistry | None = None,
+        **params: object,
+    ) -> ManipulationResult:
+        """Run the operation registered as ``name`` against this manipulator.
+
+        :param name: Registered operation name.
+        :param seed: Keyword argument, optional, defaults to ``None``. Forwarded to
+            ``apply``.
+        :param registry: Keyword argument, optional, defaults to ``None``. Registry to
+            look ``name`` up in; defaults to ``GBOpt.manipulation.default_registry``.
+        :param params: Additional operation-specific keyword parameters, forwarded to
+            ``apply``.
+        :return: The operation's result.
+        :raises ManipulationLookupError: If ``name`` is not registered in the resolved
+            registry.
+        :raises ManipulationConfigurationError: If the registered operation's arity is
+            not a positive integer.
+        :raises ManipulationArityError: If the registered operation's arity does not
+            match the number of parents this manipulator currently has.
+        """
+        active_registry = default_registry if registry is None else registry
+        manipulation = active_registry.get(name)
+        return self.apply(manipulation, seed=seed, **params)
 
     def translate_right_grain(
         self,

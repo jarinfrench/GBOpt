@@ -33,6 +33,14 @@ from GBOpt.GBManipulator import (
     _ParentsProxy,
 )
 from GBOpt.GrainOwnership import LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL, GrainOwnership
+from GBOpt.manipulation import (
+    ManipulationArityError,
+    ManipulationConfigurationError,
+    ManipulationContext,
+    ManipulationLookupError,
+    ManipulationRegistry,
+    ManipulationResult,
+)
 
 
 pytestmark = pytest.mark.filterwarnings(
@@ -784,6 +792,148 @@ class TestGBManipulator(unittest.TestCase):
             self.tilt.write_lammps(temp_file.name, p2, self.tilt.box_dims)
             self.tilt.write_lammps(temp_file.name, p3, self.tilt.box_dims)
             # self.tilt.write_lammps(temp_file.name, p4, self.tilt.box_dims)
+
+
+class _EchoManipulation:
+    """External (non-GBOpt) operation used to exercise GBManipulator.apply()."""
+
+    def __init__(self, *, arity=1, name="echo"):
+        self._arity = arity
+        self._name = name
+
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def arity(self):
+        return self._arity
+
+    def execute(self, context: ManipulationContext) -> ManipulationResult:
+        return ManipulationResult(
+            children=context.parents,
+            parameters=dict(context.params),
+            lineage={"name": self.name, "parent_count": len(context.parents)},
+        )
+
+
+class _DrawFromRngManipulation:
+    """Arity-1 operation that reports one draw from the context's own RNG."""
+
+    name = "draw"
+    arity = 1
+
+    def execute(self, context: ManipulationContext) -> ManipulationResult:
+        draw = context.rng.random()
+        return ManipulationResult(
+            children=context.parents, parameters={"draw": draw}
+        )
+
+
+class _BadArityManipulation:
+    """Operation whose declared arity is malformed, not just mismatched."""
+
+    name = "bad-arity"
+
+    def __init__(self, arity):
+        self.arity = arity
+
+    def execute(self, context: ManipulationContext) -> ManipulationResult:
+        raise AssertionError("execute must not run when arity is malformed")
+
+
+class TestGBManipulatorApply(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.seed = 100
+        cls.tilt = _make_exact_gb(
+            1.0,
+            "fcc",
+            "Cu",
+            gb_thickness=10.0,
+            interaction_distance=1.0,
+            repeat_factor=2,
+        )
+
+    def test_apply_runs_an_externally_defined_operation_with_one_parent(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        result = manipulator.apply(_EchoManipulation(arity=1), amount=2.0)
+        self.assertEqual(len(result.children), 1)
+        self.assertEqual(dict(result.parameters), {"amount": 2.0})
+        self.assertEqual(dict(result.lineage)["parent_count"], 1)
+
+    def test_apply_runs_an_externally_defined_operation_with_two_parents(self):
+        manipulator = GBManipulator(self.tilt, self.tilt, seed=self.seed)
+        result = manipulator.apply(_EchoManipulation(arity=2))
+        self.assertEqual(len(result.children), 2)
+        self.assertEqual(dict(result.lineage)["parent_count"], 2)
+
+    def test_apply_preserves_topology_ownership_bounds_and_separation(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        expected = manipulator.make_parent_candidate()
+        result = manipulator.apply(_EchoManipulation(arity=1))
+        (candidate,) = result.children
+        self.assertIs(candidate.normal_topology, expected.normal_topology)
+        np.testing.assert_allclose(candidate.box_dims, expected.box_dims)
+        np.testing.assert_allclose(
+            candidate.left_grain_x_bounds, expected.left_grain_x_bounds
+        )
+        np.testing.assert_allclose(
+            candidate.right_grain_x_bounds, expected.right_grain_x_bounds
+        )
+        self.assertEqual(candidate.inplane_periodic, expected.inplane_periodic)
+        self.assertEqual(candidate.interface_separation, expected.interface_separation)
+        np.testing.assert_array_equal(candidate.grain_labels, expected.grain_labels)
+
+    def test_apply_rejects_arity_mismatch_before_execution(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        with self.assertRaises(ManipulationArityError):
+            manipulator.apply(_EchoManipulation(arity=2))
+
+    def test_apply_rejects_malformed_arity_before_execution(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        with self.assertRaises(ManipulationConfigurationError):
+            manipulator.apply(_BadArityManipulation(arity=0))
+        with self.assertRaises(ManipulationConfigurationError):
+            manipulator.apply(_BadArityManipulation(arity="1"))
+
+    def test_apply_parents_remain_immutable_and_children_are_independent(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        parent_before = manipulator.make_parent_candidate()
+        result = manipulator.apply(_EchoManipulation(arity=1))
+        parent_after = manipulator.make_parent_candidate()
+        np.testing.assert_array_equal(parent_before.atoms, parent_after.atoms)
+        (child,) = result.children
+        child_atoms = child.atoms
+        child_atoms_copy = child_atoms.copy()
+        child_atoms_copy["x"] += 1.0
+        np.testing.assert_array_equal(child.atoms, child_atoms)
+        np.testing.assert_array_equal(parent_after.atoms, parent_before.atoms)
+
+    def test_apply_with_explicit_seed_zero_is_valid_and_deterministic(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        first = manipulator.apply(_DrawFromRngManipulation(), seed=0)
+        second = manipulator.apply(_DrawFromRngManipulation(), seed=0)
+        self.assertEqual(first.parameters["draw"], second.parameters["draw"])
+
+    def test_apply_without_seed_advances_the_manipulator_own_rng(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        first = manipulator.apply(_DrawFromRngManipulation())
+        second = manipulator.apply(_DrawFromRngManipulation())
+        self.assertNotEqual(first.parameters["draw"], second.parameters["draw"])
+
+    def test_apply_named_runs_a_registered_operation(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        registry = ManipulationRegistry()
+        registry.register("echo", _EchoManipulation(arity=1))
+        result = manipulator.apply_named("echo", registry=registry, amount=3.0)
+        self.assertEqual(dict(result.parameters), {"amount": 3.0})
+
+    def test_apply_named_unknown_name_raises(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        registry = ManipulationRegistry()
+        with self.assertRaises(ManipulationLookupError):
+            manipulator.apply_named("missing", registry=registry)
 
 
 class TestParent(unittest.TestCase):
