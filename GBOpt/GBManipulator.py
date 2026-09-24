@@ -1210,6 +1210,100 @@ def _create_neighbor_list(rcut: float, pos: np.ndarray) -> list:
     return neighbor_list
 
 
+def _soft_mode_q_points(unit_cell: UnitCell, mesh_size: int) -> np.ndarray:
+    """Return irreducible q points in Cartesian reciprocal-space coordinates.
+
+    A self-consistent spglib cell is constructed from the conventional lattice and
+    basis. spglib is then used to reduce that cell to a primitive cell and identify the
+    irreducible reciprocal-mesh representatives.
+
+    The returned q vectors are expressed in Cartesian reciprocal coordinates with units
+    of inverse Angstroms so they can be combined directly with Cartesian interatomic
+    displacement vectors.
+
+    :param unit_cell: Nominal bulk unit cell used to determine crystal symmetry.
+    :param mesh_size: Uniform reciprocal-space mesh size along each primitive reciprocal
+        axis.
+    :return: Irreducible q vectors sorted by increasing physical magnitude.
+    :raises GBManipulatorValueError: If spglib cannot identify a primitive cell.
+    """
+    conventional_lattice = np.asarray(
+        unit_cell.conventional,
+        dtype=np.float64,
+    )
+    cartesian_positions = np.asarray(
+        unit_cell.positions(),
+        dtype=np.float64,
+    )
+
+    # spglib expects scaled positions relative to the supplied lattice.
+    scaled_positions = np.linalg.solve(
+        conventional_lattice.T,
+        cartesian_positions.T,
+    ).T
+    scaled_positions = np.mod(scaled_positions, 1.0)
+
+    # Normalize numerical noise at periodic boundaries.
+    close_to_zero = np.isclose(
+        scaled_positions,
+        0.0,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    close_to_one = np.isclose(
+        scaled_positions,
+        1.0,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    scaled_positions[close_to_zero | close_to_one] = 0.0
+
+    conventional_cell = (
+        conventional_lattice,
+        scaled_positions,
+        unit_cell.types(),
+    )
+
+    primitive_cell = spg.find_primitive(conventional_cell)
+    if primitive_cell is None:
+        raise GBManipulatorValueError(
+            "Could not identify a primitive cell for soft-mode q-point generation."
+        )
+
+    mesh = np.full(3, mesh_size, dtype=np.intc)
+
+    mapping, grid = spg.get_ir_reciprocal_mesh(
+        mesh,
+        primitive_cell,
+    )
+
+    # The grid contains every mesh point. The unique values in mapping are indices of
+    # the irreducible representatives.
+    ir_indices = np.unique(mapping)
+    q_fractional = (
+        np.asarray(grid[ir_indices], dtype=np.float64)
+        / mesh.astype(np.float64)
+    )
+
+    primitive_lattice = np.asarray(
+        primitive_cell[0],
+        dtype=np.float64,
+    )
+
+    # Lattice vectors are stored as rows. The reciprocal basis is therefore 2*pi*A^(-T),
+    # giving Cartesian q vectors in inverse Angstroms.
+    reciprocal_lattice = (
+        2.0
+        * np.pi
+        * np.linalg.inv(primitive_lattice).T
+    )
+    q_cartesian = q_fractional @ reciprocal_lattice
+
+    magnitudes = np.linalg.norm(q_cartesian, axis=1)
+    order = np.argsort(magnitudes, kind="stable")
+    return q_cartesian[order]
+
+
 # @jit(nopython=True, cache=True)
 def _calculate_bond_hardness(parent, neighbor_list, ideal_bonds):
     atoms = parent.whole_system
@@ -1283,23 +1377,48 @@ def _calculate_bond_hardness(parent, neighbor_list, ideal_bonds):
 
 
 @jit(nopython=True, cache=True)
-def _calculate_dynamical_matrix(hardness, positions, gb_atom_indices, neighbor_list, q_vec):
+def _calculate_dynamical_matrix(
+    hardness,
+    positions,
+    gb_atom_indices,
+    neighbor_list,
+    q_vec,
+):
     num_gb_atoms = len(gb_atom_indices)
     Dij = np.zeros((3 * num_gb_atoms, 3 * num_gb_atoms), dtype=np.complex128)
 
-    for d_i in prange(len(gb_atom_indices)):
+    for d_i in prange(num_gb_atoms):
         id1 = gb_atom_indices[d_i]
+
         for id2 in neighbor_list[id1]:
+            bond_hardness = hardness[id1, id2]
+
+            # Every bond connected to a movable GB atom contributes to that atom's
+            # onsite restoring term, including bonds to atoms outside the movable GB
+            # region.
+            for aa in range(3):
+                Dij[
+                    3 * d_i + aa,
+                    3 * d_i + aa,
+                ] += bond_hardness
+
+            # Atoms outside gb_atom_indices are treated as fixed, so they have no
+            # corresponding degrees of freedom in this matrix.
             if id2 not in gb_atom_indices:
                 continue
+
             d_j = np.where(gb_atom_indices == id2)[0][0]
             rij = positions[id2] - positions[id1]
             exp_term = np.exp(1j * np.dot(q_vec, rij))
+
+            # The bond-hardness model couples corresponding Cartesian components;
+            # cross-coordinate terms are zero.
             for aa in range(3):
-                for bb in range(3):
-                    Dij[3 * d_i + aa, 3 * d_j + bb] = -hardness[id1, id2] * exp_term
-                    if d_i == d_j:
-                        Dij[3 * d_i + aa, 3 * d_j + bb] += hardness[id1, id2] * exp_term
+                Dij[
+                    3 * d_i + aa,
+                    3 * d_j + aa,
+                ] -= bond_hardness * exp_term
+
     return Dij
 
 
@@ -2701,11 +2820,11 @@ class GBManipulator:
         *,
         mesh_size: int = 4,
         num_q: int = 1,
-        num_children: int = 1,
+        mode_index: int = 0,
         subtract_displacement: bool = False,
     ) -> np.ndarray:
         """
-        Displace atoms along soft phonon modes.
+        Displace atoms along a single selected soft phonon mode.
 
         :param threshold: Maximum displacement of atoms allowed, optional, defaults to 1.5
             times the ideal bond length.
@@ -2714,12 +2833,13 @@ class GBManipulator:
         :param num_q: Keyword argument. Specifies the number of unique q points to use
             when calculating the dynamical matrix and determining the displacements.
             Optional. Defaults to 50.
-        :param num_children: Keyword argument. Specifies the number of children to
-            create from the parent structure. Optional. Defaults to 1.
+        :param mode_index: Keyword argument. Selects which non-acoustic soft mode to
+            displace along, ordered from softest (0) to next-softest (1), and so on.
+            Optional. Defaults to 0.
         :param subtract_displacement: Keyword argument. Flag for subtracting, rather
             than adding the displacements from the eigenvectors to the original
             positions. Optional. Defaults to False (adds the displacements).
-        :return: *num_children* grain boundary structures.
+        :return: The grain boundary structure displaced along the selected mode.
         """
         if threshold is not None and threshold < 0:
             raise GBManipulatorValueError("d_max must be a positive float value.")
@@ -2727,8 +2847,8 @@ class GBManipulator:
             raise GBManipulatorValueError("mesh_size must be >= 1.")
         if num_q < 1:
             raise GBManipulatorValueError("num_q must be >= 1.")
-        if num_children < 1:
-            raise GBManipulatorValueError("num_children must be >= 1.")
+        if mode_index < 0:
+            raise GBManipulatorValueError("mode_index must be >= 0.")
         parent = self.__parents[0]
         atoms = Atom.as_array(parent.whole_system)
         positions = atoms[:, 1:]
@@ -2738,48 +2858,43 @@ class GBManipulator:
         if not threshold:
             threshold = 1.5 * max(ideal_bonds.values())
         cutoff = 1.5 * max(ideal_bonds.values())
-        neighbor_list = _create_neighbor_list(cutoff, positions[:, 1:])
+        neighbor_list = _create_neighbor_list(cutoff, positions)
         neighbor_list_typed = List()
         for neighbor in neighbor_list:
             neighbor_list_typed.append(List(neighbor))
         hardness = _calculate_bond_hardness(parent, neighbor_list, ideal_bonds)
-        # spglib defines a structure by a tuple of (basis_vectors, atom_positions,
-        # atom_types). basis_vectors is a 3x3 array of the basis vectors of the crystal,
-        # atom_positions is the positions of the atoms in the unit cell in fractional
-        # coordinates, and atom_types is the type of each atom indicated in
-        # atom_positions.
-        structure = (
-            parent.unit_cell.primitive,
-            parent.unit_cell.positions(),
-            parent.unit_cell.types()
+        q_points = _soft_mode_q_points(
+            parent.unit_cell,
+            mesh_size,
         )
-        mesh = [mesh_size, mesh_size, mesh_size]  # mesh of q vectors
-        # Gets all symmetrically distinct q vectors, including time reversal symmetry
-        _, grid = spg.get_ir_reciprocal_mesh(mesh, structure)
-        unique_q_points = grid / np.array(mesh, dtype=float)
 
-        # sort the q vectors by magnitude
-        q_magnitudes = np.linalg.norm(unique_q_points, axis=1)
-        sorted_indices = np.argsort(q_magnitudes)
-        unique_q_points = unique_q_points[sorted_indices]
-
-        if len(unique_q_points) < num_q:
+        if len(q_points) < num_q:
             warnings.warn(
-                f"Fewer q_points generated than desired: {len(unique_q_points)} < "
-                f"{num_q}. Recommended to increase mesh size.")
+                f"Fewer q_points generated than desired: {len(q_points)} < {num_q}. "
+                "Recommended to increase mesh size."
+            )
 
         n_atoms = len(parent.gb_indices)
 
         sparse_threshold = 10000
 
+        # Number of softest eigenvectors that must be computed per q point in order
+        # to be able to select mode_index once the modes are sorted globally below.
+        num_modes_needed = mode_index + 1
+        if num_modes_needed > 3 * n_atoms:
+            raise GBManipulatorValueError(
+                f"mode_index={mode_index} is out of range: at most "
+                f"{3 * n_atoms} mode(s) can be computed for this system."
+            )
+
         # initialize the arrays to save the eigenvalues (frequencies) and eigenvectors
         # (displacements)
-        freqs = np.zeros((num_q, num_children))
-        disps = np.zeros((num_q, num_children, 3 * n_atoms))
+        freqs = np.zeros((num_q, num_modes_needed))
+        disps = np.zeros((num_q, num_modes_needed, 3 * n_atoms))
 
         # For each unique q point, calculate the dynamical matrix and the associated
         # eigenvalues and eigenvectors.
-        for i, q_vec in enumerate(unique_q_points[:num_q]):
+        for i, q_vec in enumerate(q_points[:num_q]):
             dynamical_matrix = _calculate_dynamical_matrix(
                 hardness, positions, parent.gb_indices, neighbor_list_typed, q_vec)
             if 3 * n_atoms <= sparse_threshold:
@@ -2788,27 +2903,28 @@ class GBManipulator:
                 sparse_matrix = sps.csc_matrix(dynamical_matrix)
                 # scipy.sparse.linalg.eigsh can only calculate a small subset of the
                 # eigenvalues and eigenvectors of a sparse matrix. Therefore, if the
-                # number of children specified (which specifies how many eigenvectors we
+                # number of modes needed (which specifies how many eigenvectors we
                 # need) is larger than 3 * n_atoms - 1, we cannot use this method, and
                 # would need to fall back to calculating the eigenvalues using a dense
                 # matrix, but that might be prohibitively expensive if we have reached
                 # this point. TODO: Will need testing.
-                if num_children >= 3 * n_atoms - 1 != num_children:
+                if num_modes_needed >= 3 * n_atoms - 1 != num_modes_needed:
                     raise GBManipulatorValueError(
-                        "Cannot generate the specified number of children.")
+                        "Cannot generate the requested soft mode.")
                 freq_vals, disp_vals = sps.linalg.eigsh(
-                    sparse_matrix, k=num_children, which="SA")
-            freqs[i] = freq_vals[:num_children]
+                    sparse_matrix, k=num_modes_needed, which="SA")
+            freqs[i] = freq_vals[:num_modes_needed]
             # The eigvec associated with the Nth eigfreq for the ith q vector is saved
             # in the (start + N)th index
-            disps[i, :, :] = np.real(disp_vals)[:, :num_children].T
+            disps[i, :, :] = np.real(disp_vals)[:, :num_modes_needed].T
 
         # Now that we have all of the frequencies for a variety of q points, we can
-        # identify the N largest instabilities and use the associated displacements to
-        # create the N child structures. We first filter out the frequencies at or near
-        # 0, as these are associated with translational or rotational (acoustic) modes
+        # identify the softest instabilities and use the associated displacements to
+        # create the selected child structure. We first filter out the frequencies at
+        # or near 0, as these are associated with translational or rotational
+        # (acoustic) modes
 
-        # TODO: Look into combining the eigenvectors of the multiple q points. AiVA suggests that weighted averages or using principle component analysis might work well in this regard.
+        # TODO: Look into combining the eigenvectors of the multiple q points. Weighted averages or using principle component analysis might work well in this regard.
         non_acoustic_indices = np.where(~np.isclose(freqs, 0))
 
         # TODO: Look into further filtering this so we only consider unique displacements. Do equivalent eigenvalues results in the same eigenvectors for different q values? What about within the same q vector?
@@ -2819,9 +2935,11 @@ class GBManipulator:
         saved_disps = disps[non_acoustic_indices[0][sorted_filtered_freq_indices],
                             non_acoustic_indices[1][sorted_filtered_freq_indices], :]
 
-        # We are going to be creating num_children separate systems based on the
-        # eigen displacements. We initialize this here.
-        pos = np.zeros((num_children, *positions.shape))
+        if mode_index >= len(saved_disps):
+            raise GBManipulatorValueError(
+                f"mode_index={mode_index} is out of range: only "
+                f"{len(saved_disps)} non-acoustic soft mode(s) available."
+            )
 
         # minimum allowable distance before atoms are "too close"
         d_min = 2 * parent.unit_cell.radius
@@ -2835,17 +2953,13 @@ class GBManipulator:
             dists = np.linalg.norm(positions[atom_idx] - neighbor_positions, axis=1)
             precomputed_distances[i] = np.min(dists) - d_min
 
-        # We now need to perform the displacement. We check to make sure that the
-        # displacement does not cause atoms to overlap. We do this for each child that
-        # we want to generate from this analysis.
-        for mode_index in range(num_children):
-            pos[mode_index] = np.copy(positions)
-            disp_vector = saved_disps[mode_index].reshape(-1, 3)
-            disp_magnitude = np.linalg.norm(disp_vector, axis=1)
+        # We now need to perform the displacement for the selected mode. We check to
+        # make sure that the displacement does not cause atoms to overlap.
+        pos = np.copy(positions)
+        disp_vector = saved_disps[mode_index].reshape(-1, 3)
+        disp_magnitude = np.linalg.norm(disp_vector, axis=1)
 
-            if np.any(disp_magnitude == 0):
-                continue
-
+        if not np.any(disp_magnitude == 0):
             # Any True value here is a possible overlap between two atoms after the
             # displacement suggested in disp_vector.
             overlap_condition = precomputed_distances < disp_magnitude
@@ -2857,22 +2971,14 @@ class GBManipulator:
                 safe_displacements[overlap_condition] = overlapped_atoms / overlap_disps
 
             adjusted_displacements = disp_vector * safe_displacements[:, None]
-            pos[mode_index, parent.gb_indices] = positions[parent.gb_indices] + \
+            pos[parent.gb_indices] = positions[parent.gb_indices] + \
                 adjusted_displacements * (-1 if subtract_displacement else 1)
 
-            non_gb_indices = np.setdiff1d(
-                np.arange(positions.shape[0]), parent.gb_indices)
-
-            pos[mode_index, non_gb_indices] = positions[non_gb_indices]
-
-        structured_pos = []
-        for child in pos:
-            structured_p = np.zeros((len(atoms)), dtype=Atom.atom_dtype)
-            structured_p["name"] = parent.whole_system["name"]
-            structured_p["x"] = child[:, 0]
-            structured_p["y"] = child[:, 1]
-            structured_p["z"] = child[:, 2]
-            structured_pos.append(structured_p)
+        structured_pos = np.zeros((len(atoms)), dtype=Atom.atom_dtype)
+        structured_pos["name"] = parent.whole_system["name"]
+        structured_pos["x"] = pos[:, 0]
+        structured_pos["y"] = pos[:, 1]
+        structured_pos["z"] = pos[:, 2]
         return structured_pos
 
     def apply_group_symmetry(self, group: str) -> np.ndarray:
