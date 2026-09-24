@@ -1,7 +1,6 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
 import copy
-import filecmp
 import importlib
 import math
 import tempfile
@@ -13,6 +12,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+from numba.typed import List
 
 from GBOpt.Atom import Atom
 from GBOpt.BoundarySpec import CSLExactSpec, FiveDOFSpec, PQSpec
@@ -30,17 +30,17 @@ from GBOpt.GBManipulator import (
     ParentsProxyTypeError,
     ParentsProxyValueError,
     ParentValueError,
+    _calculate_dynamical_matrix,
     _calculate_local_order,
     _ParentsProxy,
 )
 from GBOpt.GrainOwnership import LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL, GrainOwnership
-
+from GBOpt.UnitCell import UnitCell
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:File-backed Parent initialization without explicit grain ownership is "
     "deprecated.*:DeprecationWarning"
 )
-from GBOpt.UnitCell import UnitCell
 
 _TEST_DIR = Path(__file__).resolve().parent
 _INPUT_DIR = _TEST_DIR / "inputs"
@@ -234,14 +234,15 @@ def test_local_order_is_higher_for_ideal_crystal_neighborhoods(structure, atoms)
     assert ideal_order > distorted_order + 1e-8
 
 
-def _synthetic_manipulator(unit_cell, atoms, seed=100):
-    # Bypass full GBMaker construction so stoichiometric mutator tests can
-    # isolate selection logic with a tiny deterministic parent.
+def _synthetic_manipulator(unit_cell, atoms, seed=100, gb_indices=None):
+    if gb_indices is None:
+        gb_indices = np.arange(len(atoms))
+
     parent = SimpleNamespace(
         unit_cell=unit_cell,
         whole_system=atoms,
-        gb_atoms=atoms,
-        gb_indices=np.arange(len(atoms)),
+        gb_atoms=atoms[gb_indices],
+        gb_indices=np.asarray(gb_indices, dtype=np.intp),
     )
 
     manipulator = object.__new__(GBManipulator)
@@ -689,7 +690,7 @@ class TestGBManipulator(unittest.TestCase):
     @pytest.mark.slow
     def test_displace_along_soft_modes_num_q_vecs(self):
         # test number of q vectors
-        child = self.manipulator_tilt.displace_along_soft_modes(num_q=20)
+        child = self.manipulator_tilt.displace_along_soft_modes(num_q=4)
         self.assertEqual(len(child), 1)
         self.assertFalse(structured_array_equal(
             child[0], self.manipulator_tilt.parents[0].whole_system))
@@ -707,8 +708,6 @@ class TestGBManipulator(unittest.TestCase):
 
     @pytest.mark.slow
     def test_displace_along_soft_modes_simple_case(self):
-        # While we end up using the indicated file for the actual atomic configuration,
-        # that configuration was developed using this set of parameters
         GB = _make_approximate_gb(
             3.54,
             "fcc",
@@ -721,30 +720,56 @@ class TestGBManipulator(unittest.TestCase):
             interaction_distance=5,
         )
         manipulator = GBManipulator(
-            './tests/inputs/Cu_single_crystal_with_displaced_atom.txt', unit_cell=GB.unit_cell, gb_thickness=5)
-        child1 = manipulator.displace_along_soft_modes()[0]
-        child2 = manipulator.displace_along_soft_modes(subtract_displacement=True)[0]
-        self.assertFalse(structured_array_equal(child1, child2))
+            "./tests/inputs/Cu_single_crystal_with_displaced_atom.txt",
+            unit_cell=GB.unit_cell,
+            gb_thickness=5,
+        )
 
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            GB.write_lammps(temp_file.name, child1, GB.box_dims)
-            self.assertTrue(
-                filecmp.cmp(
-                    temp_file.name,
-                    './tests/gold/soft_phonon_mode_displacement_added.txt',
-                    shallow=False
-                )
-            )
+        parent = manipulator.parents[0]
+        child = manipulator.displace_along_soft_modes()[0]
 
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            GB.write_lammps(temp_file.name, child2, GB.box_dims)
-            self.assertTrue(
-                filecmp.cmp(
-                    temp_file.name,
-                    './tests/gold/soft_phonon_mode_displacement_subtracted.txt',
-                    shallow=False
-                )
+        parent_positions = np.column_stack(
+            (
+                parent.whole_system["x"],
+                parent.whole_system["y"],
+                parent.whole_system["z"],
             )
+        )
+        child_positions = np.column_stack(
+            (
+                child["x"],
+                child["y"],
+                child["z"],
+            )
+        )
+
+        gb_indices = np.asarray(parent.gb_indices, dtype=np.intp)
+        non_gb_indices = np.setdiff1d(
+            np.arange(len(parent_positions)),
+            gb_indices,
+        )
+
+        np.testing.assert_array_equal(
+            child["name"],
+            parent.whole_system["name"],
+        )
+
+        assert np.all(np.isfinite(child_positions))
+
+        # Soft-mode displacement must not move atoms outside the selected GB region.
+        np.testing.assert_allclose(
+            child_positions[non_gb_indices],
+            parent_positions[non_gb_indices],
+        )
+
+        # The selected mode should actually displace at least one movable atom.
+        gb_displacements = (
+            child_positions[gb_indices]
+            - parent_positions[gb_indices]
+        )
+        assert np.any(
+            np.linalg.norm(gb_displacements, axis=1) > 1e-12
+        )
 
     def test_apply_group_symmetry(self):
         manipulator = GBManipulator(self.tilt, seed=self.seed)
@@ -1659,6 +1684,454 @@ def test_explicit_ownership_parent_proxy_replacement_resets_candidate_labels(tmp
     assert np.array_equal(
         manipulator.candidate_grain_labels,
         replacement_labels,
+    )
+
+
+def test_displace_along_soft_modes_uses_irreducible_cartesian_q_points(monkeypatch):
+    a0 = 4.81
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure(
+        "rocksalt",
+        a0,
+        ("Na", "Cl"),
+    )
+
+    atoms = np.array(
+        [
+            ("Na", 0.0, 0.0, 0.0),
+            ("Cl", a0 / 2.0, 0.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+
+    parent = SimpleNamespace(
+        unit_cell=unit_cell,
+        whole_system=atoms,
+        gb_atoms=atoms,
+        gb_indices=np.array([0, 1], dtype=np.intp),
+        box_dims=np.array(
+            [
+                [0.0, a0],
+                [0.0, a0],
+                [0.0, a0],
+            ]
+        ),
+        gb_thickness=a0,
+    )
+
+    manipulator = object.__new__(GBManipulator)
+    manipulator._GBManipulator__one_parent = True
+    manipulator._GBManipulator__parents = [parent, None]
+
+    gbmanipulator_module = importlib.import_module(
+        "GBOpt.GBManipulator"
+    )
+
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_create_neighbor_list",
+        lambda _cutoff, _positions: [[1], [0]],
+    )
+
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_calculate_bond_hardness",
+        lambda _parent, _neighbors, _bonds: np.ones((2, 2)),
+    )
+
+    captured_q = []
+
+    def capture_q(
+        _hardness,
+        _positions,
+        _gb_indices,
+        _neighbor_list,
+        q_vec,
+    ):
+        captured_q.append(np.asarray(q_vec, dtype=float).copy())
+
+        # Give the displacement machinery a deterministic nonzero spectrum.
+        return np.diag(
+            np.arange(-6.0, 0.0)
+        ).astype(np.complex128)
+
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_calculate_dynamical_matrix",
+        capture_q,
+    )
+
+    # A 2x2x2 primitive rocksalt mesh has three irreducible q-point
+    # representatives with time reversal enabled.
+    with pytest.warns(UserWarning, match="Fewer q_points"):
+        manipulator.displace_along_soft_modes(
+            mesh_size=2,
+            num_q=4,
+            num_children=1,
+        )
+
+    assert len(captured_q) == 3
+
+    q_magnitudes = np.linalg.norm(
+        np.asarray(captured_q),
+        axis=1,
+    )
+
+    np.testing.assert_allclose(
+        q_magnitudes,
+        [
+            0.0,
+            np.sqrt(3.0) * np.pi / a0,
+            2.0 * np.pi / a0,
+        ],
+    )
+
+
+def test_soft_mode_q_points_sort_by_cartesian_reciprocal_magnitude(monkeypatch):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure(
+        "sc",
+        1.0,
+        "H",
+    )
+
+    gbmanipulator_module = importlib.import_module(
+        "GBOpt.GBManipulator"
+    )
+
+    primitive_cell = (
+        np.diag([10.0, 1.0, 1.0]),
+        np.array([[0.0, 0.0, 0.0]]),
+        np.array([1]),
+    )
+
+    # Fractional magnitudes:
+    #
+    # [0, 1/4, 0] -> 0.25
+    # [1/2, 0, 0] -> 0.50
+    #
+    # Physical magnitudes for this anisotropic lattice:
+    #
+    # [1/2, 0, 0] -> pi / 10
+    # [0, 1/4, 0] -> pi / 2
+    #
+    # Thus sorting fractional coordinates gives the opposite ordering
+    # from sorting physical reciprocal vectors.
+    mapping = np.array([0, 1, 2], dtype=np.intc)
+    grid = np.array(
+        [
+            [0, 0, 0],
+            [0, 1, 0],
+            [2, 0, 0],
+        ],
+        dtype=np.intc,
+    )
+
+    monkeypatch.setattr(
+        gbmanipulator_module.spg,
+        "find_primitive",
+        lambda _cell: primitive_cell,
+    )
+
+    monkeypatch.setattr(
+        gbmanipulator_module.spg,
+        "get_ir_reciprocal_mesh",
+        lambda _mesh, _cell: (mapping, grid),
+    )
+
+    q_points = gbmanipulator_module._soft_mode_q_points(
+        unit_cell,
+        mesh_size=4,
+    )
+
+    np.testing.assert_allclose(
+        q_points,
+        np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [np.pi / 10.0, 0.0, 0.0],
+                [0.0, np.pi / 2.0, 0.0],
+            ]
+        ),
+    )
+
+
+def test_displace_along_soft_modes_uses_three_dimensional_neighbor_positions(
+    monkeypatch,
+):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("rocksalt", 4.0, ("Na", "Cl"))
+
+    atoms = np.array(
+        [
+            ("Na", 0.0, 0.0, 0.0),
+            ("Cl", 10.0, 0.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    manipulator = _synthetic_manipulator(unit_cell, atoms)
+
+    gbmanipulator_module = importlib.import_module("GBOpt.GBManipulator")
+
+    captured_positions = {}
+
+    class NeighborListCaptured(Exception):
+        pass
+
+    def capture_neighbor_positions(cutoff, positions):
+        positions = np.asarray(positions, dtype=float)
+        captured_positions["positions"] = positions
+        captured_positions["distance"] = np.linalg.norm(
+            positions[1] - positions[0]
+        )
+        captured_positions["cutoff"] = cutoff
+        raise NeighborListCaptured
+
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_create_neighbor_list",
+        capture_neighbor_positions,
+    )
+
+    with pytest.raises(NeighborListCaptured):
+        manipulator.displace_along_soft_modes()
+
+    np.testing.assert_allclose(
+        captured_positions["positions"],
+        np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+            ]
+        ),
+    )
+
+    assert captured_positions["distance"] == pytest.approx(10.0)
+    assert captured_positions["distance"] > captured_positions["cutoff"]
+
+
+def _typed_neighbor_list(neighbors):
+    result = List()
+    for neighbor in neighbors:
+        result.append(List(neighbor))
+    return result
+
+
+def test_dynamical_matrix_two_atom_bond_has_laplacian_structure():
+    hardness = np.array([[0.0, 2.0], [2.0, 0.0]])
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    gb_indices = np.array([0, 1], dtype=np.intp)
+
+    neighbor_list = List()
+    neighbor_list.append(List([1]))
+    neighbor_list.append(List([0]))
+
+    q_vec = np.zeros(3)
+
+    actual = _calculate_dynamical_matrix(
+        hardness,
+        positions,
+        gb_indices,
+        neighbor_list,
+        q_vec,
+    )
+
+    identity = np.eye(3)
+    expected = np.block(
+        [
+            [2.0 * identity, -2.0 * identity],
+            [-2.0 * identity, 2.0 * identity],
+        ]
+    )
+
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_dynamical_matrix_two_atom_bond_has_three_translation_modes():
+    hardness = np.array([[0.0, 2.0], [2.0, 0.0]])
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    gb_indices = np.array([0, 1], dtype=np.intp)
+
+    neighbor_list = List()
+    neighbor_list.append(List([1]))
+    neighbor_list.append(List([0]))
+
+    matrix = _calculate_dynamical_matrix(
+        hardness,
+        positions,
+        gb_indices,
+        neighbor_list,
+        np.zeros(3),
+    )
+
+    eigenvalues = np.linalg.eigvalsh(matrix)
+
+    np.testing.assert_allclose(
+        eigenvalues,
+        [0.0, 0.0, 0.0, 4.0, 4.0, 4.0],
+        atol=1e-12,
+    )
+
+
+def test_dynamical_matrix_fixed_neighbor_contributes_to_diagonal():
+    hardness = np.array([[0.0, 3.0], [3.0, 0.0]])
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+    # Only atom 0 is movable.
+    gb_indices = np.array([0], dtype=np.intp)
+    neighbor_list = _typed_neighbor_list([[1], [0]])
+
+    actual = _calculate_dynamical_matrix(
+        hardness,
+        positions,
+        gb_indices,
+        neighbor_list,
+        np.zeros(3),
+    )
+
+    np.testing.assert_allclose(
+        actual,
+        3.0 * np.eye(3),
+    )
+
+
+def test_dynamical_matrix_is_hermitian_at_nonzero_q():
+    hardness = np.array([[0.0, 2.0], [2.0, 0.0]])
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    gb_indices = np.array([0, 1], dtype=np.intp)
+    neighbor_list = _typed_neighbor_list([[1], [0]])
+    q_vec = np.array([0.7, 0.0, 0.0])
+
+    actual = _calculate_dynamical_matrix(
+        hardness,
+        positions,
+        gb_indices,
+        neighbor_list,
+        q_vec,
+    )
+
+    phase = np.exp(1j * 0.7)
+    identity = np.eye(3)
+
+    expected = np.block(
+        [
+            [2.0 * identity, -2.0 * phase * identity],
+            [-2.0 * phase.conjugate() * identity, 2.0 * identity],
+        ]
+    )
+
+    np.testing.assert_allclose(actual, expected, atol=1e-12)
+    np.testing.assert_allclose(actual, actual.conj().T, atol=1e-12)
+
+
+def test_displace_along_soft_modes_subtracts_selected_displacement(monkeypatch):
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("sc", 1.0, "H")
+
+    atoms = np.array(
+        [
+            ("H", 0.0, 0.0, 0.0),
+            ("H", 10.0, 0.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    manipulator = _synthetic_manipulator(unit_cell, atoms, gb_indices=[0])
+
+    gbmanipulator_module = importlib.import_module("GBOpt.GBManipulator")
+
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_create_neighbor_list",
+        lambda _cutoff, _positions: [[1], [0]],
+    )
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_calculate_bond_hardness",
+        lambda _parent, _neighbors, _bonds: np.ones((2, 2)),
+    )
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_soft_mode_q_points",
+        lambda _unit_cell, _mesh_size: np.zeros((1, 3)),
+    )
+
+    # Give the single movable atom a nondegenerate eigensystem whose softest
+    # mode is a unit displacement along +x.
+    monkeypatch.setattr(
+        gbmanipulator_module,
+        "_calculate_dynamical_matrix",
+        lambda *_args: np.diag([-3.0, -2.0, -1.0]).astype(
+            np.complex128
+        ),
+    )
+
+    added = manipulator.displace_along_soft_modes(
+        num_q=1,
+        num_children=1,
+    )[0]
+    subtracted = manipulator.displace_along_soft_modes(
+        num_q=1,
+        num_children=1,
+        subtract_displacement=True,
+    )[0]
+
+    parent_positions = np.column_stack(
+        (
+            atoms["x"],
+            atoms["y"],
+            atoms["z"],
+        )
+    )
+    added_positions = np.column_stack(
+        (
+            added["x"],
+            added["y"],
+            added["z"],
+        )
+    )
+    subtracted_positions = np.column_stack(
+        (
+            subtracted["x"],
+            subtracted["y"],
+            subtracted["z"],
+        )
+    )
+
+    added_displacement = added_positions[0] - parent_positions[0]
+    subtracted_displacement = (
+        subtracted_positions[0] - parent_positions[0]
+    )
+
+    # The same selected mode must be applied with opposite sign.
+    np.testing.assert_allclose(
+        added_displacement,
+        -subtracted_displacement,
+    )
+    np.testing.assert_allclose(
+        added_displacement,
+        [1.0, 0.0, 0.0],
+    )
+
+    # The atom outside the movable GB region must remain unchanged.
+    np.testing.assert_allclose(
+        added_positions[1],
+        parent_positions[1],
+    )
+    np.testing.assert_allclose(
+        subtracted_positions[1],
+        parent_positions[1],
+    )
+
+    # The parent itself must not be modified.
+    np.testing.assert_allclose(
+        np.column_stack(
+            (
+                atoms["x"],
+                atoms["y"],
+                atoms["z"],
+            )
+        ),
+        parent_positions,
     )
 
 

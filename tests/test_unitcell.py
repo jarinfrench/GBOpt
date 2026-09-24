@@ -631,6 +631,39 @@ def test_binary_neighbor_shells_scale_with_lattice_parameter(
     )
 
 
+def test_rocksalt_positions_scale_with_lattice_parameter():
+    cell = UnitCell()
+    cell.init_by_structure(
+        structure="rocksalt",
+        a0=4.0,
+        atoms=("Na", "Cl"),
+    )
+
+    np.testing.assert_allclose(
+        cell.positions(),
+        np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 2.0, 2.0],
+                [2.0, 0.0, 2.0],
+                [2.0, 2.0, 0.0],
+                [0.0, 0.0, 2.0],
+                [0.0, 2.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 2.0, 2.0],
+            ]
+        ),
+    )
+
+    assert cell.nn_distance(1) == pytest.approx(2.0)
+    assert cell.nn_distance(2) == pytest.approx(4.0 / math.sqrt(2))
+
+    cell.a0 = 5.0
+
+    assert cell.nn_distance(1) == pytest.approx(2.5)
+    assert cell.nn_distance(2) == pytest.approx(5.0 / math.sqrt(2))
+
+
 # ---------------------------------------------------------------------------
 # Exact rational basis metadata
 # ---------------------------------------------------------------------------
