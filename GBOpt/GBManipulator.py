@@ -9,16 +9,10 @@ calculator evaluation, and optimizer policy do not belong here.
 import copy as copy_module
 import multiprocessing as mp
 import warnings
-from itertools import combinations_with_replacement
 from numbers import Real
 from os.path import isfile
 
 import numpy as np
-import scipy.sparse as sps
-import spglib as spg
-from numba import float64, jit, prange
-from numba.typed import List
-from scipy.spatial import ConvexHull, Delaunay, KDTree
 
 from GBOpt._candidate_admissibility import (
     CandidateAdmissibilityError,
@@ -57,6 +51,19 @@ from GBOpt.manipulation import (
     RightGrainTranslation,
     default_registry,
 )
+from GBOpt.manipulation.density import (
+    _calculate_local_order as _calculate_local_order,  # re-exported for compatibility
+)
+from GBOpt.manipulation.density import (
+    delaunay_insertion_sites,
+    grid_insertion_sites,
+    select_insertion_sites,
+    select_removal_indices,
+)
+from GBOpt.manipulation.soft_mode import (
+    _calculate_dynamical_matrix as _calculate_dynamical_matrix,  # re-exported for compatibility
+)
+from GBOpt.manipulation.soft_mode import soft_mode_displacement_atoms
 from GBOpt.manipulation.translation import right_grain_translation_atoms
 from GBOpt.UnitCell import UnitCell
 
@@ -1117,329 +1124,6 @@ class _ParentsProxy:
         return len(self.__manipulator._GBManipulator__parents)
 
 
-@jit(float64(float64, float64), nopython=True, cache=True)
-def _gaussian(x: float, sigma: float = 0.02) -> float:
-    """
-    Calculates a Gaussian-smeared delta function at *x* given a standard deviation of
-    *sigma*.
-
-    :param x: Where to calculate the Gaussian-smeared delta function.
-    :param sigma: Standard deviation of the Gaussian-smeared delta function, optional,
-        defaults to 0.02.
-    :return: Value of the Gaussian-smeared delta function at x.
-    """
-    prefactor = 1 / (sigma * np.sqrt(2 * np.pi))
-    return prefactor * np.exp(-x * x / (2 * sigma * sigma))
-
-
-@jit(nopython=True, cache=True)
-def _calculate_fingerprint_vector(atom, neighs, NB, V, Btype, Delta, Rmax):
-    """
-    Calculates the fingerprint for *atom* as described in Lyakhov *et al.*,
-    Computer Phys. Comm. 181 (2010) 1623-1632 (Eq. 4).
-
-    :param np.ndarray atom: The atom we are calculating the fingerprint for.
-    :param np.ndarray neighs: list of Atom containing the neighbors to **atom**.
-    :param int NB: The number of atoms of type B neighbor to **atom**.
-    :param float V: The volume of the unit cell in angstroms**3.
-    :param int Btype: The type of neighbors we are interested in.
-    :param float Delta: The discretization length for Rs in angstroms.
-    :param float Rmax: The maximum distance from the *atom* to another atom to
-        calculate the fingerprint.
-    :return: The vector containing the fingerprint for *atom*.
-    """
-    Rs = np.arange(0, Rmax + Delta, Delta)
-
-    fingerprint_vector = np.zeros_like(Rs)
-    for idx, R in enumerate(Rs):
-        local_sum = 0
-        for neigh in neighs:
-            if neigh[0] == Btype:
-                diff = atom[1:] - neigh[1:]
-                # Rij = np.linalg.norm(atom[1:] - neigh[1:])
-                distance = np.sqrt(np.dot(diff, diff))
-                delta = _gaussian(R - distance, 0.02)
-                local_sum += delta / \
-                    (4 * np.pi * distance * distance * (NB / V) * Delta)
-        fingerprint_vector[idx] = local_sum - 1
-
-    return fingerprint_vector
-
-
-@jit(nopython=True, cache=True, parallel=True)
-def _calculate_local_order(atom, neighs, unit_cell_types, unit_cell_a0, N, Delta, Rmax):
-    """
-    Calculates the local order parameter following Lyakhov *et al.*, Computer Phys.
-    Comm. 181 (2010) 1623-1632 (Eq. 5).
-
-    :param np.ndarray atom: Atom we are calculating the local order for.
-    :param np.ndarray neighs: Neighbors of *atom*.
-    :param np.ndarray unit_cell_types: The types of the atoms in the unit cell.
-    :param float unit_cell_a0: The lattice parameter.
-    :param int N: The number of atoms in the unit cell.
-    :param float Delta: Bin size to calculate the fingerprint vector.
-    :param float Rmax: Maximum distance from *atom* to consider as a neighbor to
-        *atom* in angstroms.
-    :return: The local order parameter for *atom* based on its neighbors.
-    """
-    local_sum = 0
-    atom_types = np.unique(neighs[:, 0])
-    V = unit_cell_a0 ** 3
-    prefactor = Delta / (N * (V / N) ** (1 / 3))
-    for Btype in atom_types:
-        NB = np.sum(unit_cell_types == Btype)
-        fingerprint = _calculate_fingerprint_vector(
-            atom, neighs, NB, V, Btype, Delta, Rmax)
-        local_sum += NB * prefactor * np.dot(fingerprint, fingerprint)
-    return np.sqrt(local_sum)
-
-
-def _create_neighbor_list(rcut: float, pos: np.ndarray) -> list:
-    """
-    Creates a neighbor list using a KDTree.
-
-    :param rcut: Cutoff distance for considering an atom a neighbor to another.
-    :param pos: The array of atom positions.
-    :return: The neighbor list for the atoms in **pos**
-    """
-    kdtree = KDTree(pos)
-    neighbor_list = kdtree.query_ball_tree(kdtree, r=rcut)
-    # Remove an atom from using itself as a neighbor.
-    for i, neighbor in enumerate(neighbor_list):
-        neighbor.remove(i)
-    return neighbor_list
-
-
-def _soft_mode_q_points(unit_cell: UnitCell, mesh_size: int) -> np.ndarray:
-    """Return irreducible q points in Cartesian reciprocal-space coordinates.
-
-    A self-consistent spglib cell is constructed from the conventional lattice and
-    basis. spglib is then used to reduce that cell to a primitive cell and identify the
-    irreducible reciprocal-mesh representatives.
-
-    The returned q vectors are expressed in Cartesian reciprocal coordinates with units
-    of inverse Angstroms so they can be combined directly with Cartesian interatomic
-    displacement vectors.
-
-    :param unit_cell: Nominal bulk unit cell used to determine crystal symmetry.
-    :param mesh_size: Uniform reciprocal-space mesh size along each primitive reciprocal
-        axis.
-    :return: Irreducible q vectors sorted by increasing physical magnitude.
-    :raises GBManipulatorValueError: If spglib cannot identify a primitive cell.
-    """
-    conventional_lattice = np.asarray(
-        unit_cell.conventional,
-        dtype=np.float64,
-    )
-    cartesian_positions = np.asarray(
-        unit_cell.positions(),
-        dtype=np.float64,
-    )
-
-    # spglib expects scaled positions relative to the supplied lattice.
-    scaled_positions = np.linalg.solve(
-        conventional_lattice.T,
-        cartesian_positions.T,
-    ).T
-    scaled_positions = np.mod(scaled_positions, 1.0)
-
-    # Normalize numerical noise at periodic boundaries.
-    close_to_zero = np.isclose(
-        scaled_positions,
-        0.0,
-        rtol=0.0,
-        atol=1e-12,
-    )
-    close_to_one = np.isclose(
-        scaled_positions,
-        1.0,
-        rtol=0.0,
-        atol=1e-12,
-    )
-    scaled_positions[close_to_zero | close_to_one] = 0.0
-
-    conventional_cell = (
-        conventional_lattice,
-        scaled_positions,
-        unit_cell.types(),
-    )
-
-    primitive_cell = spg.find_primitive(conventional_cell)
-    if primitive_cell is None:
-        raise GBManipulatorValueError(
-            "Could not identify a primitive cell for soft-mode q-point generation."
-        )
-
-    mesh = np.full(3, mesh_size, dtype=np.intc)
-
-    mapping, grid = spg.get_ir_reciprocal_mesh(
-        mesh,
-        primitive_cell,
-    )
-
-    # The grid contains every mesh point. The unique values in mapping are indices of
-    # the irreducible representatives.
-    ir_indices = np.unique(mapping)
-    q_fractional = (
-        np.asarray(grid[ir_indices], dtype=np.float64)
-        / mesh.astype(np.float64)
-    )
-
-    primitive_lattice = np.asarray(
-        primitive_cell[0],
-        dtype=np.float64,
-    )
-
-    # Lattice vectors are stored as rows. The reciprocal basis is therefore 2*pi*A^(-T),
-    # giving Cartesian q vectors in inverse Angstroms.
-    reciprocal_lattice = (
-        2.0
-        * np.pi
-        * np.linalg.inv(primitive_lattice).T
-    )
-    q_cartesian = q_fractional @ reciprocal_lattice
-
-    magnitudes = np.linalg.norm(q_cartesian, axis=1)
-    order = np.argsort(magnitudes, kind="stable")
-    return q_cartesian[order]
-
-
-# @jit(nopython=True, cache=True)
-def _calculate_bond_hardness(parent, neighbor_list, ideal_bonds):
-    atoms = parent.whole_system
-    types = Atom.as_array(atoms)[:, 0]
-    gb_indices = parent.gb_indices
-
-    atom_info = {}
-    for idx, atom in enumerate(atoms):
-        a = Atom(*atom)  # convert this to an Atom
-        if a.name not in atom_info:
-            atom_info[a.name] = {
-                "num": types[idx],
-                "r_cov": a["r_cov"],
-                "valence": a["valence"],
-                "valence_electrons": a["valence_electrons"]
-            }
-
-    atom_type_to_name = {info["num"]: name for name, info in atom_info.items()}
-    atom_name_to_type = {name: num for num, name in atom_type_to_name.items()}
-    atom_types = list(atom_info.keys())
-
-    n_of_bond_type = {
-        (atom1, atom2): 0
-        for atom1 in atom_types for atom2 in atom_types
-    }
-
-    for idx in gb_indices:
-        for jdx in neighbor_list[idx]:
-            if jdx < idx:
-                continue
-            n_of_bond_type[(atoms[idx]["name"], atoms[jdx]["name"])] += 1
-
-    # We precompute half of Delta_k since it is used frequently.
-    Delta_k = {}
-    sorted_atom_type_to_name = sorted(atom_type_to_name)
-    for type1, type2 in combinations_with_replacement(sorted_atom_type_to_name, 2):
-        name1 = atom_type_to_name[type1]
-        name2 = atom_type_to_name[type2]
-        dk_tuple = (type1, type2)
-        Delta_k[dk_tuple] = 0.5 * (ideal_bonds[(type1, type2)] -
-                                   atom_info[name1]["r_cov"] - atom_info[name2]["r_cov"])
-    bond_valence = np.sum(np.exp(-np.asarray(list(Delta_k.values())) / 0.37))
-
-    y_dim = parent.box_dims[1, 1] - parent.box_dims[1, 0]
-    z_dim = parent.box_dims[2, 1] - parent.box_dims[2, 0]
-    V = parent.gb_thickness * y_dim * z_dim
-    N = np.sum(list(n_of_bond_type.values()))
-    Hij = np.zeros((len(atoms), len(atoms)))
-    for i1 in gb_indices:
-        atom1 = Atom(*atoms[i1])
-        type1 = atom_name_to_type[atom1["name"]]
-        i1_CN = atom1["valence"] / bond_valence
-        for i2 in neighbor_list[i1]:
-            atom2 = Atom(*atoms[i2])
-            type2 = atom_name_to_type[atom2["name"]]
-            dk_tuple = (type1, type2) if type1 <= type2 else (type2, type1)
-            i1_electronegativity = 0.481 * \
-                atom1["valence_electrons"] / \
-                (atom1["r_cov"] + Delta_k[dk_tuple])
-            i2_electronegativity = 0.481 * \
-                atom2["valence_electrons"] / \
-                (atom2["r_cov"] + Delta_k[dk_tuple])
-            i2_CN = atom2["valence"] / bond_valence
-            Xij = np.sqrt(i1_electronegativity / i1_CN * i2_electronegativity / i2_CN)
-            fi = abs(i1_electronegativity - i2_electronegativity) / \
-                (4*np.sqrt(i1_electronegativity * i2_electronegativity))
-            Hij[i1, i2] = Xij / (V / N) * np.exp(-2.7 * fi)
-            Hij[i2, i1] = Hij[i1, i2]
-
-    return Hij
-
-
-@jit(nopython=True, cache=True)
-def _calculate_dynamical_matrix(
-    hardness,
-    positions,
-    gb_atom_indices,
-    neighbor_list,
-    q_vec,
-):
-    num_gb_atoms = len(gb_atom_indices)
-    Dij = np.zeros((3 * num_gb_atoms, 3 * num_gb_atoms), dtype=np.complex128)
-
-    for d_i in prange(num_gb_atoms):
-        id1 = gb_atom_indices[d_i]
-
-        for id2 in neighbor_list[id1]:
-            bond_hardness = hardness[id1, id2]
-
-            # Every bond connected to a movable GB atom contributes to that atom's
-            # onsite restoring term, including bonds to atoms outside the movable GB
-            # region.
-            for aa in range(3):
-                Dij[
-                    3 * d_i + aa,
-                    3 * d_i + aa,
-                ] += bond_hardness
-
-            # Atoms outside gb_atom_indices are treated as fixed, so they have no
-            # corresponding degrees of freedom in this matrix.
-            if id2 not in gb_atom_indices:
-                continue
-
-            d_j = np.where(gb_atom_indices == id2)[0][0]
-            rij = positions[id2] - positions[id1]
-            exp_term = np.exp(1j * np.dot(q_vec, rij))
-
-            # The bond-hardness model couples corresponding Cartesian components;
-            # cross-coordinate terms are zero.
-            for aa in range(3):
-                Dij[
-                    3 * d_i + aa,
-                    3 * d_j + aa,
-                ] -= bond_hardness * exp_term
-
-    return Dij
-
-
-def _get_stoichiometric_change(n_units: int, ratio: dict[int, int]) -> dict[int, int]:
-    """_summary_
-
-    Args:
-        n_units: The number of atom units (defined as the sum of the values in the ratio
-            dict) that will be modified. For example, given a ratio of
-            {1: 1, 2: 2, 3: 3, 4: 1}, this number would indicate how many of type 1
-            (and type 4) would be affected by the operation.
-        ratio: The ratio of each atom type in the unit cell. Must be a dict where the
-            keys and values are positive integers.
-
-    Returns:
-        dict[int, int]: The number of atoms of each type that will be changed.
-    """
-
-    return {atom_type: num * n_units for atom_type, num in ratio.items()}
-
-
 class GBManipulator:
     """
     Class to manipulate atoms in the grain boundary region.
@@ -2314,138 +1998,18 @@ class GBManipulator:
             )
             return atoms
 
-        if len(type_map) == 1:
-            num_to_remove_dict = {1: num_to_remove}
-        # determine both the number to remove of each type, and the probability of
-        # removal
-        elif keep_ratio:
-            num_to_remove_dict = _get_stoichiometric_change(
-                num_to_remove, parent.unit_cell.ratio
-            )
-            num_to_remove = sum(list(num_to_remove_dict.values()))
-            central_type = min(num_to_remove_dict, key=num_to_remove_dict.get)
-            cutoff = (
-                parent.unit_cell.nn_distance(2) + parent.unit_cell.nn_distance(1)
-            ) / 2
-            neighbor_list = _create_neighbor_list(cutoff, positions)
-            Delta = 0.05  # Bin size to calculate the fingerprint vector.
-            Rmax = 15  # Max distance allowed to be a neighbor
-            args_list = [
-                (
-                    atoms[atom_idx],
-                    atoms[neighbor_list[atom_idx]],
-                    parent.unit_cell.names(asint=True),
-                    parent.unit_cell.a0,
-                    len(parent.unit_cell.unit_cell),
-                    Delta,
-                    Rmax,
-                )
-                for idx, atom_idx in enumerate(gb_atom_indices)
-            ]
-            order = np.zeros(len(args_list))
-            for i, args in enumerate(args_list):
-                order[i] = _calculate_local_order(*args)
-
-            # We want the probabilities to be inversely proportional to the order parameter.
-            # Higher order parameters should be more "stable" against removal than low order
-            # parameters. We give small probabilities to the higher order values just to
-            # allow for variety in the calculations.
-            probabilities = max(order) - order + min(order)
-            probabilities = probabilities / np.sum(probabilities, dtype=float)
-        else:
-            # If we aren't worried about keeping the ratio, randomly assign atoms to be
-            # removed to each type, summing up to num_to_remove.
-            breaks = np.sort(
-                np.random.choice(
-                    range(1, num_to_remove), len(type_map) - 1, replace=False
-                )
-            )
-            breaks = np.concatenate(([0], breaks, [num_to_remove]))
-            values = np.diff(breaks)
-            num_to_remove_dict = {
-                i + 1: int(values[i]) for i in range(len(type_map))
-            }
-
-        if keep_ratio and len(type_map) > 1:
-            type_mask = atoms[gb_atom_indices][:, 0] == central_type
-            central_indices = gb_atom_indices[type_mask]
-            central_probabilities = probabilities[type_mask]
-            central_probabilities = (
-                central_probabilities / np.sum(central_probabilities)
-            )
-
-            if len(central_indices) == 0:
-                raise GBManipulatorValueError(
-                    f"No atoms found for type {central_type} in the grain boundary."
-                )
-
-            central_num_to_remove = num_to_remove_dict[central_type]
-            selected_central_indices = self.__rng.choice(
-                central_indices,
-                central_num_to_remove,
-                replace=False,
-                p=central_probabilities,
-            )
-
-            distances = {
-                idx: np.full(len(neighbor_list[idx]), np.inf)
-                for idx in selected_central_indices
-            }
-            for central_idx in selected_central_indices:
-                neighbors = neighbor_list[central_idx]
-                gb_neighbors = np.intersect1d(neighbors, gb_atom_indices)
-                mask = np.isin(neighbors, gb_neighbors)
-                distances[central_idx][mask] = np.linalg.norm(
-                    positions[gb_neighbors] - positions[central_idx], axis=1
-                )
-
-            indices_to_remove = list(distances.keys())
-            for atom_type, ratio in parent.unit_cell.ratio.items():
-                if atom_type == central_type:
-                    continue
-                # type_mask = atoms[gb_atom_indices][:, 0] == atom_type
-                # type_indices = gb_atom_indices[type_mask]
-                for idx, dists in distances.items():
-                    neighbor_indices = np.asarray(neighbor_list[idx])
-                    gb_neighbor_indices = np.intersect1d(
-                        neighbor_indices, gb_atom_indices)
-                    mask = np.isin(neighbor_indices, gb_neighbor_indices)
-                    type_mask = atoms[gb_neighbor_indices][:, 0] == atom_type
-                    type_indices = neighbor_indices[mask][type_mask]
-                    duplicates = [
-                        i for i, el in enumerate(type_indices)
-                        if el in indices_to_remove
-                    ]
-
-                    type_indices = list(set(type_indices) - set(duplicates))
-                    if len(type_indices) < ratio:
-                        raise GBManipulatorValueError(
-                            f"Not enough neighbor atoms of type {atom_type} to remove."
-                        )
-
-                    # this really shouldn't happen, as this would indicate overlapping
-                    # atoms
-                    dists[dists < 1e-8] = 1e-8
-                    type_probabilities = 1 / dists[mask][type_mask]
-                    type_probabilities = type_probabilities / np.sum(type_probabilities)
-
-                    type_idx_to_remove = self.__rng.choice(
-                        type_indices, ratio, replace=False, p=type_probabilities
-                    )
-
-                    indices_to_remove.extend(type_idx_to_remove)
-
-        else:  # keep_ratio == False or len(type_map) == 1
-            indices_to_remove = []
-            for atom_type, num in num_to_remove_dict.items():
-                type_indices = gb_atom_indices[
-                    atoms[gb_atom_indices][:, 0] == atom_type
-                ]
-                type_idx_to_remove = self.__rng.choice(type_indices, num, replace=False)
-                indices_to_remove.extend(type_idx_to_remove)
-
-        if not len(indices_to_remove) == num_to_remove:
-            raise GBManipulatorValueError("")
+        indices_to_remove = self.__translate_manipulation_error(
+            select_removal_indices,
+            atoms=atoms,
+            positions=positions,
+            gb_atom_indices=gb_atom_indices,
+            type_map=type_map,
+            ratio=parent.unit_cell.ratio,
+            unit_cell=parent.unit_cell,
+            num_to_remove=num_to_remove,
+            keep_ratio=keep_ratio,
+            rng=self.__rng,
+        )
         pos = np.delete(parent.whole_system, indices_to_remove, axis=0)
         labels = getattr(parent, "grain_labels", None)
         retained_labels = (
@@ -2491,163 +2055,6 @@ class GBManipulator:
             specified.
         :return: Atom positions after atom insertion.
         """
-        def Delaunay_approach(
-            gb_atoms: np.ndarray,
-            atom_radius: float,
-            num_to_insert: int
-        ) -> np.ndarray:
-            """
-            Delaunay triangulation approach for inserting atoms. Potential insertion
-            sites are the circumcenters of the tetrahedra.
-
-            :param gb_atoms: Array of atom positions where we are considering inserting
-                new atoms.
-            :param atom_radius: The radius of an atom.
-            :param num_to_insert: The number of atoms to insert.
-            :return: The sites at which new atoms are inserted.
-            """
-            # First we need to duplicate the gb_atoms in the y and z directions to
-            # account for PBCs.
-            min_bounds = np.min(gb_atoms, axis=0)
-            max_bounds = np.max(gb_atoms, axis=0)
-            Lx, Ly, Lz = max_bounds - min_bounds
-            tiles = [(dy, dz) for dy in [-1, 0, 1] for dz in [-1, 0, 1]]
-            replicas = []
-            original_indices = []
-            for dy, dz in tiles:
-                shift = np.zeros_like(gb_atoms)
-                shift[:, 1] = dy * Ly
-                shift[:, 2] = dz * Lz
-                replicas.append(gb_atoms + shift)
-                original_indices.extend(np.arange(len(gb_atoms)))
-            tiled = np.vstack(replicas)
-            original_indices = np.array(original_indices)
-
-            # Delaunay triangulation approach
-            tri = Delaunay(tiled)
-            # ijk is for the 3x3 transformation matrix triangulation.transform[:, :3, :]
-            # ik is for the offset vector triangulation.transform[:, 3, :], and ij is
-            # the resulting circumcenter coordinates
-            circumcenters = -np.einsum(
-                "ijk,ik->ij",
-                tri.transform[:, :3, :],
-                tri.transform[:, 3, :]
-            )
-            # Wrap circumcenters back into the original bounds
-            circumcenters[:, 1] = np.mod(
-                circumcenters[:, 1] - min_bounds[1], Ly) + min_bounds[1]
-            circumcenters[:, 2] = np.mod(
-                circumcenters[:, 2] - min_bounds[2], Lz) + min_bounds[2]
-
-            original_indices_simplices = original_indices[tri.simplices]
-
-            # Bounds check
-            in_bounds = np.all((circumcenters >= min_bounds) & (
-                circumcenters <= max_bounds), axis=1)
-            mask = in_bounds
-
-            # Volume check
-            # Calculating the volume may occasionally fail if the points are collinear,
-            # so we catch the warning so users are not concerned.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                simplices = gb_atoms[original_indices_simplices]
-                A, B, C, D = simplices[:, 0], simplices[:,
-                                                        1], simplices[:, 2], simplices[:, 3]
-                volumes = np.abs(
-                    np.einsum("ij,ij->i", np.cross(B - A, C - A), D - A)) / 6.0
-            volume_threshold = 1e-3
-            volume_mask = (volumes > volume_threshold * np.median(volumes)) & ~np.isnan(
-                circumcenters).any(axis=1)
-            mask &= volume_mask
-
-            # Convex hull check
-            hull_vertices = set(ConvexHull(gb_atoms).vertices)
-            simplex_mask = ~np.any(np.isin(tri.simplices, list(hull_vertices)), axis=1)
-            mask &= simplex_mask
-
-            valid_circumcenters = circumcenters[mask]
-            valid_simplices = original_indices_simplices[mask, 0]
-            sphere_radii = np.linalg.norm(
-                gb_atoms[valid_simplices] - valid_circumcenters, axis=1)
-            interstitial_radii = sphere_radii - atom_radius
-            interstitial_radii -= np.min(interstitial_radii)  # make everything >= 0
-            probabilities = interstitial_radii / np.sum(interstitial_radii)
-            probabilities = probabilities / np.sum(probabilities)  # normalize
-            assert abs(1 - np.sum(probabilities)
-                       ) < 1e-8, "Probabilities are not normalized!"
-            num_sites = len(circumcenters)
-
-            if num_to_insert is None:
-                num_to_insert = int(fill_fraction * num_sites)
-
-            if num_to_insert == 0:
-                warnings.warn("Calculated fraction of atoms to insert is 0: "
-                              f"int({fill_fraction}*{len(gb_atoms)}) = 0"
-                              )
-
-            return valid_circumcenters, probabilities
-
-        def grid_approach(
-            gb_atoms: np.ndarray,
-            atom_radius: float,
-            num_to_insert: int,
-        ) -> np.ndarray:
-            """
-            Grid approach for inserting atoms. Potential insertion sites are on a 1x1x1
-            Angstrom grid where sites must be at least *atom_radius* away.
-
-            :param gb_atoms: Array of atom positions where we are considering inserting
-                new atoms.
-            :param atom_radius: The radius of an atom.
-            :param num_to_insert: The number of atoms to insert.
-
-            :return: The sites at which new atoms are inserted.
-            """
-            # Grid approach
-            max_x, max_y, max_z = gb_atoms.max(axis=0)
-            min_x, min_y, min_z = gb_atoms.min(axis=0)
-            X, Y, Z = np.meshgrid(
-                np.arange(np.floor(min_x), np.ceil(max_x) + 1),
-                np.arange(np.floor(min_y), np.ceil(max_y) + 1),
-                np.arange(np.floor(min_z), np.ceil(max_z) + 1),
-                indexing="ij"
-            )
-            sites = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
-            GB_tree = KDTree(gb_atoms)
-            sites_tree = KDTree(sites)
-            indices_to_remove = GB_tree.query_ball_tree(sites_tree, atom_radius)
-            indices_to_remove = list(set(
-                [i for sublist in indices_to_remove for i in sublist]))
-            filtered_sites = np.delete(sites, indices_to_remove, axis=0)
-
-            distances, _ = GB_tree.query(filtered_sites, k=1)
-            probabilities = distances / np.sum(distances)
-            probabilities = probabilities / np.sum(probabilities)  # normalize
-            assert abs(1 - np.sum(probabilities)
-                       ) < 1e-8, "Probabilities are not normalized!"
-            num_sites = len(filtered_sites)
-
-            if num_to_insert is None:
-                num_to_insert = int(fill_fraction * num_sites)
-
-            if num_to_insert == 0:
-                warnings.warn("Calculated fraction of atoms to insert is 0: "
-                              f"int({fill_fraction}*{len(gb_atoms)}) = 0"
-                              )
-
-            return filtered_sites, probabilities
-
-            indices = self.__rng.choice(num_sites,
-                                        num_to_insert,
-                                        replace=False,
-                                        p=probabilities
-                                        )
-            return filtered_sites[indices]
-
-            raise GBManipulatorValueError(
-                "fill_fraction or num_to_insert must be specified.")
-
         if not fill_fraction and not num_to_insert:
             raise GBManipulatorValueError(
                 "fill_fraction or num_to_insert must be specified."
@@ -2661,10 +2068,10 @@ class GBManipulator:
         type_map_inverse = {v: k for k, v in type_map.items()}
 
         if fill_fraction is not None and (fill_fraction <= 0 or fill_fraction > 0.25):
-            raise GBManipulatorValueError
-            (f"Invalid value for fill_fraction ({fill_fraction=}). Must be 0 < "
-             "fill_fraction <= 0.25"
-             )
+            raise GBManipulatorValueError(
+                f"Invalid value for fill_fraction ({fill_fraction=}). Must be 0 < "
+                "fill_fraction <= 0.25"
+            )
 
         if num_to_insert is not None and (
             num_to_insert < 1 or num_to_insert > int(0.25 * len(gb_atoms))
@@ -2686,85 +2093,26 @@ class GBManipulator:
             )
             return atoms
 
-        if len(type_map) == 1:
-            num_to_insert_dict = {1: num_to_insert}
-        elif keep_ratio:
-            num_to_insert_dict = _get_stoichiometric_change(
-                num_to_insert, parent.unit_cell.ratio
-            )
-            num_to_insert = sum(list(num_to_insert_dict.values()))
-            central_type = min(num_to_insert_dict, key=num_to_insert_dict.get)
-        else:  # random insertion of random types
-            breaks = np.sort(
-                np.random.choice(
-                    range(1, num_to_insert), len(type_map) - 1, replace=False
-                )
-            )
-            breaks = np.concatenate([[0], breaks, [num_to_insert]])
-            values = np.diff(breaks)
-            num_to_insert_dict = {
-                i + 1: int(values[i]) for i in range(len(type_map))
-            }
-
-        # Calculate the insertion sites using the specified approach.
         if method == "delaunay":
-            possible_sites, probabilities = Delaunay_approach(
-                gb_atoms[:, 1:], parent.unit_cell.radius, num_to_insert)
+            possible_sites, probabilities = delaunay_insertion_sites(
+                gb_atoms[:, 1:], parent.unit_cell.radius)
         elif method == "grid":
-            possible_sites, probabilities = grid_approach(
-                gb_atoms[:, 1:], parent.unit_cell.radius, num_to_insert)
+            possible_sites, probabilities = grid_insertion_sites(
+                gb_atoms[:, 1:], parent.unit_cell.radius)
         else:
             raise GBManipulatorValueError(f"Unrecognized insert_atoms method: {method}")
 
-        if keep_ratio and len(type_map) > 1:
-            central_num_to_insert = num_to_insert_dict[central_type]
-            selected_central_indices = self.__rng.choice(
-                list(range(len(possible_sites))),
-                central_num_to_insert,
-                replace=False,
-                p=probabilities
-            )
-            cutoff = (
-                parent.unit_cell.nn_distance(2) + parent.unit_cell.nn_distance(1)
-            ) / 2.0
-            possible_sites_neighbor_list = _create_neighbor_list(cutoff, possible_sites)
-
-            atoms_to_add = {
-                type_map[i]: [] if type_map[i] != central_type else selected_central_indices for i in type_map.keys()}
-            for atom_type, ratio in parent.unit_cell.ratio.items():
-                if atom_type == central_type:
-                    continue
-                for idx in selected_central_indices:
-                    neighbors = possible_sites_neighbor_list[idx]
-                    already_assigned = {idx for v in atoms_to_add.values() for idx in v}
-                    # Only consider the indices that have not already been assigned
-                    available_neighbors = list(set(neighbors) - already_assigned)
-                    if len(available_neighbors) < ratio:
-                        raise GBManipulatorValueError(
-                            "Not enough sites to insert atoms into."
-                        )
-                    partial_probabilities = probabilities[available_neighbors]
-                    partial_probabilities = partial_probabilities / \
-                        np.sum(partial_probabilities)
-                    selected_neighbor_offsets = self.__rng.choice(
-                        list(range(len(available_neighbors))), ratio, replace=False,
-                        p=partial_probabilities
-                    )
-                    selected_indices = [
-                        available_neighbors[offset]
-                        for offset in selected_neighbor_offsets
-                    ]
-                    atoms_to_add[atom_type].extend(selected_indices)
-        else:
-            atoms_to_add = {}
-            site_indices = list(range(len(possible_sites)))
-            for atom_type, num in num_to_insert_dict.items():
-                available_indices = list(
-                    set(site_indices) - set(np.array(atoms_to_add.values()).flatten()))
-                type_idx_to_insert = self.__rng.choice(
-                    available_indices, num, replace=False, p=probabilities
-                )
-                atoms_to_add[atom_type] = type_idx_to_insert
+        atoms_to_add = self.__translate_manipulation_error(
+            select_insertion_sites,
+            possible_sites=possible_sites,
+            probabilities=probabilities,
+            type_map=type_map,
+            ratio=parent.unit_cell.ratio,
+            unit_cell=parent.unit_cell,
+            num_to_insert=num_to_insert,
+            keep_ratio=keep_ratio,
+            rng=self.__rng,
+        )
 
         new_atoms = np.array(
             [
@@ -2850,136 +2198,26 @@ class GBManipulator:
         if mode_index < 0:
             raise GBManipulatorValueError("mode_index must be >= 0.")
         parent = self.__parents[0]
-        atoms = Atom.as_array(parent.whole_system)
-        positions = atoms[:, 1:]
 
+        # NOTE: threshold is validated and defaulted here (matching every other
+        # parameter's handling) but, as before R17/R18, never actually used below --
+        # see REFACTOR_CLEANUP.md's open entry on this parameter.
         ideal_bonds = parent.unit_cell.ideal_bond_lengths
-        # TODO: justify the scaling factor. USPEX uses 1.5
         if not threshold:
             threshold = 1.5 * max(ideal_bonds.values())
-        cutoff = 1.5 * max(ideal_bonds.values())
-        neighbor_list = _create_neighbor_list(cutoff, positions)
-        neighbor_list_typed = List()
-        for neighbor in neighbor_list:
-            neighbor_list_typed.append(List(neighbor))
-        hardness = _calculate_bond_hardness(parent, neighbor_list, ideal_bonds)
-        q_points = _soft_mode_q_points(
-            parent.unit_cell,
-            mesh_size,
+
+        return self.__translate_manipulation_error(
+            soft_mode_displacement_atoms,
+            structured_atoms=parent.whole_system,
+            unit_cell=parent.unit_cell,
+            gb_indices=parent.gb_indices,
+            box_dims=parent.box_dims,
+            gb_thickness=parent.gb_thickness,
+            mesh_size=mesh_size,
+            num_q=num_q,
+            mode_index=mode_index,
+            subtract_displacement=subtract_displacement,
         )
-
-        if len(q_points) < num_q:
-            warnings.warn(
-                f"Fewer q_points generated than desired: {len(q_points)} < {num_q}. "
-                "Recommended to increase mesh size."
-            )
-
-        n_atoms = len(parent.gb_indices)
-
-        sparse_threshold = 10000
-
-        # Number of softest eigenvectors that must be computed per q point in order
-        # to be able to select mode_index once the modes are sorted globally below.
-        num_modes_needed = mode_index + 1
-        if num_modes_needed > 3 * n_atoms:
-            raise GBManipulatorValueError(
-                f"mode_index={mode_index} is out of range: at most "
-                f"{3 * n_atoms} mode(s) can be computed for this system."
-            )
-
-        # initialize the arrays to save the eigenvalues (frequencies) and eigenvectors
-        # (displacements)
-        freqs = np.zeros((num_q, num_modes_needed))
-        disps = np.zeros((num_q, num_modes_needed, 3 * n_atoms))
-
-        # For each unique q point, calculate the dynamical matrix and the associated
-        # eigenvalues and eigenvectors.
-        for i, q_vec in enumerate(q_points[:num_q]):
-            dynamical_matrix = _calculate_dynamical_matrix(
-                hardness, positions, parent.gb_indices, neighbor_list_typed, q_vec)
-            if 3 * n_atoms <= sparse_threshold:
-                freq_vals, disp_vals = np.linalg.eigh(dynamical_matrix)
-            else:
-                sparse_matrix = sps.csc_matrix(dynamical_matrix)
-                # scipy.sparse.linalg.eigsh can only calculate a small subset of the
-                # eigenvalues and eigenvectors of a sparse matrix. Therefore, if the
-                # number of modes needed (which specifies how many eigenvectors we
-                # need) is larger than 3 * n_atoms - 1, we cannot use this method, and
-                # would need to fall back to calculating the eigenvalues using a dense
-                # matrix, but that might be prohibitively expensive if we have reached
-                # this point. TODO: Will need testing.
-                if num_modes_needed >= 3 * n_atoms - 1 != num_modes_needed:
-                    raise GBManipulatorValueError(
-                        "Cannot generate the requested soft mode.")
-                freq_vals, disp_vals = sps.linalg.eigsh(
-                    sparse_matrix, k=num_modes_needed, which="SA")
-            freqs[i] = freq_vals[:num_modes_needed]
-            # The eigvec associated with the Nth eigfreq for the ith q vector is saved
-            # in the (start + N)th index
-            disps[i, :, :] = np.real(disp_vals)[:, :num_modes_needed].T
-
-        # Now that we have all of the frequencies for a variety of q points, we can
-        # identify the softest instabilities and use the associated displacements to
-        # create the selected child structure. We first filter out the frequencies at
-        # or near 0, as these are associated with translational or rotational
-        # (acoustic) modes
-
-        # TODO: Look into combining the eigenvectors of the multiple q points. Weighted averages or using principle component analysis might work well in this regard.
-        non_acoustic_indices = np.where(~np.isclose(freqs, 0))
-
-        # TODO: Look into further filtering this so we only consider unique displacements. Do equivalent eigenvalues results in the same eigenvectors for different q values? What about within the same q vector?
-        filtered_freqs = freqs[non_acoustic_indices]
-        # We want the softest modes, which have the largest negative eigenvalues
-        sorted_filtered_freq_indices = np.argsort(filtered_freqs)
-        # indexing order: q_point, eigenvector number, eigenvector
-        saved_disps = disps[non_acoustic_indices[0][sorted_filtered_freq_indices],
-                            non_acoustic_indices[1][sorted_filtered_freq_indices], :]
-
-        if mode_index >= len(saved_disps):
-            raise GBManipulatorValueError(
-                f"mode_index={mode_index} is out of range: only "
-                f"{len(saved_disps)} non-acoustic soft mode(s) available."
-            )
-
-        # minimum allowable distance before atoms are "too close"
-        d_min = 2 * parent.unit_cell.radius
-
-        # Here we precompute the neighbor distances for each atom pair, subtracting off
-        # the minimum allowable distance between the atoms.
-        precomputed_distances = np.zeros(len(parent.gb_indices))
-        for i, atom_idx in enumerate(parent.gb_indices):
-            neighbors = neighbor_list[atom_idx]
-            neighbor_positions = positions[neighbors]
-            dists = np.linalg.norm(positions[atom_idx] - neighbor_positions, axis=1)
-            precomputed_distances[i] = np.min(dists) - d_min
-
-        # We now need to perform the displacement for the selected mode. We check to
-        # make sure that the displacement does not cause atoms to overlap.
-        pos = np.copy(positions)
-        disp_vector = saved_disps[mode_index].reshape(-1, 3)
-        disp_magnitude = np.linalg.norm(disp_vector, axis=1)
-
-        if not np.any(disp_magnitude == 0):
-            # Any True value here is a possible overlap between two atoms after the
-            # displacement suggested in disp_vector.
-            overlap_condition = precomputed_distances < disp_magnitude
-            # disp_magnitude / disp_magnitude
-            safe_displacements = np.ones_like(disp_magnitude)
-            if np.any(overlap_condition):
-                overlapped_atoms = precomputed_distances[overlap_condition]
-                overlap_disps = disp_magnitude[overlap_condition]
-                safe_displacements[overlap_condition] = overlapped_atoms / overlap_disps
-
-            adjusted_displacements = disp_vector * safe_displacements[:, None]
-            pos[parent.gb_indices] = positions[parent.gb_indices] + \
-                adjusted_displacements * (-1 if subtract_displacement else 1)
-
-        structured_pos = np.zeros((len(atoms)), dtype=Atom.atom_dtype)
-        structured_pos["name"] = parent.whole_system["name"]
-        structured_pos["x"] = pos[:, 0]
-        structured_pos["y"] = pos[:, 1]
-        structured_pos["z"] = pos[:, 2]
-        return structured_pos
 
     def apply_group_symmetry(self, group: str) -> np.ndarray:
         """

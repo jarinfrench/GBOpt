@@ -250,6 +250,10 @@ def _synthetic_manipulator(unit_cell, atoms, seed=100, gb_indices=None):
         whole_system=atoms,
         gb_atoms=atoms[gb_indices],
         gb_indices=np.asarray(gb_indices, dtype=np.intp),
+        box_dims=np.array(
+            [[-1e6, 1e6], [-1e6, 1e6], [-1e6, 1e6]]
+        ),
+        gb_thickness=10.0,
     )
 
     manipulator = object.__new__(GBManipulator)
@@ -304,11 +308,11 @@ def test_insert_atoms_with_stoichiometry_uses_selected_neighbor_site_ids(monkeyp
         return neighbors
 
     manipulator.rng = FixedChoiceRng()
-    gbmanipulator_module = importlib.import_module("GBOpt.GBManipulator")
+    density_module = importlib.import_module("GBOpt.manipulation.density")
 
-    monkeypatch.setattr(gbmanipulator_module, "KDTree", FakeKDTree)
+    monkeypatch.setattr(density_module, "KDTree", FakeKDTree)
     monkeypatch.setattr(
-        gbmanipulator_module,
+        density_module,
         "_create_neighbor_list",
         sparse_site_neighbors,
     )
@@ -525,7 +529,7 @@ class TestGBManipulator(unittest.TestCase):
 
         manipulator = _synthetic_manipulator(unit_cell, atoms, seed=self.seed)
 
-        with patch("GBOpt.GBManipulator._calculate_local_order", return_value=1.0):
+        with patch("GBOpt.manipulation.density._calculate_local_order", return_value=1.0):
             new_system = manipulator.remove_atoms(num_to_remove=1, keep_ratio=True)
 
         np.testing.assert_array_equal(atoms, original_atoms)
@@ -602,7 +606,7 @@ class TestGBManipulator(unittest.TestCase):
                 for site_idx in range(len(positions))
             ]
 
-        with patch("GBOpt.GBManipulator._create_neighbor_list",
+        with patch("GBOpt.manipulation.density._create_neighbor_list",
                    side_effect=all_sites_are_neighbors):
             new_system = manipulator.insert_atoms(
                 num_to_insert=1,
@@ -652,7 +656,7 @@ class TestGBManipulator(unittest.TestCase):
         self.assertTrue(np.array_equal(translated["name"], base_names))
         self.assertEqual(set(roundtrip_names(translated)), expected_types)
 
-        with patch("GBOpt.GBManipulator._calculate_local_order", return_value=1.0):
+        with patch("GBOpt.manipulation.density._calculate_local_order", return_value=1.0):
             removed = manipulator.remove_atoms(num_to_remove=1, keep_ratio=True)
         self.assertEqual(set(roundtrip_names(removed)), expected_types)
 
@@ -1518,7 +1522,7 @@ def test_explicit_ownership_insertion_assigns_new_label_once(monkeypatch, tmp_pa
 
             return np.asarray([result])
 
-    module = importlib.import_module("GBOpt.GBManipulator")
+    module = importlib.import_module("GBOpt.manipulation.density")
     monkeypatch.setattr(module, "KDTree", FakeKDTree)
 
     manipulator.rng = SiteChoice()
@@ -1907,20 +1911,20 @@ def test_displace_along_soft_modes_uses_irreducible_cartesian_q_points(monkeypat
     manipulator._GBManipulator__one_parent = True
     manipulator._GBManipulator__parents = [parent, None]
 
-    gbmanipulator_module = importlib.import_module(
-        "GBOpt.GBManipulator"
+    soft_mode_module = importlib.import_module(
+        "GBOpt.manipulation.soft_mode"
     )
 
     monkeypatch.setattr(
-        gbmanipulator_module,
+        soft_mode_module,
         "_create_neighbor_list",
         lambda _cutoff, _positions: [[1], [0]],
     )
 
     monkeypatch.setattr(
-        gbmanipulator_module,
+        soft_mode_module,
         "_calculate_bond_hardness",
-        lambda _parent, _neighbors, _bonds: np.ones((2, 2)),
+        lambda **_kwargs: np.ones((2, 2)),
     )
 
     captured_q = []
@@ -1940,7 +1944,7 @@ def test_displace_along_soft_modes_uses_irreducible_cartesian_q_points(monkeypat
         ).astype(np.complex128)
 
     monkeypatch.setattr(
-        gbmanipulator_module,
+        soft_mode_module,
         "_calculate_dynamical_matrix",
         capture_q,
     )
@@ -1979,8 +1983,8 @@ def test_soft_mode_q_points_sort_by_cartesian_reciprocal_magnitude(monkeypatch):
         "H",
     )
 
-    gbmanipulator_module = importlib.import_module(
-        "GBOpt.GBManipulator"
+    soft_mode_module = importlib.import_module(
+        "GBOpt.manipulation.soft_mode"
     )
 
     primitive_cell = (
@@ -2012,18 +2016,18 @@ def test_soft_mode_q_points_sort_by_cartesian_reciprocal_magnitude(monkeypatch):
     )
 
     monkeypatch.setattr(
-        gbmanipulator_module.spg,
+        soft_mode_module.spg,
         "find_primitive",
         lambda _cell: primitive_cell,
     )
 
     monkeypatch.setattr(
-        gbmanipulator_module.spg,
+        soft_mode_module.spg,
         "get_ir_reciprocal_mesh",
         lambda _mesh, _cell: (mapping, grid),
     )
 
-    q_points = gbmanipulator_module._soft_mode_q_points(
+    q_points = soft_mode_module._soft_mode_q_points(
         unit_cell,
         mesh_size=4,
     )
@@ -2055,7 +2059,7 @@ def test_displace_along_soft_modes_uses_three_dimensional_neighbor_positions(
     )
     manipulator = _synthetic_manipulator(unit_cell, atoms)
 
-    gbmanipulator_module = importlib.import_module("GBOpt.GBManipulator")
+    soft_mode_module = importlib.import_module("GBOpt.manipulation.soft_mode")
 
     captured_positions = {}
 
@@ -2072,7 +2076,7 @@ def test_displace_along_soft_modes_uses_three_dimensional_neighbor_positions(
         raise NeighborListCaptured
 
     monkeypatch.setattr(
-        gbmanipulator_module,
+        soft_mode_module,
         "_create_neighbor_list",
         capture_neighbor_positions,
     )
@@ -2221,20 +2225,20 @@ def test_displace_along_soft_modes_subtracts_selected_displacement(monkeypatch):
     )
     manipulator = _synthetic_manipulator(unit_cell, atoms, gb_indices=[0])
 
-    gbmanipulator_module = importlib.import_module("GBOpt.GBManipulator")
+    soft_mode_module = importlib.import_module("GBOpt.manipulation.soft_mode")
 
     monkeypatch.setattr(
-        gbmanipulator_module,
+        soft_mode_module,
         "_create_neighbor_list",
         lambda _cutoff, _positions: [[1], [0]],
     )
     monkeypatch.setattr(
-        gbmanipulator_module,
+        soft_mode_module,
         "_calculate_bond_hardness",
-        lambda _parent, _neighbors, _bonds: np.ones((2, 2)),
+        lambda **_kwargs: np.ones((2, 2)),
     )
     monkeypatch.setattr(
-        gbmanipulator_module,
+        soft_mode_module,
         "_soft_mode_q_points",
         lambda _unit_cell, _mesh_size: np.zeros((1, 3)),
     )
@@ -2242,7 +2246,7 @@ def test_displace_along_soft_modes_subtracts_selected_displacement(monkeypatch):
     # Give the single movable atom a nondegenerate eigensystem whose softest
     # mode is a unit displacement along +x.
     monkeypatch.setattr(
-        gbmanipulator_module,
+        soft_mode_module,
         "_calculate_dynamical_matrix",
         lambda *_args: np.diag([-3.0, -2.0, -1.0]).astype(
             np.complex128
