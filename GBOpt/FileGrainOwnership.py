@@ -35,6 +35,9 @@ from GBOpt.io.lammps import (
 )
 
 if TYPE_CHECKING:
+    # Type-checking only: never executed, so this carries no import-cycle risk. The
+    # runtime cycle-avoidance workaround this replaces was a *local* (function-body)
+    # import of GBManipulator, now removed -- see reload_explicit_manipulator below.
     from GBOpt.GBManipulator import GBManipulator
 
 __all__ = [
@@ -446,6 +449,12 @@ def reload_explicit_manipulator(
     """Validate and reconstruct an evaluator-returned owned candidate.
 
     This is the authoritative reload path for explicit-ownership GA execution.
+    Compatibility wrapper: the validated reconstruction itself now lives in
+    :class:`GBOpt.CandidateLoader.CandidateLoader`, which is the one module in this
+    stack allowed to import :class:`~GBOpt.GBManipulator.GBManipulator` at module scope.
+    ``FileGrainOwnership`` imports ``CandidateLoader`` locally here (not the reverse)
+    because ``CandidateLoader`` itself imports ``CandidateFileMapping`` from this module
+    at module scope; importing it back at module scope here would be circular.
 
     :param returned_structure: Path to the evaluator-returned LAMMPS structure.
     :param candidate_mapping: Keyword argument, required. Expected candidate IDs,
@@ -469,66 +478,13 @@ def reload_explicit_manipulator(
     :raises GrainOwnershipError: If evaluator output changes candidate atom count, IDs,
         species, disallowed box geometry, topology, or ownership alignment.
     """
-    if not isinstance(allow_variable_cell, (bool, np.bool_)):
-        raise TypeError("allow_variable_cell must be a Boolean")
-    variable_cell = bool(allow_variable_cell)
+    from GBOpt.CandidateLoader import CandidateLoader
 
-    snapshot = read_lammps_structure_file(returned_structure, type_dict=type_dict)
-    file_ids = snapshot.atom_ids
-    if snapshot.atoms.size != candidate_mapping.expected_count:
-        raise GrainOwnershipError(
-            "evaluator output atom count does not match the candidate"
-        )
-    expected_ids = candidate_mapping.atom_ids
-    if not np.array_equal(np.sort(file_ids), expected_ids):
-        raise GrainOwnershipError(
-            "evaluator output atom IDs do not match the candidate"
-        )
-    order = np.argsort(file_ids, kind="stable")
-    expected_species = candidate_mapping.species
-    actual_species = np.asarray(snapshot.atoms["name"], dtype="U8")[order]
-    if not np.array_equal(actual_species, expected_species):
-        raise GrainOwnershipError(
-            "evaluator output changed species/type for one or more atom IDs"
-        )
-    tolerance = candidate_mapping.coordinate_tolerance
-    box_changed = not np.allclose(
-        snapshot.box_dims, candidate_mapping.box_dims, atol=tolerance, rtol=0.0
-    )
-    if box_changed and not variable_cell:
-        raise GrainOwnershipError(
-            "evaluator output changed box bounds; variable-cell relaxation is "
-            "not enabled"
-        )
-    if snapshot.selected_frame is not None and snapshot.boundary_periodic is None:
-        raise GrainOwnershipError(
-            "evaluator dump does not encode unambiguous boundary topology"
-        )
-    if snapshot.boundary_periodic is not None:
-        expected_periodic = (
-            candidate_mapping.periodic_outer_x_interface,
-            *candidate_mapping.inplane_periodic,
-        )
-        if snapshot.boundary_periodic != expected_periodic:
-            raise GrainOwnershipError("evaluator output changed boundary topology")
-    ownership = candidate_mapping.ownership_for_file_ids(
-        file_ids,
-        box_dims=snapshot.box_dims if box_changed else None,
-    )
-    # Local import avoids a module cycle with GBManipulator -> FileGrainOwnership.
-    from GBOpt.GBManipulator import GBManipulator
-
-    manipulator = GBManipulator(
-        str(returned_structure),
+    return CandidateLoader().reload(
+        returned_structure,
+        candidate_mapping=candidate_mapping,
         unit_cell=unit_cell,
         gb_thickness=gb_thickness,
         type_dict=type_dict,
-        grain_ownership=ownership,
+        allow_variable_cell=allow_variable_cell,
     )
-    parent = manipulator.parents[0]
-    if (
-        parent.grain_labels is None
-        or len(parent.grain_labels) != candidate_mapping.expected_count
-    ):
-        raise GrainOwnershipError("reloaded ownership length does not match atom count")
-    return manipulator
