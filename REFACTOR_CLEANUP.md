@@ -1,5 +1,99 @@
 # Refactor cleanup backlog
 
+## R22's `EvaluationResult` scoped to the 8-item checklist, not issue #82's fuller prose
+
+Issue #82's "Proposed behavior" describes `StructureArtifact` as carrying "stable
+artifact ID/digest/metadata," but the acceptance criteria only require a
+digest/identifier "where available" -- not that one always be computed, and not a
+separate `metadata` field at all. `StructureArtifact` therefore has `path`/`format`/
+`digest`, with `digest` defaulting to `None` and only computed on request via
+`StructureArtifact.from_path(..., compute_digest=True)` (a SHA-256 hash of the file's
+current contents) -- never eagerly, since hashing is not free and most callers (in
+particular a `FAILED` result's diagnostic artifact) have no need for one. No `metadata`
+field was added, per the same "acceptance criteria are literal constraints, not a
+floor" discipline established for #62.
+
+`EvaluationResult` also has no `to_state`/`from_state` serialization, matching
+`CandidateEvaluation`'s own precedent (only the artifact-independent
+`CandidateEvaluationSummary` variant has them) for the same reason: both hold a live,
+non-JSON-serializable `manipulator` reference. A serializable summary type analogous to
+`CandidateEvaluationSummary` was not added speculatively -- issue #82 doesn't ask for
+one, and per the R08/R09 "speculative value types can be wrong-shaped" precedent, its
+real shape should be driven by whichever later step (R23 or R26+) actually needs to
+persist an `EvaluationResult` across a checkpoint boundary, not guessed here.
+
+**Resolve at**: no action needed unless a later step needs `StructureArtifact` metadata
+or an `EvaluationResult` checkpoint-serialization form.
+
+## R22's adapters cannot always distinguish `CandidateEvaluation`'s collapsed failure origin
+
+`from_candidate_evaluation` adapts today's `CandidateEvaluation.failure_reason` -- a
+single opaque string that already collapses several distinct failure origins (evaluator
+callback exception, artifact reload failure, ownership reconstruction failure, objective
+validation) by the time `_explicit_ownership_evaluation.py` constructs it. Only the
+ownership-construction failure is unambiguously recoverable from `record` alone:
+`record.mapping is None` happens exactly when `_candidate_file_mapping` itself raised
+`GrainOwnershipError`, before any evaluator callback ever runs, so that case maps to
+`FailureStage.OWNERSHIP` with certainty. Every other failure shape (callback exception,
+`_reload_mapping` failure, invalid/missing objective, reused/invalid structure path) is
+attributed to `FailureStage.EVALUATOR` as a disclosed, best-effort default, since
+distinguishing them would require regex-matching free-form diagnostic text that was
+never a stable contract (the same kind of fragile inference this file's own
+`positive=True`/CRLF-substring entries already warn against). Full-fidelity stage
+attribution (`ARTIFACT`/`PARSE`/`VALIDATION` correctly separated from `EVALUATOR`) is
+only possible from inside `ExplicitOwnershipEvaluator` itself, where the real exception
+types are still visible -- not retrofittable after the fact from its already-flattened
+output type. `from_scalar_tuple`/`from_batch_dict`, by contrast, see the raw,
+undecided data directly and do classify precisely (`VALIDATION` for a missing/non-finite
+energy, `ARTIFACT` for a missing/blank structure path).
+
+**Resolve at**: R23 ("Normalize MC and GA evaluation flows"), if that step wires
+`ExplicitOwnershipEvaluator` itself to construct `EvaluationResult` directly (with
+access to the real exception types at each failure site) rather than adapting from
+`CandidateEvaluation` after the fact.
+
+## R22's `EvaluationStatus`/`FailureStage` reproduce the existing `(str, Enum)` UP042 finding
+
+`BoundaryNormalTopology`, `ArtifactPin`, and `ArtifactStatus` are all already
+`class X(str, Enum)`, which ruff's `UP042` flags as preferring `enum.StrEnum` instead.
+`EvaluationStatus`/`FailureStage` follow the same established `(str, Enum)` convention
+(matching the enum shape already used throughout this codebase) and reproduce the exact
+same finding shape at two more call sites -- not new-shape debt, per the "new code that
+deliberately mirrors an existing pattern reproduces that pattern's pre-existing findings
+verbatim" precedent already documented below for R15's `__current_parent_candidates`.
+
+**Resolve at**: no action needed; revisit only if a future step migrates the codebase's
+existing `(str, Enum)` classes to `enum.StrEnum` as a deliberate, disclosed batch change.
+
+## R22 net tooling deltas: mypy net 0, ruff +3 (two disclosed reproduced-pattern, one disclosed established `__init__` convention), bandit unchanged, pyscn unchanged (42 quality issues, 46 clone pairs)
+
+Baseline taken at the R22 branch point (`6d8eec4`, tip of `refactor/r21-optimizer-
+logging`): ruff 218 repo-wide; mypy `GBOpt/_explicit_ownership_evaluation.py` 11,
+`GBOpt/optimization` 66 (genetic.py 45, checkpointing.py 14, monte_carlo.py 5,
+mutation.py 2, types.py 0); bandit 7 low/1 medium/0 high; pyscn 42 quality issues, 46
+clone pairs.
+
+The new `GBOpt/evaluation/` subpackage (`types.py`, `adapters.py`, `__init__.py`) adds
+no new-shape mypy findings at all: `mypy GBOpt/evaluation` reports the identical 202
+total findings across the same 22 pre-existing files that `mypy
+GBOpt/_explicit_ownership_evaluation.py` alone already pulls in via
+`GBOpt/__init__.py`'s import graph, with zero findings on any `GBOpt/evaluation/*` path
+itself. `GBOpt/_explicit_ownership_evaluation.py`'s own 11 and `GBOpt/optimization`'s 66
+are both unchanged, since this step adds new files without editing either.
+
+ruff: 221 repo-wide (+3), all three disclosed above (`RUF022` on the new package's
+`__init__.py`, matching this codebase's established grouped-not-alphabetized `__all__`
+convention; two `UP042` on `EvaluationStatus`/`FailureStage` reproducing the existing
+`(str, Enum)` pattern).
+
+bandit: unchanged (7 low, 1 medium, 0 high) -- the new subpackage introduces no
+subprocess/eval/pickle-shaped code for bandit to flag.
+
+pyscn: unchanged at 42 quality issues and 46 clone pairs -- no new complexity/length/
+dead-code finding crossed the gate's thresholds, and no new clone pair was introduced.
+
+**Resolve at**: no action needed; noted for the record.
+
 ## R21 scoped its logging instrumentation to acceptance criteria, not the issue's full "Proposed behavior" prose
 
 Issue #81's "Proposed behavior" text lists module loggers "for run start, initial
