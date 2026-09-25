@@ -15,6 +15,7 @@ from GBOpt.Checkpoint import (
     CheckpointStore,
     CheckpointValueError,
     _wrap_batch_func_with_checkpoint,
+    validate_checkpoint_envelope,
 )
 
 
@@ -240,6 +241,119 @@ def test_fsync_option_still_publishes_a_readable_checkpoint(checkpoint_path):
     store.save_final(_make_state(3))
 
     assert store.load()["progress_index"] == 3
+
+
+# ---------------------------------------------------------------------------
+# validate_checkpoint_envelope
+# ---------------------------------------------------------------------------
+
+
+def test_validate_checkpoint_envelope_accepts_a_well_formed_state():
+    state = _make_state(4)
+
+    assert (
+        validate_checkpoint_envelope(
+            state, minimizer="TestMinimizer", progress_unit="step"
+        )
+        is state
+    )
+
+
+def test_validate_checkpoint_envelope_rejects_non_dict_state():
+    with pytest.raises(CheckpointCompatibilityError, match="must be a dictionary"):
+        validate_checkpoint_envelope(
+            ["not", "a", "dict"], minimizer="TestMinimizer", progress_unit="step"
+        )
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "schema_version",
+        "minimizer",
+        "progress_unit",
+        "progress_index",
+        "best_energy",
+        "best_dump",
+        "rng_state",
+        "run_params",
+        "state",
+    ],
+)
+def test_validate_checkpoint_envelope_rejects_missing_required_field(missing_field):
+    state = _make_state()
+    del state[missing_field]
+
+    with pytest.raises(CheckpointCompatibilityError, match="missing required field"):
+        validate_checkpoint_envelope(
+            state, minimizer="TestMinimizer", progress_unit="step"
+        )
+
+
+def test_validate_checkpoint_envelope_rejects_unsupported_schema_version():
+    state = _make_state()
+    state["schema_version"] = 2
+
+    with pytest.raises(CheckpointCompatibilityError, match="unsupported checkpoint schema"):
+        validate_checkpoint_envelope(
+            state, minimizer="TestMinimizer", progress_unit="step"
+        )
+
+
+def test_validate_checkpoint_envelope_rejects_wrong_minimizer():
+    state = _make_state()
+    state["minimizer"] = "SomeOtherMinimizer"
+
+    with pytest.raises(CheckpointCompatibilityError, match="was written by"):
+        validate_checkpoint_envelope(
+            state, minimizer="TestMinimizer", progress_unit="step"
+        )
+
+
+def test_validate_checkpoint_envelope_rejects_wrong_progress_unit():
+    state = _make_state()
+    state["progress_unit"] = "generation"
+
+    with pytest.raises(CheckpointCompatibilityError, match="progress_unit"):
+        validate_checkpoint_envelope(
+            state, minimizer="TestMinimizer", progress_unit="step"
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("run_params", ["not", "a", "dict"]), ("state", "not-a-dict")],
+)
+def test_validate_checkpoint_envelope_rejects_non_dict_run_params_or_state(
+    field, value
+):
+    state = _make_state()
+    state[field] = value
+
+    with pytest.raises(CheckpointCompatibilityError, match="must be dictionaries"):
+        validate_checkpoint_envelope(
+            state, minimizer="TestMinimizer", progress_unit="step"
+        )
+
+
+@pytest.mark.parametrize("bad_index", [-1, 1.5, "3", True, None])
+def test_validate_checkpoint_envelope_rejects_malformed_progress_index(bad_index):
+    state = _make_state()
+    state["progress_index"] = bad_index
+
+    with pytest.raises(CheckpointCompatibilityError, match="progress_index"):
+        validate_checkpoint_envelope(
+            state, minimizer="TestMinimizer", progress_unit="step"
+        )
+
+
+def test_validate_checkpoint_envelope_accepts_numpy_integer_progress_index():
+    state = _make_state()
+    state["progress_index"] = np.int64(2)
+
+    validate_checkpoint_envelope(
+        state, minimizer="TestMinimizer", progress_unit="step"
+    )
 
 
 # ---------------------------------------------------------------------------

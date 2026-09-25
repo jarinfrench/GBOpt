@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 from collections.abc import Callable
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,19 @@ import numpy as np
 
 CHECKPOINT_SCHEMA_VERSION: int = 1
 """Schema version written into every checkpoint envelope."""
+
+REQUIRED_ENVELOPE_FIELDS: tuple[str, ...] = (
+    "schema_version",
+    "minimizer",
+    "progress_unit",
+    "progress_index",
+    "best_energy",
+    "best_dump",
+    "rng_state",
+    "run_params",
+    "state",
+)
+"""Top-level fields every schema-v1 minimizer checkpoint envelope must carry."""
 
 
 class CheckpointError(Exception):
@@ -55,6 +69,76 @@ def _validate_checkpoint_format(fmt: str) -> None:
         raise CheckpointValueError(
             f"fmt must be 'json' or 'pickle', got {fmt!r}"
         )
+
+
+def validate_checkpoint_envelope(
+    state: object,
+    *,
+    minimizer: str,
+    progress_unit: str,
+) -> dict:
+    """Validate a schema-v1 checkpoint envelope before minimizer-specific state access.
+
+    Centralizes the structural checks every minimizer's restore path needs before
+    touching ``state["run_params"]``/``state["state"]``: that *state* is a dictionary,
+    declares every field in :data:`REQUIRED_ENVELOPE_FIELDS`, was written by the
+    expected minimizer at the expected schema version and progress unit, and carries a
+    well-formed ``progress_index``. It does not validate anything below ``run_params``
+    or ``state`` — the optimizer-specific payload inside those two fields remains each
+    minimizer's own responsibility.
+
+    :param state: Deserialized checkpoint payload, as returned by
+        :meth:`CheckpointStore.load`.
+    :param minimizer: Keyword argument, required. Expected ``minimizer`` field value
+        (e.g. ``"MonteCarloMinimizer"``, ``"GeneticAlgorithmMinimizer"``).
+    :param progress_unit: Keyword argument, required. Expected ``progress_unit`` field
+        value (e.g. ``"step"``, ``"generation"``).
+    :return: *state*, unchanged, once every check above has passed.
+    :raises CheckpointCompatibilityError: If *state* is not a dictionary, is missing a
+        required top-level field, declares an unsupported schema version, names a
+        different minimizer or progress unit, has a non-dictionary ``run_params``/
+        ``state``, or has a malformed ``progress_index``.
+    """
+    if not isinstance(state, dict):
+        raise CheckpointCompatibilityError(
+            "checkpoint envelope must be a dictionary"
+        )
+    missing = [field for field in REQUIRED_ENVELOPE_FIELDS if field not in state]
+    if missing:
+        raise CheckpointCompatibilityError(
+            f"checkpoint envelope is missing required field(s): {', '.join(missing)}"
+        )
+    if state["schema_version"] != CHECKPOINT_SCHEMA_VERSION:
+        raise CheckpointCompatibilityError(
+            f"unsupported checkpoint schema version {state['schema_version']!r}, "
+            f"expected {CHECKPOINT_SCHEMA_VERSION!r}"
+        )
+    if state["minimizer"] != minimizer:
+        raise CheckpointCompatibilityError(
+            f"checkpoint was written by {state['minimizer']!r}, expected {minimizer!r}"
+        )
+    if state["progress_unit"] != progress_unit:
+        raise CheckpointCompatibilityError(
+            f"checkpoint progress_unit {state['progress_unit']!r} does not match "
+            f"expected {progress_unit!r}"
+        )
+    if not isinstance(state["run_params"], dict) or not isinstance(
+        state["state"], dict
+    ):
+        raise CheckpointCompatibilityError(
+            "checkpoint run_params and state fields must be dictionaries"
+        )
+    progress_index = state["progress_index"]
+    if (
+        isinstance(progress_index, (bool, np.bool_))
+        or not isinstance(progress_index, Integral)
+        or progress_index < 0
+    ):
+        raise CheckpointCompatibilityError(
+            "checkpoint progress_index must be a non-negative integer, got "
+            f"{progress_index!r}"
+        )
+    return state
 
 
 def _load_checkpoint_payload(path: Path, fmt: str, *, kind: str) -> Any:
