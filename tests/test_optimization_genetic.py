@@ -15,6 +15,7 @@ from GBOpt.artifacts import ArtifactRetentionPolicy, KeepBest, remove_managed_pa
 from GBOpt.artifacts.provenance import ArtifactProvenanceError, _ArtifactProvenance
 from GBOpt.BoundarySpec import CSLExactSpec
 from GBOpt.Checkpoint import CandidateCheckpoint, CheckpointStore
+from GBOpt.evaluation import EvaluationStatus
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GBManipulator import CompositionAwareCrossoverError, GBManipulator
 from GBOpt.GrainOwnership import (
@@ -23,6 +24,12 @@ from GBOpt.GrainOwnership import (
     GrainOwnership,
 )
 from GBOpt.manipulation import ManipulationRegistry, ManipulationResult
+from GBOpt.observability import (
+    OptimizationAlgorithm,
+    OptimizationEvent,
+    OptimizationEventType,
+    TerminationReason,
+)
 from GBOpt.optimization.genetic import ENERGY_PENALTY, GeneticAlgorithmMinimizer
 from GBOpt.optimization.types import (
     GBMinimizerError,
@@ -312,7 +319,7 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
             raise RuntimeError("calculator service unavailable")
 
         minimizer = self._make_minimizer(generations=1, batch_func=raising_batch_func)
-        energies, files, manipulators = minimizer._evaluate_generation(
+        energies, files, manipulators, results = minimizer._evaluate_generation(
             population_manipulators=[None] * minimizer.population_size,
             population_structures=[None] * minimizer.population_size,
             population_lineages=[["START", None]] * minimizer.population_size,
@@ -323,6 +330,7 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         self.assertEqual(energies, [ENERGY_PENALTY] * minimizer.population_size)
         self.assertEqual(files, [None] * minimizer.population_size)
         self.assertEqual(manipulators, [None] * minimizer.population_size)
+        self.assertTrue(all(result.status is EvaluationStatus.FAILED for result in results))
 
     def test_batch_evaluator_exception_with_checkpoint_penalizes_and_records(self):
         cp = Path(self.tmpdir.name) / "ga_batch_exc.json"
@@ -333,7 +341,7 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         minimizer = self._make_minimizer(generations=1, batch_func=raising_batch_func)
         unique_ids = [f"GA_99_g0_c{i}" for i in range(minimizer.population_size)]
         gen_checkpoint = CandidateCheckpoint.new_or_resume(cp, "json", 0, unique_ids)
-        energies, files, manipulators = minimizer._evaluate_generation(
+        energies, files, manipulators, results = minimizer._evaluate_generation(
             population_manipulators=[None] * minimizer.population_size,
             population_structures=[None] * minimizer.population_size,
             population_lineages=[["START", None]] * minimizer.population_size,
@@ -345,6 +353,7 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         self.assertEqual(energies, [ENERGY_PENALTY] * minimizer.population_size)
         self.assertEqual(files, [None] * minimizer.population_size)
         self.assertEqual(manipulators, [None] * minimizer.population_size)
+        self.assertTrue(all(result.status is EvaluationStatus.FAILED for result in results))
         for i in range(minimizer.population_size):
             uid = f"GA_99_g0_c{i}"
             self.assertTrue(gen_checkpoint.is_done(uid))
@@ -3306,3 +3315,301 @@ def test_binary_operations_rejects_wrong_arity(ga_gb, tmp_path):
             binary_operations=["unary_op"],
             registry=registry,
         )
+
+
+# --------------------------------------------------------------------------------------
+# Versioned MC/GA lifecycle events (issue #84)
+# --------------------------------------------------------------------------------------
+
+
+class _RecordingSink:
+    def __init__(self):
+        self.events: list[OptimizationEvent] = []
+
+    def emit(self, event: OptimizationEvent) -> None:
+        self.events.append(event)
+
+
+class _ExplodingSink:
+    def emit(self, event: OptimizationEvent) -> None:
+        raise RuntimeError("sink is broken")
+
+
+def _legacy_fake_energy(gb_root):
+    def fake_energy_func(GB, manipulator, atom_positions, unique_id):
+        dump_file = gb_root / f"{unique_id}.data"
+        GB.write_lammps(
+            str(dump_file),
+            atom_positions,
+            manipulator.parents[0].box_dims,
+        )
+        return float(np.mean(atom_positions["x"])), str(dump_file)
+
+    return fake_energy_func
+
+
+def test_ga_event_sink_type_is_validated(ga_gb, tmp_path):
+    with pytest.raises(GBMinimizerTypeError, match="event_sink"):
+        GeneticAlgorithmMinimizer(
+            ga_gb,
+            _legacy_fake_energy(tmp_path),
+            ["translate_right_grain"],
+            seed=0,
+            event_sink=object(),
+        )
+
+
+def test_legacy_ga_emits_expected_lifecycle_sequence(ga_gb, tmp_path):
+    sink = _RecordingSink()
+    minimizer = GeneticAlgorithmMinimizer(
+        ga_gb,
+        _legacy_fake_energy(tmp_path),
+        ["insert_atoms", "remove_atoms", "translate_right_grain"],
+        seed=0,
+        population_size=4,
+        generations=2,
+        keep_top_pct=25,
+        intermediate_pct=75,
+        event_sink=sink,
+        case_id="case-a",
+        campaign_id="campaign-b",
+    )
+
+    minimizer.run_GA(unique_id=42)
+
+    event_types = [event.event_type for event in sink.events]
+    assert event_types[0] is OptimizationEventType.RUN_STARTED
+    assert event_types[1] is OptimizationEventType.INITIAL_EVALUATION
+    assert event_types[-1] is OptimizationEventType.RUN_TERMINATED
+    assert sink.events[-1].termination_reason is TerminationReason.MAX_GENERATIONS
+
+    assert event_types.count(OptimizationEventType.PROPOSAL_EVALUATED) == (
+        minimizer.population_size * minimizer.generations
+    )
+    assert event_types.count(
+        OptimizationEventType.GENERATION_BOUNDARY
+    ) == minimizer.generations
+
+    accept_reject = sum(
+        1
+        for event_type in event_types
+        if event_type
+        in (
+            OptimizationEventType.CANDIDATE_ACCEPTED,
+            OptimizationEventType.CANDIDATE_REJECTED,
+        )
+    )
+    assert accept_reject == minimizer.population_size * minimizer.generations
+
+    for event in sink.events:
+        assert event.run.run_id == "42"
+        assert event.run.seed == 0
+        assert event.run.algorithm is OptimizationAlgorithm.GENETIC_ALGORITHM
+        assert event.run.case_id == "case-a"
+        assert event.run.campaign_id == "campaign-b"
+
+
+def test_legacy_ga_initial_evaluation_failure_emits_run_failed_and_propagates(
+    ga_gb, tmp_path
+):
+    def crashing_energy_func(GB, manipulator, atom_positions, unique_id):
+        raise RuntimeError("boom")
+
+    sink = _RecordingSink()
+    minimizer = GeneticAlgorithmMinimizer(
+        ga_gb,
+        crashing_energy_func,
+        ["translate_right_grain"],
+        seed=0,
+        population_size=2,
+        generations=1,
+        event_sink=sink,
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        minimizer.run_GA(unique_id=1)
+
+    event_types = [event.event_type for event in sink.events]
+    assert event_types == [
+        OptimizationEventType.RUN_STARTED,
+        OptimizationEventType.RUN_FAILED,
+    ]
+    assert sink.events[-1].failure_message is not None
+
+
+def test_legacy_ga_reseeds_when_generation_has_no_survivors(ga_gb, tmp_path):
+    population_size = 4
+    evaluation_index = 0
+
+    def fake_energy_func(GB, manipulator, atom_positions, unique_id):
+        nonlocal evaluation_index
+        current_index = evaluation_index
+        evaluation_index += 1
+        if 1 <= current_index <= population_size:
+            raise RuntimeError("Simulated failure")
+        dump_file = tmp_path / f"{unique_id}.data"
+        GB.write_lammps(
+            str(dump_file),
+            atom_positions,
+            manipulator.parents[0].box_dims,
+        )
+        return float(np.mean(atom_positions["x"])), str(dump_file)
+
+    sink = _RecordingSink()
+    minimizer = GeneticAlgorithmMinimizer(
+        ga_gb,
+        fake_energy_func,
+        ["insert_atoms", "remove_atoms", "translate_right_grain"],
+        seed=0,
+        population_size=population_size,
+        generations=2,
+        keep_top_pct=25,
+        intermediate_pct=75,
+        event_sink=sink,
+    )
+
+    minimizer.run_GA(unique_id=3)
+
+    reseeded = [
+        event
+        for event in sink.events
+        if event.event_type is OptimizationEventType.POPULATION_RESEEDED
+    ]
+    assert len(reseeded) == 1
+    assert reseeded[0].iteration == 0
+    rejected_in_gen0 = [
+        event
+        for event in sink.events
+        if event.event_type is OptimizationEventType.CANDIDATE_REJECTED
+        and event.iteration == 0
+    ]
+    assert len(rejected_in_gen0) == population_size
+
+
+def test_ga_event_emission_does_not_alter_rng_state_or_result(ga_gb, tmp_path):
+    silent = GeneticAlgorithmMinimizer(
+        ga_gb,
+        _legacy_fake_energy(tmp_path),
+        ["insert_atoms", "remove_atoms", "translate_right_grain"],
+        seed=0,
+        population_size=4,
+        generations=2,
+        keep_top_pct=25,
+        intermediate_pct=75,
+    )
+    silent_result = silent.run_GA(unique_id=7)
+
+    observed = GeneticAlgorithmMinimizer(
+        ga_gb,
+        _legacy_fake_energy(tmp_path),
+        ["insert_atoms", "remove_atoms", "translate_right_grain"],
+        seed=0,
+        population_size=4,
+        generations=2,
+        keep_top_pct=25,
+        intermediate_pct=75,
+        event_sink=_RecordingSink(),
+    )
+    observed_result = observed.run_GA(unique_id=7)
+
+    assert observed_result == silent_result
+    assert (
+        observed.local_random.bit_generator.state
+        == silent.local_random.bit_generator.state
+    )
+    assert observed.history == silent.history
+
+
+def test_a_broken_event_sink_does_not_abort_legacy_ga_run(ga_gb, tmp_path):
+    minimizer = GeneticAlgorithmMinimizer(
+        ga_gb,
+        _legacy_fake_energy(tmp_path),
+        ["insert_atoms", "remove_atoms", "translate_right_grain"],
+        seed=0,
+        population_size=4,
+        generations=2,
+        keep_top_pct=25,
+        intermediate_pct=75,
+        event_sink=_ExplodingSink(),
+    )
+
+    best_energy, _best_dump = minimizer.run_GA(unique_id=8)
+
+    assert isinstance(best_energy, float)
+
+
+def test_owned_ga_emits_expected_lifecycle_sequence(owned_ga, tmp_path):
+    gb, seed_path, ownership, _labels = owned_ga
+
+    def fake_energy(GB, manipulator, atom_positions, unique_id):
+        output = tmp_path / f"{unique_id}.data"
+        _write_owned_evaluator_output(
+            output,
+            atom_positions,
+            manipulator.parents[0].box_dims,
+        )
+        return float(np.mean(atom_positions["x"])), str(output)
+
+    sink = _RecordingSink()
+    minimizer = GeneticAlgorithmMinimizer(
+        gb,
+        fake_energy,
+        ["translate_right_grain"],
+        seed=31,
+        initial_structure=seed_path,
+        initial_ownership=ownership,
+        population_size=4,
+        generations=2,
+        keep_top_pct=25,
+        intermediate_pct=100,
+        event_sink=sink,
+    )
+
+    minimizer.run_GA(unique_id=61)
+
+    event_types = [event.event_type for event in sink.events]
+    assert event_types[0] is OptimizationEventType.RUN_STARTED
+    assert event_types[1] is OptimizationEventType.INITIAL_EVALUATION
+    assert event_types[-1] is OptimizationEventType.RUN_TERMINATED
+    assert sink.events[-1].termination_reason is TerminationReason.MAX_GENERATIONS
+    assert (
+        event_types.count(OptimizationEventType.PROPOSAL_EVALUATED)
+        == minimizer.population_size * minimizer.generations
+    )
+    assert (
+        event_types.count(OptimizationEventType.GENERATION_BOUNDARY)
+        == minimizer.generations
+    )
+    for event in sink.events:
+        assert event.run.algorithm is OptimizationAlgorithm.GENETIC_ALGORITHM
+
+
+def test_owned_ga_initial_evaluation_failure_emits_run_failed(owned_ga, tmp_path):
+    gb, seed_path, ownership, _labels = owned_ga
+
+    def crashing_energy_func(GB, manipulator, atom_positions, unique_id):
+        raise RuntimeError("boom")
+
+    sink = _RecordingSink()
+    minimizer = GeneticAlgorithmMinimizer(
+        gb,
+        crashing_energy_func,
+        ["translate_right_grain"],
+        seed=0,
+        initial_structure=seed_path,
+        initial_ownership=ownership,
+        population_size=2,
+        generations=1,
+        event_sink=sink,
+    )
+
+    with pytest.raises(GBMinimizerError):
+        minimizer.run_GA(unique_id=1)
+
+    event_types = [event.event_type for event in sink.events]
+    assert event_types == [
+        OptimizationEventType.RUN_STARTED,
+        OptimizationEventType.INITIAL_EVALUATION,
+        OptimizationEventType.RUN_FAILED,
+    ]
+    assert sink.events[1].status is EvaluationStatus.FAILED

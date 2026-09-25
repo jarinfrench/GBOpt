@@ -100,6 +100,15 @@ def test_event_normalizes_iteration_and_input_index():
     assert type(event.input_index) is int
 
 
+def test_event_input_index_accepts_negative_sentinel():
+    # Some authoritative evaluation sources (e.g. an owned-mode initial candidate)
+    # use input_index=-1 for "not a submitted population member" -- this field
+    # must accept whatever EvaluationResult.input_index itself already accepts.
+    event = _event(input_index=-1)
+
+    assert event.input_index == -1
+
+
 def test_event_normalizes_operation_parameters_to_json_safe_mapping():
     event = _event(
         event_type=OptimizationEventType.PROPOSAL_EVALUATED,

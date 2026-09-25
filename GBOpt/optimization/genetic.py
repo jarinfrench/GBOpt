@@ -75,6 +75,16 @@ from GBOpt.manipulation import (
     SliceAndMerge,
     default_registry,
 )
+from GBOpt.observability import (
+    EventSink,
+    NullEventSink,
+    OptimizationAlgorithm,
+    OptimizationEvent,
+    OptimizationEventType,
+    RunContext,
+    TerminationReason,
+    evaluation_event_fields,
+)
 from GBOpt.optimization.checkpointing import (
     _artifact_archive_root,
     _cleanup_committed_artifacts,
@@ -142,6 +152,9 @@ class GeneticAlgorithmMinimizer:
         failure_diagnostic_count: int = 3,
         managed_artifact_root: str | Path | None = None,
         cleanup_candidate: Callable[[ArtifactCleanupRequest], None] | None = None,
+        event_sink: EventSink | None = None,
+        case_id: str | None = None,
+        campaign_id: str | None = None,
     ):
         """Configure one genetic-algorithm grain-boundary minimizer.
 
@@ -220,14 +233,32 @@ class GeneticAlgorithmMinimizer:
             Backend-owned callback invoked after a durable checkpoint commit for each
             evaluator source that has become transient. Mutually exclusive with
             ``managed_artifact_root``.
+        :param event_sink: Keyword argument, optional, defaults to ``None``. Destination
+            for this run's versioned lifecycle events. ``None`` uses ``NullEventSink``,
+            so a run is silent unless a caller opts in. A sink whose ``emit()`` raises is
+            logged and otherwise ignored -- event emission never aborts or otherwise
+            alters the run.
+        :param case_id: Keyword argument, optional, defaults to ``None``. Caller-supplied
+            scientific case identity stamped on every emitted event's ``RunContext``.
+        :param campaign_id: Keyword argument, optional, defaults to ``None``.
+            Caller-supplied campaign identity grouping several runs, stamped on every
+            emitted event's ``RunContext``.
         :raises TypeError: If ``initial_ownership`` is not GrainOwnership, accompanies a
             non-file initial structure, ``allow_variable_cell`` is not Boolean, a
-            crossover/cleanup policy argument has an invalid type, or
-            ``retention_policy`` is not an ``ArtifactRetentionPolicy``.
+            crossover/cleanup policy argument has an invalid type, ``retention_policy``
+            is not an ``ArtifactRetentionPolicy``, or ``event_sink`` is neither ``None``
+            nor an ``EventSink``.
         :raises ValueError: If ownership is supplied without an initial structure,
             variable-cell execution is requested without explicit ownership, cleanup
             ownership is ambiguous, or pruning lacks an explicit cleanup owner.
         """
+        if event_sink is not None and not isinstance(event_sink, EventSink):
+            raise GBMinimizerTypeError("event_sink must be an EventSink or None")
+        self._event_sink: EventSink = (
+            NullEventSink() if event_sink is None else event_sink
+        )
+        self.case_id = case_id
+        self.campaign_id = campaign_id
         if not isinstance(allow_variable_cell, (bool, np.bool_)):
             raise TypeError("allow_variable_cell must be a Boolean")
         allow_variable_cell = bool(allow_variable_cell)
@@ -1132,20 +1163,27 @@ class GeneticAlgorithmMinimizer:
         unique_id: int,
         gen_checkpoint: CandidateCheckpoint | None = None,
         cached_evaluations: list[_CachedEvaluation | None] | None = None,
-    ) -> tuple[list[float], list[str | None], list[GBManipulator | None]]:
+    ) -> tuple[
+        list[float], list[str | None], list[GBManipulator | None], list[EvaluationResult]
+    ]:
         """Evaluate all candidates, optionally using a batch energy function.
 
         Each candidate's raw callback result is classified through the same
         ``EvaluationResult`` contract regardless of source (fresh callback, batch
         callback, checkpoint restore, or carryover cache), so a candidate always
         penalizes to ``ENERGY_PENALTY`` on a missing/non-finite energy or a missing
-        structure path, not just on an outright callback exception.
+        structure path, not just on an outright callback exception. The returned
+        ``EvaluationResult`` reflects a subsequent candidate-reconstruction failure too
+        (reclassified to ``FailureStage.ARTIFACT``), not just the evaluator callback's
+        own raw outcome, so it always matches the aligned energy/path this method
+        actually returns.
 
         :param gen_checkpoint: If provided, already-evaluated candidates are skipped and
             new results are recorded after each evaluation.
         :param cached_evaluations: Successful results aligned to unchanged carryover
             candidates. ``None`` entries are evaluated normally.
-        :return: Aligned energies, evaluator artifact paths, and manipulators.
+        :return: Aligned energies, evaluator artifact paths, manipulators, and
+            authoritative per-candidate evaluation results.
         :raises ValueError: If cached results are not population-aligned.
         :raises EvaluationTypeError: If a callback result is not the documented tuple
             or dictionary shape.
@@ -1275,6 +1313,7 @@ class GeneticAlgorithmMinimizer:
             gen_energies = []
             gen_files = []
             evaluated_manipulators = []
+            results: list[EvaluationResult] = []
             for index, raw_result in enumerate(batch_results):
                 if raw_result is None:
                     raise RuntimeError("batch evaluation lost candidate alignment")
@@ -1314,16 +1353,26 @@ class GeneticAlgorithmMinimizer:
                         gen_files[-1] = None
                         gen_energies[-1] = ENERGY_PENALTY
                         evaluated_manipulators.append(None)
+                        result = EvaluationResult(
+                            candidate_id=uid,
+                            input_index=index,
+                            status=EvaluationStatus.FAILED,
+                            selection_energy=ENERGY_PENALTY,
+                            failure_stage=FailureStage.ARTIFACT,
+                            failure_message=f"{type(exc).__name__}: {exc}",
+                        )
                 else:
                     gen_files.append(None)
                     gen_energies[-1] = ENERGY_PENALTY
                     evaluated_manipulators.append(None)
+                results.append(result)
 
-            return gen_energies, gen_files, evaluated_manipulators
+            return gen_energies, gen_files, evaluated_manipulators, results
 
         gen_energies: list[float] = []
         gen_files: list[str | None] = []
         evaluated_manipulators: list[GBManipulator | None] = []
+        results: list[EvaluationResult] = []
 
         for idx, (manipulator, atom_positions) in enumerate(
                 zip(population_manipulators, population_structures)):
@@ -1394,12 +1443,21 @@ class GeneticAlgorithmMinimizer:
                     gen_files[-1] = None
                     gen_energies[-1] = ENERGY_PENALTY
                     evaluated_manipulators.append(None)
+                    result = EvaluationResult(
+                        candidate_id=uid,
+                        input_index=idx,
+                        status=EvaluationStatus.FAILED,
+                        selection_energy=ENERGY_PENALTY,
+                        failure_stage=FailureStage.ARTIFACT,
+                        failure_message=f"{type(exc).__name__}: {exc}",
+                    )
             else:
                 gen_files.append(None)
                 gen_energies[-1] = ENERGY_PENALTY
                 evaluated_manipulators.append(None)
+            results.append(result)
 
-        return gen_energies, gen_files, evaluated_manipulators
+        return gen_energies, gen_files, evaluated_manipulators, results
 
     def _make_next_generation(
         self,
@@ -1801,6 +1859,40 @@ class GeneticAlgorithmMinimizer:
             )
         return manipulators, structures
 
+    def _emit(
+        self,
+        event_type: OptimizationEventType,
+        *,
+        run_context: RunContext,
+        iteration: int,
+        **fields: object,
+    ) -> None:
+        """Build and deliver one lifecycle event, never letting a sink abort the run.
+
+        :param event_type: Lifecycle occurrence to report.
+        :param run_context: Keyword argument, required. Identity of the emitting run.
+        :param iteration: Keyword argument, required. GA generation this event reports
+            on.
+        :param **fields: Additional ``OptimizationEvent`` keyword arguments.
+        """
+        try:
+            event = OptimizationEvent(
+                event_type=event_type,
+                run=run_context,
+                iteration=iteration,
+                **fields,
+            )
+            self._event_sink.emit(event)
+        except Exception:
+            # Deliberate recovery boundary: a broken event -- or a sink that raises --
+            # is an observability-side failure, never a reason to abort or otherwise
+            # change the numerical outcome of the run that triggered it.
+            logger.exception(
+                "event emission failed for %s at GA generation %d; continuing the run",
+                event_type.value,
+                iteration,
+            )
+
     def run_GA(
         self,
         unique_id: int | uuid.UUID | None = None,
@@ -1934,15 +2026,61 @@ class GeneticAlgorithmMinimizer:
                 population_structures.append(
                     np.array(manip.parents[0].whole_system, copy=True)
                 )
+            run_context = RunContext(
+                run_id=str(unique_id),
+                seed=self.seed,
+                algorithm=OptimizationAlgorithm.GENETIC_ALGORITHM,
+                case_id=self.case_id,
+                campaign_id=self.campaign_id,
+            )
+            self._emit(
+                OptimizationEventType.RUN_STARTED,
+                run_context=run_context,
+                iteration=_start_gen - 1,
+            )
         else:
+            run_context = RunContext(
+                run_id=str(unique_id),
+                seed=self.seed,
+                algorithm=OptimizationAlgorithm.GENETIC_ALGORITHM,
+                case_id=self.case_id,
+                campaign_id=self.campaign_id,
+            )
+            self._emit(
+                OptimizationEventType.RUN_STARTED, run_context=run_context, iteration=0
+            )
             # Evaluate the initial structure
             init_system = np.array(
                 self.manipulator.parents[0].whole_system, copy=True)
-            init_gbe, init_dump = self.gb_energy_func(
-                self.GB,
-                self.manipulator,
-                init_system,
-                "GA_initial" + str(unique_id),
+            initial_candidate_id = "GA_initial" + str(unique_id)
+            try:
+                init_gbe, init_dump = self.gb_energy_func(
+                    self.GB,
+                    self.manipulator,
+                    init_system,
+                    initial_candidate_id,
+                )
+            except Exception as exc:
+                self._emit(
+                    OptimizationEventType.RUN_FAILED,
+                    run_context=run_context,
+                    iteration=0,
+                    failure_stage=FailureStage.EVALUATOR,
+                    failure_message=f"{type(exc).__name__}: {exc}",
+                )
+                raise
+            self._emit(
+                OptimizationEventType.INITIAL_EVALUATION,
+                run_context=run_context,
+                iteration=0,
+                **evaluation_event_fields(
+                    from_scalar_tuple(
+                        initial_candidate_id,
+                        0,
+                        (init_gbe, init_dump),
+                        penalty=ENERGY_PENALTY,
+                    )
+                ),
             )
             self.GBE_vals.append([init_gbe])
             self.history = []
@@ -2027,15 +2165,26 @@ class GeneticAlgorithmMinimizer:
                 if checkpoint.enabled else None
             )
 
-            gen_energies, gen_files, evaluated_manipulators = self._evaluate_generation(
-                population_manipulators,
-                population_structures,
-                population_lineages,
-                gen,
-                unique_id,
-                gen_checkpoint=gen_checkpoint,
-                cached_evaluations=population_cached_evaluations,
+            gen_energies, gen_files, evaluated_manipulators, gen_results = (
+                self._evaluate_generation(
+                    population_manipulators,
+                    population_structures,
+                    population_lineages,
+                    gen,
+                    unique_id,
+                    gen_checkpoint=gen_checkpoint,
+                    cached_evaluations=population_cached_evaluations,
+                )
             )
+
+            for i, result in enumerate(gen_results):
+                self._emit(
+                    OptimizationEventType.PROPOSAL_EVALUATED,
+                    run_context=run_context,
+                    iteration=gen,
+                    operation_name=population_lineages[i][0],
+                    **evaluation_event_fields(result),
+                )
 
             valid_old_idxs = [
                 i for i, f in enumerate(gen_files) if self._is_valid_file(f)
@@ -2046,6 +2195,21 @@ class GeneticAlgorithmMinimizer:
 
             if not valid_old_idxs:
                 # If nothing valid survived evaluation, re-seed from best.
+                for i, result in enumerate(gen_results):
+                    self._emit(
+                        OptimizationEventType.CANDIDATE_REJECTED,
+                        run_context=run_context,
+                        iteration=gen,
+                        operation_name=population_lineages[i][0],
+                        **evaluation_event_fields(result),
+                    )
+                self._emit(
+                    OptimizationEventType.POPULATION_RESEEDED,
+                    run_context=run_context,
+                    iteration=gen,
+                    candidate_id=None,
+                    selection_energy=best_energy,
+                )
                 next_manipulators = []
                 next_structures = []
                 next_lineages = []
@@ -2076,6 +2240,12 @@ class GeneticAlgorithmMinimizer:
                     if gbe < best_energy:
                         best_energy = gbe
                         best_dump = dump_file_name
+                        self._emit(
+                            OptimizationEventType.BEST_UPDATED,
+                            run_context=run_context,
+                            iteration=gen,
+                            **evaluation_event_fields(gen_results[i]),
+                        )
 
                 # Build compressed arrays of only valid candidates for selection and breeding.
                 valid_energies = [gen_energies[i] for i in valid_old_idxs]
@@ -2084,6 +2254,22 @@ class GeneticAlgorithmMinimizer:
                 lowest_valid_idxs, inter_valid_idxs = self._select_indices_by_energy(
                     valid_energies
                 )
+
+                selected_old_idxs = {valid_old_idxs[j] for j in lowest_valid_idxs} | {
+                    valid_old_idxs[j] for j in inter_valid_idxs
+                }
+                for i, result in enumerate(gen_results):
+                    self._emit(
+                        (
+                            OptimizationEventType.CANDIDATE_ACCEPTED
+                            if i in selected_old_idxs
+                            else OptimizationEventType.CANDIDATE_REJECTED
+                        ),
+                        run_context=run_context,
+                        iteration=gen,
+                        operation_name=population_lineages[i][0],
+                        **evaluation_event_fields(result),
+                    )
 
                 # Carry over lowest energies.
                 next_manipulators = []
@@ -2147,6 +2333,21 @@ class GeneticAlgorithmMinimizer:
             # Iter checkpoint is transient; main checkpoint covers this boundary
             if gen_checkpoint is not None:
                 gen_checkpoint.delete()
+
+            self._emit(
+                OptimizationEventType.GENERATION_BOUNDARY,
+                run_context=run_context,
+                iteration=gen,
+                selection_energy=best_energy,
+            )
+
+        if _last_completed_gen >= 0:
+            self._emit(
+                OptimizationEventType.RUN_TERMINATED,
+                run_context=run_context,
+                iteration=_last_completed_gen,
+                termination_reason=TerminationReason.MAX_GENERATIONS,
+            )
 
         return (best_energy, best_dump)
 
@@ -2474,6 +2675,18 @@ class GeneticAlgorithmMinimizer:
                 )
                 if stale.exists():
                     stale.unlink()
+                run_context = RunContext(
+                    run_id=str(unique_id),
+                    seed=self.seed,
+                    algorithm=OptimizationAlgorithm.GENETIC_ALGORITHM,
+                    case_id=self.case_id,
+                    campaign_id=self.campaign_id,
+                )
+                self._emit(
+                    OptimizationEventType.RUN_STARTED,
+                    run_context=run_context,
+                    iteration=int(progress_index),
+                )
             except GBMinimizerError:
                 raise
             except (KeyError, TypeError, ValueError) as exc:
@@ -2481,6 +2694,16 @@ class GeneticAlgorithmMinimizer:
                     f"Invalid explicit-ownership GA checkpoint state: {exc}"
                 ) from exc
         else:
+            run_context = RunContext(
+                run_id=str(unique_id),
+                seed=self.seed,
+                algorithm=OptimizationAlgorithm.GENETIC_ALGORITHM,
+                case_id=self.case_id,
+                campaign_id=self.campaign_id,
+            )
+            self._emit(
+                OptimizationEventType.RUN_STARTED, run_context=run_context, iteration=0
+            )
             self.GBE_vals = []
             self.history = []
             self.last_generation_evaluations = []
@@ -2496,7 +2719,24 @@ class GeneticAlgorithmMinimizer:
                 f"GA_initial{unique_id}",
                 -1,
             )
+            self._emit(
+                OptimizationEventType.INITIAL_EVALUATION,
+                run_context=run_context,
+                iteration=0,
+                **evaluation_event_fields(from_candidate_evaluation(initial_record)),
+            )
             if not initial_record.success or initial_record.structure_path is None:
+                self._emit(
+                    OptimizationEventType.RUN_FAILED,
+                    run_context=run_context,
+                    iteration=0,
+                    failure_stage=(
+                        initial_record.failure_stage or FailureStage.EVALUATOR
+                    ),
+                    failure_message=(
+                        initial_record.failure_reason or "initial evaluation failed"
+                    ),
+                )
                 raise GBMinimizerError(
                     "initial explicit-ownership evaluation failed: "
                     f"{initial_record.failure_reason}"
@@ -2619,6 +2859,7 @@ class GeneticAlgorithmMinimizer:
             }
 
         pending_failure_diagnostics: list[_FailureDiagnostic] = []
+        _last_completed_gen = -1
 
         for gen in range(_start_gen, self.generations):
             current_pending = [
@@ -2654,6 +2895,14 @@ class GeneticAlgorithmMinimizer:
                 )
             except CheckpointError as exc:
                 raise GBMinimizerError(str(exc)) from exc
+            for record in records:
+                self._emit(
+                    OptimizationEventType.PROPOSAL_EVALUATED,
+                    run_context=run_context,
+                    iteration=gen,
+                    operation_name=population_lineages[record.input_index][0],
+                    **evaluation_event_fields(from_candidate_evaluation(record)),
+                )
             self.last_generation_evaluations = records
             if self.artifact_store is not None:
                 for record in records:
@@ -2700,6 +2949,23 @@ class GeneticAlgorithmMinimizer:
             valid_records = [record for record in records if record.success]
 
             if not valid_records:
+                for record in records:
+                    self._emit(
+                        OptimizationEventType.CANDIDATE_REJECTED,
+                        run_context=run_context,
+                        iteration=gen,
+                        operation_name=population_lineages[record.input_index][0],
+                        **evaluation_event_fields(from_candidate_evaluation(record)),
+                    )
+                self._emit(
+                    OptimizationEventType.POPULATION_RESEEDED,
+                    run_context=run_context,
+                    iteration=gen,
+                    candidate_id=None,
+                    selection_energy=from_candidate_evaluation(
+                        best_record
+                    ).selection_energy,
+                )
                 next_manipulators: list[GBManipulator] = []
                 next_structures: list[np.ndarray] = []
                 next_lineages: list[list[str]] = []
@@ -2735,6 +3001,14 @@ class GeneticAlgorithmMinimizer:
                         best_record = record
                         best_selection_energy = record_selection_energy
                         self.best_evaluation = record
+                        self._emit(
+                            OptimizationEventType.BEST_UPDATED,
+                            run_context=run_context,
+                            iteration=gen,
+                            **evaluation_event_fields(
+                                from_candidate_evaluation(record)
+                            ),
+                        )
                         if self.artifact_store is not None:
                             self.artifact_store.replace_pin(
                                 ArtifactPin.BEST_RESULT, record.candidate_id
@@ -2747,6 +3021,23 @@ class GeneticAlgorithmMinimizer:
                 lowest_indices, intermediate_indices = self._select_indices_by_energy(
                     valid_energies
                 )
+                selected_candidate_ids = {
+                    valid_records[index].candidate_id for index in lowest_indices
+                } | {
+                    valid_records[index].candidate_id for index in intermediate_indices
+                }
+                for record in records:
+                    self._emit(
+                        (
+                            OptimizationEventType.CANDIDATE_ACCEPTED
+                            if record.candidate_id in selected_candidate_ids
+                            else OptimizationEventType.CANDIDATE_REJECTED
+                        ),
+                        run_context=run_context,
+                        iteration=gen,
+                        operation_name=population_lineages[record.input_index][0],
+                        **evaluation_event_fields(from_candidate_evaluation(record)),
+                    )
                 next_manipulators = []
                 next_structures = []
                 next_lineages = []
@@ -2919,6 +3210,24 @@ class GeneticAlgorithmMinimizer:
                 self._write_owned_artifact_manifest()
             elif self.artifact_store is not None:
                 self._write_owned_artifact_manifest()
+
+            _last_completed_gen = gen
+            self._emit(
+                OptimizationEventType.GENERATION_BOUNDARY,
+                run_context=run_context,
+                iteration=gen,
+                selection_energy=from_candidate_evaluation(
+                    best_record
+                ).selection_energy,
+            )
+
+        if _last_completed_gen >= 0:
+            self._emit(
+                OptimizationEventType.RUN_TERMINATED,
+                run_context=run_context,
+                iteration=_last_completed_gen,
+                termination_reason=TerminationReason.MAX_GENERATIONS,
+            )
 
         self.best_evaluation = best_record
         return best_record.objective, str(best_record.structure_path)

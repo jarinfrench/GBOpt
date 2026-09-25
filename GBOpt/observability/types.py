@@ -276,12 +276,29 @@ def _normalize_iteration(value: object, *, name: str) -> int:
     :raises ObservabilityTypeError: If ``value`` is Boolean or non-integral.
     :raises ObservabilityValueError: If ``value`` is negative.
     """
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
-        raise ObservabilityTypeError(f"{name} must be a non-Boolean integer")
-    normalized = int(value)
+    normalized = _normalize_index(value, name=name)
     if normalized < 0:
         raise ObservabilityValueError(f"{name} must be non-negative")
     return normalized
+
+
+def _normalize_index(value: object, *, name: str) -> int:
+    """Validate one integer index, matching ``EvaluationResult.input_index``.
+
+    Unlike :func:`_normalize_iteration`, this allows a negative value -- some
+    authoritative evaluation sources (e.g. an owned-mode initial candidate,
+    ``input_index=-1``) use a negative sentinel for "not a submitted population
+    member," and this field must accept whatever ``EvaluationResult.input_index``
+    itself already accepts, not a stricter range.
+
+    :param value: Index value to validate.
+    :param name: Keyword argument, required. Field name used in diagnostics.
+    :return: Python integer.
+    :raises ObservabilityTypeError: If ``value`` is Boolean or non-integral.
+    """
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+        raise ObservabilityTypeError(f"{name} must be a non-Boolean integer")
+    return int(value)
 
 
 def _validate_termination_reason_coherence(
@@ -387,7 +404,9 @@ class OptimizationEvent:
     :param candidate_id: Keyword argument, optional, defaults to ``None``. Stable
         candidate identity, when this event reports on one candidate.
     :param input_index: Keyword argument, optional, defaults to ``None``. Candidate
-        position within the submitted generation, when applicable.
+        position within the submitted generation, when applicable; matches
+        ``EvaluationResult.input_index`` exactly, including a negative sentinel value
+        (e.g. an owned-mode initial candidate's ``-1``).
     :param status: Keyword argument, optional, defaults to ``None``. Success/failure
         outcome, when this event reports on one evaluation.
     :param selection_energy: Keyword argument, optional, defaults to ``None``.
@@ -465,7 +484,7 @@ class OptimizationEvent:
         input_index = (
             None
             if input_index is None
-            else _normalize_iteration(input_index, name="input_index")
+            else _normalize_index(input_index, name="input_index")
         )
         if status is not None and not isinstance(status, EvaluationStatus):
             raise ObservabilityTypeError("status must be an EvaluationStatus or None")
