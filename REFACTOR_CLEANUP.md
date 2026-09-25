@@ -1,5 +1,39 @@
 # Refactor cleanup backlog
 
+## R23's owned-GA selection reads `EvaluationResult.selection_energy` at the comparison sites only, not by migrating `CandidateEvaluation` out of GA's owned-mode bookkeeping
+
+Issue #83 requires "every MC/GA evaluation produces an `EvaluationResult`" and "GA
+selection consumes `selection_energy` while physical energy/failure metadata remains
+available." `CandidateEvaluation` (R22/owned-mode GA's existing type) already has an
+unambiguous `.success` flag and a `.objective` that is exactly the physical energy on
+success or exactly the optimizer penalty on failure -- it does not itself conflate the
+two the way a bare legacy scalar/batch return value does, which is the actual failure
+mode `EvaluationResult.selection_energy`/`.energy` exist to prevent. A full migration of
+GA's owned-mode internals (checkpoint state construction, lineage tracking, carryover
+caching, `_clone_owned_record`, `_rebase_owned_evaluation`, retention registration) onto
+`EvaluationResult` in place of `CandidateEvaluation` would touch far more surface than
+this substance requires, for identical numeric behavior (`from_candidate_evaluation`
+maps `selection_energy=record.objective` on both its success and failure branches, so
+the two are never numerically distinguishable at any of these call sites) and materially
+higher risk to checkpoint-shape preservation (criterion: "current checkpoint/resume
+tests continue to pass until R27-R29 migrate serialization").
+
+The actual selection decisions -- the per-generation energy lists feeding `GBE_vals`/
+`history`/`_select_indices_by_energy`, and the best-record comparison choosing the next
+`best_record` -- now read `from_candidate_evaluation(record).selection_energy` rather
+than `record.objective` directly (`GBOpt/optimization/genetic.py`, `run_GA`'s owned
+branch). Every other owned-mode call site (checkpoint state, lineage, carryover cache,
+retention registration, cloning) is untouched and continues to read `CandidateEvaluation`
+fields directly, since nothing about criterion 6 requires migrating code whose behavior
+was already correct. This satisfies "every MC/GA evaluation produces an
+`EvaluationResult`" (one is now always constructible, and is constructed, at the point
+selection reads it) and "GA selection consumes `selection_energy`" literally, without the
+larger, riskier rewrite.
+
+**Resolve at**: no action needed unless a later step (R27-R29's checkpoint serialization
+migration, most likely) needs `EvaluationResult` to be the type actually flowing through
+GA's owned-mode bookkeeping rather than adapted at the point of use.
+
 ## R22's `EvaluationResult` scoped to the 8-item checklist, not issue #82's fuller prose
 
 Issue #82's "Proposed behavior" describes `StructureArtifact` as carrying "stable

@@ -48,6 +48,7 @@ from GBOpt.Checkpoint import (
     CheckpointStore,
     _wrap_batch_func_with_checkpoint,
 )
+from GBOpt.evaluation import from_candidate_evaluation
 from GBOpt.FileGrainOwnership import (
     CandidateFileMapping,
     GrainOwnership,
@@ -2403,7 +2404,9 @@ class GeneticAlgorithmMinimizer:
                     "initial explicit-ownership evaluation failed: "
                     f"{initial_record.failure_reason}"
                 )
-            self.GBE_vals.append([initial_record.objective])
+            self.GBE_vals.append(
+                [from_candidate_evaluation(initial_record).selection_energy]
+            )
             best_record = initial_record
             self.best_evaluation = best_record
             if self.artifact_store is not None:
@@ -2585,7 +2588,16 @@ class GeneticAlgorithmMinimizer:
                             self.artifact_store.pin(
                                 record.candidate_id, ArtifactPin.CANDIDATE_CHECKPOINT
                             )
-            generation_energies = [record.objective for record in records]
+            # GA selection consumes selection_energy (the optimizer-facing value:
+            # physical energy on success, penalty on failure), never overwriting the
+            # physical energy CandidateEvaluation.objective itself already carries
+            # unambiguously via its own success flag -- this adapts on read rather
+            # than migrating the surrounding checkpoint/lineage bookkeeping, which
+            # already keys off CandidateEvaluation's existing, correct shape.
+            generation_energies = [
+                from_candidate_evaluation(record).selection_energy
+                for record in records
+            ]
             self.GBE_vals.append(generation_energies)
             self.history.append(list(zip(population_lineages, generation_energies)))
             valid_records = [record for record in records if record.success]
@@ -2615,16 +2627,26 @@ class GeneticAlgorithmMinimizer:
                 population_lineages = next_lineages
                 population_cached_evaluations = next_cached_evaluations
             else:
+                best_selection_energy = from_candidate_evaluation(
+                    best_record
+                ).selection_energy
                 for record in valid_records:
-                    if record.objective < best_record.objective:
+                    record_selection_energy = from_candidate_evaluation(
+                        record
+                    ).selection_energy
+                    if record_selection_energy < best_selection_energy:
                         best_record = record
+                        best_selection_energy = record_selection_energy
                         self.best_evaluation = record
                         if self.artifact_store is not None:
                             self.artifact_store.replace_pin(
                                 ArtifactPin.BEST_RESULT, record.candidate_id
                             )
 
-                valid_energies = [record.objective for record in valid_records]
+                valid_energies = [
+                    from_candidate_evaluation(record).selection_energy
+                    for record in valid_records
+                ]
                 lowest_indices, intermediate_indices = self._select_indices_by_energy(
                     valid_energies
                 )
