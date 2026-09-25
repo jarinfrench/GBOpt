@@ -214,6 +214,16 @@ def test_save_creates_missing_parent_directories(tmp_path):
     assert json.loads(path.read_text())["schema_version"] == 1
 
 
+def test_save_translates_parent_directory_creation_failure(tmp_path):
+    blocking_file = tmp_path / "not_a_directory"
+    blocking_file.write_text("occupies the path a parent directory would need")
+    path = blocking_file / "run.json"
+    store = CheckpointStore.from_optional(path)
+
+    with pytest.raises(CheckpointError, match="Failed to save checkpoint"):
+        store.save_final(_make_state())
+
+
 def test_save_publishes_with_no_leftover_temporary_file(checkpoint_path):
     store = CheckpointStore.from_optional(checkpoint_path)
 

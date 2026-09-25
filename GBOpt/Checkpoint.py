@@ -198,9 +198,9 @@ def _save_checkpoint_payload(
     :raises CheckpointError: If the parent directory cannot be created or the payload
         cannot be written or published.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         if fmt == "json":
             with open(tmp, "w") as fp:
                 json.dump(_to_serializable(payload), fp, indent=json_indent)
