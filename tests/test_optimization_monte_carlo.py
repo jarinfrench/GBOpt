@@ -9,10 +9,21 @@ import numpy as np
 import pytest
 
 from GBOpt.artifacts import ArtifactRetentionPolicy, KeepBest
+from GBOpt.evaluation import EvaluationStatus
 from GBOpt.GBMaker import GBMaker
 from GBOpt.manipulation import ManipulationRegistry, ManipulationResult
+from GBOpt.observability import (
+    OptimizationAlgorithm,
+    OptimizationEvent,
+    OptimizationEventType,
+    TerminationReason,
+)
 from GBOpt.optimization.monte_carlo import MC_ENERGY_PENALTY, MonteCarloMinimizer
-from GBOpt.optimization.types import GBMinimizerError, GBMinimizerValueError
+from GBOpt.optimization.types import (
+    GBMinimizerError,
+    GBMinimizerTypeError,
+    GBMinimizerValueError,
+)
 
 _TEST_CALCULATION_CONTEXT = {"calculator": {"name": "test-evaluator"}}
 
@@ -830,3 +841,207 @@ def test_third_party_multi_child_operation_is_rejected_not_retried(gb):
     )
     with pytest.raises(GBMinimizerValueError, match="requires exactly one"):
         mc.run_MC(max_steps=2, unique_id=1)
+
+
+# --------------------------------------------------------------------------------------
+# Versioned MC/GA lifecycle events (issue #84)
+# --------------------------------------------------------------------------------------
+
+
+class _RecordingSink:
+    def __init__(self):
+        self.events: list[OptimizationEvent] = []
+
+    def emit(self, event: OptimizationEvent) -> None:
+        self.events.append(event)
+
+
+class _ExplodingSink:
+    def emit(self, event: OptimizationEvent) -> None:
+        raise RuntimeError("sink is broken")
+
+
+def test_default_event_sink_is_silent(gb, tmp_path):
+    mc = _make_minimizer(gb, _make_energy_func(gb))
+
+    result = mc.run_MC(max_steps=2, unique_id=1)
+
+    assert isinstance(result, float)
+
+
+def test_event_sink_type_is_validated(gb):
+    with pytest.raises(GBMinimizerTypeError, match="event_sink"):
+        MonteCarloMinimizer(
+            gb, _make_energy_func(gb), ["translate_right_grain"], seed=0,
+            event_sink=object(),
+        )
+
+
+def test_energy_tolerance_run_emits_expected_lifecycle_sequence(gb, tmp_path):
+    root = tmp_path / "structures"
+    energy_func = _make_sequence_energy_func([2.0, 1.99995], root)
+    sink = _RecordingSink()
+    mc = MonteCarloMinimizer(
+        gb,
+        energy_func,
+        ["translate_right_grain"],
+        seed=0,
+        event_sink=sink,
+        case_id="case-a",
+        campaign_id="campaign-b",
+    )
+
+    mc.run_MC(max_steps=5, unique_id=99)
+
+    event_types = [event.event_type for event in sink.events]
+    assert event_types == [
+        OptimizationEventType.RUN_STARTED,
+        OptimizationEventType.INITIAL_EVALUATION,
+        OptimizationEventType.PROPOSAL_EVALUATED,
+        OptimizationEventType.CANDIDATE_ACCEPTED,
+        OptimizationEventType.BEST_UPDATED,
+        OptimizationEventType.RUN_TERMINATED,
+    ]
+
+    for event in sink.events:
+        assert event.run.run_id == "99"
+        assert event.run.seed == 0
+        assert event.run.algorithm is OptimizationAlgorithm.MONTE_CARLO
+        assert event.run.case_id == "case-a"
+        assert event.run.campaign_id == "campaign-b"
+
+    initial_event = sink.events[1]
+    assert initial_event.status is EvaluationStatus.SUCCESS
+    assert initial_event.energy == pytest.approx(2.0)
+
+    proposal_event = sink.events[2]
+    assert proposal_event.iteration == 1
+    assert proposal_event.status is EvaluationStatus.SUCCESS
+    assert proposal_event.energy == pytest.approx(1.99995)
+    # translate_right_grain's own mutation-dispatch label describes the sampled shift
+    # rather than repeating the operation's own name -- operation_name mirrors
+    # whatever label Mutator.mutate() actually returns for the dispatched operation.
+    assert proposal_event.operation_name.startswith("shift")
+
+    terminated_event = sink.events[-1]
+    assert terminated_event.termination_reason is TerminationReason.ENERGY_TOLERANCE
+
+
+def test_max_steps_termination_reason(gb, tmp_path):
+    sink = _RecordingSink()
+    mc = MonteCarloMinimizer(
+        gb, _make_energy_func(gb), ["translate_right_grain"], seed=0, event_sink=sink
+    )
+
+    mc.run_MC(max_steps=2, unique_id=1)
+
+    terminated = [
+        event
+        for event in sink.events
+        if event.event_type is OptimizationEventType.RUN_TERMINATED
+    ]
+    assert len(terminated) == 1
+    assert terminated[0].termination_reason is TerminationReason.MAX_STEPS
+    assert terminated[0].iteration == 2
+
+
+def test_max_rejections_termination_reason(gb, tmp_path):
+    root = tmp_path / "structures"
+    # A strictly increasing sequence at T -> 0 is always rejected under the Metropolis
+    # criterion used here, so every proposal after the initial one is a rejection.
+    energy_func = _make_sequence_energy_func([2.0] + [100.0] * 5, root)
+    sink = _RecordingSink()
+    mc = MonteCarloMinimizer(
+        gb, energy_func, ["translate_right_grain"], seed=0, event_sink=sink
+    )
+
+    mc.run_MC(max_steps=10, max_rejections=2, unique_id=1)
+
+    rejected = [
+        event
+        for event in sink.events
+        if event.event_type is OptimizationEventType.CANDIDATE_REJECTED
+    ]
+    terminated = [
+        event
+        for event in sink.events
+        if event.event_type is OptimizationEventType.RUN_TERMINATED
+    ]
+    assert len(rejected) == 3
+    assert len(terminated) == 1
+    assert terminated[0].termination_reason is TerminationReason.MAX_REJECTIONS
+
+
+def test_initial_evaluation_failure_emits_failed_events_then_raises(gb, tmp_path):
+    def crashing_energy_func(GB, manipulator, atom_positions, unique_id):
+        raise RuntimeError("boom")
+
+    sink = _RecordingSink()
+    mc = MonteCarloMinimizer(
+        gb, crashing_energy_func, ["translate_right_grain"], seed=0, event_sink=sink
+    )
+
+    with pytest.raises(GBMinimizerError):
+        mc.run_MC(max_steps=2, unique_id=1)
+
+    event_types = [event.event_type for event in sink.events]
+    assert event_types == [
+        OptimizationEventType.RUN_STARTED,
+        OptimizationEventType.INITIAL_EVALUATION,
+        OptimizationEventType.RUN_FAILED,
+    ]
+    assert sink.events[1].status is EvaluationStatus.FAILED
+    assert sink.events[2].failure_message is not None
+
+
+def test_resume_emits_run_started_without_reemitting_initial_evaluation(gb, tmp_path):
+    checkpoint = tmp_path / "mc.json"
+    _make_minimizer(gb, _make_energy_func(gb)).run_MC(
+        max_steps=1, unique_id=1, checkpoint_file=checkpoint
+    )
+
+    sink = _RecordingSink()
+    resumed = MonteCarloMinimizer(
+        gb, _make_energy_func(gb), ["translate_right_grain"], seed=0, event_sink=sink
+    )
+    resumed.run_MC(max_steps=2, checkpoint_file=checkpoint)
+
+    event_types = [event.event_type for event in sink.events]
+    assert event_types[0] is OptimizationEventType.RUN_STARTED
+    assert OptimizationEventType.INITIAL_EVALUATION not in event_types
+
+
+def test_a_broken_event_sink_does_not_abort_the_run(gb, tmp_path):
+    mc = MonteCarloMinimizer(
+        gb,
+        _make_energy_func(gb),
+        ["translate_right_grain"],
+        seed=0,
+        event_sink=_ExplodingSink(),
+    )
+
+    result = mc.run_MC(max_steps=2, unique_id=1)
+
+    assert isinstance(result, float)
+
+
+def test_event_emission_does_not_alter_rng_state_or_result(gb, tmp_path):
+    silent = _make_minimizer(gb, _make_energy_func(gb))
+    silent_result = silent.run_MC(max_steps=5, unique_id=1)
+
+    observed = MonteCarloMinimizer(
+        gb,
+        _make_energy_func(gb),
+        ["translate_right_grain"],
+        seed=0,
+        event_sink=_RecordingSink(),
+    )
+    observed_result = observed.run_MC(max_steps=5, unique_id=1)
+
+    assert observed_result == silent_result
+    assert (
+        observed.local_random.bit_generator.state
+        == silent.local_random.bit_generator.state
+    )
+    assert observed.operation_list == silent.operation_list
+    assert observed.accepted_idx == silent.accepted_idx

@@ -46,6 +46,16 @@ from GBOpt.GBManipulator import (
     ParentError,
 )
 from GBOpt.manipulation import ManipulationRegistry
+from GBOpt.observability import (
+    EventSink,
+    NullEventSink,
+    OptimizationAlgorithm,
+    OptimizationEvent,
+    OptimizationEventType,
+    RunContext,
+    TerminationReason,
+    evaluation_event_fields,
+)
 from GBOpt.optimization.checkpointing import (
     _artifact_archive_root,
     _cleanup_committed_artifacts,
@@ -98,6 +108,9 @@ class MonteCarloMinimizer:
         calculation_context: Mapping[str, object] | None = None,
         managed_artifact_root: str | Path | None = None,
         cleanup_candidate: Callable[[ArtifactCleanupRequest], None] | None = None,
+        event_sink: EventSink | None = None,
+        case_id: str | None = None,
+        campaign_id: str | None = None,
     ):
         """Configure one Monte Carlo grain-boundary minimizer.
 
@@ -127,11 +140,28 @@ class MonteCarloMinimizer:
             Backend-owned callback invoked after a durable checkpoint commit for each
             evaluator source that has become transient. Mutually exclusive with
             ``managed_artifact_root``.
+        :param event_sink: Keyword argument, optional, defaults to ``None``. Destination
+            for this run's versioned lifecycle events. ``None`` uses ``NullEventSink``,
+            so a run is silent unless a caller opts in. A sink whose ``emit()`` raises is
+            logged and otherwise ignored -- event emission never aborts or otherwise
+            alters the run.
+        :param case_id: Keyword argument, optional, defaults to ``None``. Caller-supplied
+            scientific case identity stamped on every emitted event's ``RunContext``.
+        :param campaign_id: Keyword argument, optional, defaults to ``None``.
+            Caller-supplied campaign identity grouping several runs, stamped on every
+            emitted event's ``RunContext``.
         :raises GBMinimizerTypeError: If artifact retention/cleanup configuration has an
-            invalid type.
+            invalid type, or ``event_sink`` is neither ``None`` nor an ``EventSink``.
         :raises GBMinimizerValueError: If cleanup ownership is ambiguous or inconsistent
             with pruning configuration.
         """
+        if event_sink is not None and not isinstance(event_sink, EventSink):
+            raise GBMinimizerTypeError("event_sink must be an EventSink or None")
+        self._event_sink: EventSink = (
+            NullEventSink() if event_sink is None else event_sink
+        )
+        self.case_id = case_id
+        self.campaign_id = campaign_id
         self.GB = GB
         self.gb_energy_func = gb_energy_func
         self.initial_structure = initial_structure
@@ -397,6 +427,39 @@ class MonteCarloMinimizer:
             )
         return owners[0]
 
+    def _emit(
+        self,
+        event_type: OptimizationEventType,
+        *,
+        run_context: RunContext,
+        iteration: int,
+        **fields: object,
+    ) -> None:
+        """Build and deliver one lifecycle event, never letting a sink abort the run.
+
+        :param event_type: Lifecycle occurrence to report.
+        :param run_context: Keyword argument, required. Identity of the emitting run.
+        :param iteration: Keyword argument, required. MC step this event reports on.
+        :param **fields: Additional ``OptimizationEvent`` keyword arguments.
+        """
+        try:
+            event = OptimizationEvent(
+                event_type=event_type,
+                run=run_context,
+                iteration=iteration,
+                **fields,
+            )
+            self._event_sink.emit(event)
+        except Exception:
+            # Deliberate recovery boundary: a broken event -- or a sink that raises --
+            # is an observability-side failure, never a reason to abort or otherwise
+            # change the numerical outcome of the run that triggered it.
+            logger.exception(
+                "event emission failed for %s at MC step %d; continuing the run",
+                event_type.value,
+                iteration,
+            )
+
     def run_MC(
         self,
         E_accept: float = 1e-1,
@@ -545,9 +608,31 @@ class MonteCarloMinimizer:
                     raise GBMinimizerError(str(exc)) from exc
                 current_candidate_id = self._mc_pin_owner(ArtifactPin.RUN_CHECKPOINT)
                 best_candidate_id = self._mc_pin_owner(ArtifactPin.BEST_RESULT)
+            run_context = RunContext(
+                run_id=unique_id,
+                seed=self.seed,
+                algorithm=OptimizationAlgorithm.MONTE_CARLO,
+                case_id=self.case_id,
+                campaign_id=self.campaign_id,
+            )
+            self._emit(
+                OptimizationEventType.RUN_STARTED,
+                run_context=run_context,
+                iteration=_resume_step - 1,
+            )
         else:
             _resume_step = 1
             unique_id = str(uuid.uuid4()) if unique_id is None else str(unique_id)
+            run_context = RunContext(
+                run_id=unique_id,
+                seed=self.seed,
+                algorithm=OptimizationAlgorithm.MONTE_CARLO,
+                case_id=self.case_id,
+                campaign_id=self.campaign_id,
+            )
+            self._emit(
+                OptimizationEventType.RUN_STARTED, run_context=run_context, iteration=0
+            )
             init_system = np.array(
                 self.manipulator.parents[0].whole_system, copy=True)
             initial_candidate_id = "initial" + str(unique_id)
@@ -572,13 +657,39 @@ class MonteCarloMinimizer:
                     failure_stage=FailureStage.EVALUATOR,
                     failure_message=f"{type(exc).__name__}: {exc}",
                 )
+                self._emit(
+                    OptimizationEventType.INITIAL_EVALUATION,
+                    run_context=run_context,
+                    iteration=0,
+                    **evaluation_event_fields(initial_result),
+                )
+                self._emit(
+                    OptimizationEventType.RUN_FAILED,
+                    run_context=run_context,
+                    iteration=0,
+                    failure_stage=initial_result.failure_stage,
+                    failure_message=initial_result.failure_message,
+                )
                 raise GBMinimizerError(
                     f"initial evaluation failed: {initial_result.failure_message}"
                 ) from exc
             initial_result = from_scalar_tuple(
                 initial_candidate_id, 0, (init_gbe, _current_dump), penalty=MC_ENERGY_PENALTY
             )
+            self._emit(
+                OptimizationEventType.INITIAL_EVALUATION,
+                run_context=run_context,
+                iteration=0,
+                **evaluation_event_fields(initial_result),
+            )
             if initial_result.status is not EvaluationStatus.SUCCESS:
+                self._emit(
+                    OptimizationEventType.RUN_FAILED,
+                    run_context=run_context,
+                    iteration=0,
+                    failure_stage=initial_result.failure_stage,
+                    failure_message=initial_result.failure_message,
+                )
                 raise GBMinimizerError(
                     f"initial evaluation failed: {initial_result.failure_message}"
                 )
@@ -784,6 +895,14 @@ class MonteCarloMinimizer:
                     penalty=MC_ENERGY_PENALTY,
                 )
 
+            self._emit(
+                OptimizationEventType.PROPOSAL_EVALUATED,
+                run_context=run_context,
+                iteration=i,
+                operation_name=mutation,
+                **evaluation_event_fields(step_result),
+            )
+
             new_gbe = step_result.selection_energy
             dump_file_name = (
                 step_result.artifact.path if step_result.artifact is not None else None
@@ -817,6 +936,13 @@ class MonteCarloMinimizer:
                 )
 
             if accepted:
+                self._emit(
+                    OptimizationEventType.CANDIDATE_ACCEPTED,
+                    run_context=run_context,
+                    iteration=i,
+                    operation_name=mutation,
+                    **evaluation_event_fields(step_result),
+                )
                 self.operation_list.append([mutation, True])
                 self.manipulator = (
                     trial_manipulator
@@ -850,6 +976,12 @@ class MonteCarloMinimizer:
                     shutil.copyfile(dump_file_name, best_dump)
                     del_E = min_gbe - new_gbe
                     min_gbe = new_gbe
+                    self._emit(
+                        OptimizationEventType.BEST_UPDATED,
+                        run_context=run_context,
+                        iteration=i,
+                        **evaluation_event_fields(step_result),
+                    )
                     if self.artifact_store is not None:
                         if trial_candidate_id is None:
                             raise GBMinimizerError(
@@ -872,9 +1004,22 @@ class MonteCarloMinimizer:
                         )
                         _last_completed_step = i
                         _commit_step(i, final=True)
+                        self._emit(
+                            OptimizationEventType.RUN_TERMINATED,
+                            run_context=run_context,
+                            iteration=i,
+                            termination_reason=TerminationReason.ENERGY_TOLERANCE,
+                        )
                         _early_exit = True
                         break
             else:
+                self._emit(
+                    OptimizationEventType.CANDIDATE_REJECTED,
+                    run_context=run_context,
+                    iteration=i,
+                    operation_name=mutation,
+                    **evaluation_event_fields(step_result),
+                )
                 self.operation_list.append([mutation, False])
                 rejection_count += 1
                 if rejection_count > max_rejections:
@@ -888,6 +1033,12 @@ class MonteCarloMinimizer:
                     T *= cooldown_rate
                     _last_completed_step = i
                     _commit_step(i, final=True)
+                    self._emit(
+                        OptimizationEventType.RUN_TERMINATED,
+                        run_context=run_context,
+                        iteration=i,
+                        termination_reason=TerminationReason.MAX_REJECTIONS,
+                    )
                     _early_exit = True
                     break
 
@@ -899,6 +1050,12 @@ class MonteCarloMinimizer:
             _write_artifact_manifest(self.artifact_store, self._artifact_provenance)
         if not _early_exit and _last_completed_step >= 0:
             _commit_step(_last_completed_step, final=True)
+            self._emit(
+                OptimizationEventType.RUN_TERMINATED,
+                run_context=run_context,
+                iteration=_last_completed_step,
+                termination_reason=TerminationReason.MAX_STEPS,
+            )
 
         return min_gbe
 
