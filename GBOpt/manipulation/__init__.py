@@ -8,13 +8,16 @@ operation implementations (right-grain translation, grain-local termination cycl
 interface separation, atom insertion/removal, single-mode soft-phonon displacement, and
 two-parent slice-and-merge crossover). Registration in ``default_registry`` is still
 always explicit -- importing this module registers no built-in operation under a name;
-it only makes the operation classes importable. ``GBManipulator``'s own legacy methods
+it only makes the operation classes importable. Call ``register_builtin_operations()``
+to add every built-in to a registry (``default_registry`` unless given another) under
+its own name. ``GBManipulator``'s own legacy methods
 (``translate_right_grain``, ``cycle_grain_terminations``, ``apply_interface_separation``,
 ``insert_atoms``, ``remove_atoms``, ``displace_along_soft_modes``, ``slice_and_merge``,
 and their ``make_*_candidate`` counterparts) share these operations' pure computational
 core and remain the supported entry points for that scripted usage.
 """
 
+from .builtins import register_builtin_operations
 from .crossover import SliceAndMerge
 from .density import AtomInsertion, AtomRemoval
 from .registry import ManipulationRegistry, default_registry
@@ -53,6 +56,7 @@ __all__ = [
     # Registry
     "ManipulationRegistry",
     "default_registry",
+    "register_builtin_operations",
     # Built-in operations
     "RightGrainTranslation",
     "GrainTerminationCycle",
