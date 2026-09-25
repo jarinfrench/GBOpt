@@ -22,6 +22,7 @@ from GBOpt.GrainOwnership import (
     RIGHT_GRAIN_LABEL,
     GrainOwnership,
 )
+from GBOpt.manipulation import ManipulationRegistry, ManipulationResult
 from GBOpt.optimization.genetic import GeneticAlgorithmMinimizer
 from GBOpt.optimization.types import (
     GBMinimizerError,
@@ -3044,3 +3045,157 @@ def test_owned_cleanup_failure_leaks_source_but_checkpoint_remains_resumable(
     )
     resumed.run_GA(unique_id=308, checkpoint_file=checkpoint)
     assert len(resumed.history) == 2
+
+
+# --------------------------------------------------------------------------------------
+# Third-party binary operations via binary_operations + registry (issue #80 AC7/AC8)
+# --------------------------------------------------------------------------------------
+
+
+class _IdentityBinaryOperation:
+    """A minimal test-defined third-party binary operation: keeps the first parent."""
+
+    @property
+    def name(self) -> str:
+        return "identity_binary"
+
+    @property
+    def arity(self) -> int:
+        return 2
+
+    def execute(self, context):
+        return ManipulationResult(children=(context.parents[0],))
+
+
+class _TwoChildBinaryOperation:
+    """A misbehaving third-party binary operation: returns two children."""
+
+    @property
+    def name(self) -> str:
+        return "two_child_binary"
+
+    @property
+    def arity(self) -> int:
+        return 2
+
+    def execute(self, context):
+        return ManipulationResult(children=(context.parents[0], context.parents[1]))
+
+
+def _fake_energy_func_ga(tmp_path):
+    def energy_func(GB, manipulator, atom_positions, unique_id):
+        dump_file = tmp_path / f"{unique_id}.data"
+        GB.write_lammps(
+            str(dump_file), atom_positions, manipulator.parents[0].box_dims,
+        )
+        return 0.0, str(dump_file)
+
+    return energy_func
+
+
+def test_third_party_binary_operation_is_registered_and_selectable(ga_gb, tmp_path):
+    registry = ManipulationRegistry()
+    registry.register("identity_binary", _IdentityBinaryOperation())
+
+    minimizer = GeneticAlgorithmMinimizer(
+        ga_gb,
+        _fake_energy_func_ga(tmp_path),
+        ["translate_right_grain"],
+        seed=0,
+        binary_operations=["identity_binary"],
+        registry=registry,
+    )
+
+    specs = minimizer._binary_operation_specs()
+    names = {spec.name for spec in specs}
+    assert names == {"slice_and_merge", "identity_binary"}
+
+
+def test_third_party_binary_operation_participates_without_editing_optimizer_source(
+    ga_gb, tmp_path
+):
+    registry = ManipulationRegistry()
+    registry.register("identity_binary", _IdentityBinaryOperation())
+
+    minimizer = GeneticAlgorithmMinimizer(
+        ga_gb,
+        _fake_energy_func_ga(tmp_path),
+        ["translate_right_grain"],
+        seed=0,
+        binary_operations=["identity_binary"],
+        registry=registry,
+    )
+
+    manipulator1 = GBManipulator(ga_gb, seed=1)
+    manipulator2 = GBManipulator(ga_gb, seed=2)
+    invoker = minimizer._owned_generic_binary_invoker(
+        registry.get("identity_binary")
+    )
+    label, new_manipulator, new_atoms = invoker(
+        manipulator1.parents[0], manipulator2.parents[0], minimizer.local_random
+    )
+    assert label == "identity_binary"
+    assert isinstance(new_manipulator, GBManipulator)
+    np.testing.assert_array_equal(new_atoms, manipulator1.parents[0].whole_system)
+
+
+def test_third_party_multi_child_binary_operation_is_rejected(ga_gb, tmp_path):
+    registry = ManipulationRegistry()
+    registry.register("two_child_binary", _TwoChildBinaryOperation())
+
+    minimizer = GeneticAlgorithmMinimizer(
+        ga_gb,
+        _fake_energy_func_ga(tmp_path),
+        ["translate_right_grain"],
+        seed=0,
+        binary_operations=["two_child_binary"],
+        registry=registry,
+    )
+
+    manipulator1 = GBManipulator(ga_gb, seed=1)
+    manipulator2 = GBManipulator(ga_gb, seed=2)
+    invoker = minimizer._owned_generic_binary_invoker(
+        registry.get("two_child_binary")
+    )
+    with pytest.raises(GBMinimizerValueError, match="requires exactly one"):
+        invoker(
+            manipulator1.parents[0], manipulator2.parents[0], minimizer.local_random
+        )
+
+
+def test_binary_operations_rejects_unregistered_name(ga_gb, tmp_path):
+    with pytest.raises(GBMinimizerValueError, match="Unknown binary_operations entry"):
+        GeneticAlgorithmMinimizer(
+            ga_gb,
+            _fake_energy_func_ga(tmp_path),
+            ["translate_right_grain"],
+            seed=0,
+            binary_operations=["not_a_real_operation"],
+        )
+
+
+def test_binary_operations_rejects_wrong_arity(ga_gb, tmp_path):
+    registry = ManipulationRegistry()
+
+    class _UnaryOp:
+        @property
+        def name(self):
+            return "unary_op"
+
+        @property
+        def arity(self):
+            return 1
+
+        def execute(self, context):
+            return ManipulationResult(children=context.parents)
+
+    registry.register("unary_op", _UnaryOp())
+    with pytest.raises(GBMinimizerValueError, match="arity 1"):
+        GeneticAlgorithmMinimizer(
+            ga_gb,
+            _fake_energy_func_ga(tmp_path),
+            ["translate_right_grain"],
+            seed=0,
+            binary_operations=["unary_op"],
+            registry=registry,
+        )

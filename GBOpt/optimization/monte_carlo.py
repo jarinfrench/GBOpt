@@ -38,6 +38,7 @@ from GBOpt.GBManipulator import (
     GBManipulatorError,
     ParentError,
 )
+from GBOpt.manipulation import ManipulationRegistry
 from GBOpt.optimization.checkpointing import (
     _artifact_archive_root,
     _cleanup_committed_artifacts,
@@ -79,6 +80,7 @@ class MonteCarloMinimizer:
         seed=None,
         *,
         initial_structure: Any = None,
+        registry: ManipulationRegistry | None = None,
         retention_policy: ArtifactRetentionPolicy | None = None,
         calculation_context: Mapping[str, object] | None = None,
         managed_artifact_root: str | Path | None = None,
@@ -89,11 +91,16 @@ class MonteCarloMinimizer:
         :param GB: GBMaker object to perform minimization on.
         :param gb_energy_func: Function called with GBMaker, GBManipulator, atom
             positions, and a run identifier; returns objective and relaxed dump path.
-        :param choices: GBManipulator operation names available to the mutator.
+        :param choices: GBManipulator operation names available to the mutator. Any name
+            that is not one of the three legacy operation names is resolved by lookup in
+            ``registry``.
         :param seed: Random-number seed. Keyword argument, optional, defaults to
             ``None``; ``None`` seeds from the current time.
         :param initial_structure: Keyword argument, optional, defaults to ``None``.
             Optional GBMaker or file-backed initial structure accepted by GBManipulator.
+        :param registry: Keyword argument, optional, defaults to ``None``. Registry used
+            to resolve any non-legacy ``choices`` name; ``None`` uses
+            ``GBOpt.manipulation.default_registry``.
         :param retention_policy: Keyword argument, optional, defaults to ``None``.
             Scientific artifact-retention policy. ``None`` preserves legacy keep-all
             artifact behavior.
@@ -127,7 +134,7 @@ class MonteCarloMinimizer:
         )
         self._artifact_provenance: _ArtifactProvenance | None = None
         self.manipulator = self._make_initial_manipulator()
-        self.mutator = Mutator(choices, self.manipulator)
+        self.mutator = Mutator(choices, self.manipulator, registry=registry)
         self.accepted_idx = [0]  # Initial guess is accepted by definition
         self.operation_list = [["START", True]]
         self.local_random = np.random.default_rng(

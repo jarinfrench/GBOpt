@@ -10,6 +10,7 @@ import pytest
 
 from GBOpt.artifacts import ArtifactRetentionPolicy, KeepBest
 from GBOpt.GBMaker import GBMaker
+from GBOpt.manipulation import ManipulationRegistry, ManipulationResult
 from GBOpt.optimization.monte_carlo import MonteCarloMinimizer
 from GBOpt.optimization.types import GBMinimizerError, GBMinimizerValueError
 
@@ -625,3 +626,76 @@ def test_resume_restores_min_steps_from_checkpoint(gb, tmp_path):
 
     saved = json.loads(checkpoint.read_text(encoding="utf-8"))
     assert saved["run_params"]["min_steps"] == 5
+
+
+# --------------------------------------------------------------------------------------
+# Third-party operations via choices + registry (issue #80 AC7/AC8)
+# --------------------------------------------------------------------------------------
+
+
+class _IdentityUnaryOperation:
+    """A minimal test-defined third-party unary operation: returns its input unchanged."""
+
+    @property
+    def name(self) -> str:
+        return "identity_unary"
+
+    @property
+    def arity(self) -> int:
+        return 1
+
+    def execute(self, context):
+        return ManipulationResult(children=context.parents)
+
+
+class _TwoChildUnaryOperation:
+    """A misbehaving third-party unary operation: returns two children."""
+
+    @property
+    def name(self) -> str:
+        return "two_child_unary"
+
+    @property
+    def arity(self) -> int:
+        return 1
+
+    def execute(self, context):
+        return ManipulationResult(children=(context.parents[0], context.parents[0]))
+
+
+def test_third_party_unary_operation_participates_without_editing_optimizer_source(
+    gb,
+):
+    registry = ManipulationRegistry()
+    registry.register("identity_unary", _IdentityUnaryOperation())
+
+    mc = MonteCarloMinimizer(
+        gb,
+        _make_energy_func(gb),
+        ["identity_unary"],
+        seed=0,
+        registry=registry,
+    )
+    # A single step: the generic apply()/ManipulationContext boundary requires known
+    # boundary-normal topology, which the initial GBMaker-built manipulator has but a
+    # manipulator reloaded from a relaxed file via deprecated coordinate-based
+    # inference does not -- see this class's own known-topology-dependent legacy
+    # methods (make_translation_candidate, etc.) for the same established constraint.
+    result = mc.run_MC(max_steps=1, unique_id=1)
+    assert isinstance(result, float)
+    assert mc.operation_list[1][0] == "identity_unary"
+
+
+def test_third_party_multi_child_operation_is_rejected_not_retried(gb):
+    registry = ManipulationRegistry()
+    registry.register("two_child_unary", _TwoChildUnaryOperation())
+
+    mc = MonteCarloMinimizer(
+        gb,
+        _make_energy_func(gb),
+        ["two_child_unary"],
+        seed=0,
+        registry=registry,
+    )
+    with pytest.raises(GBMinimizerValueError, match="requires exactly one"):
+        mc.run_MC(max_steps=2, unique_id=1)

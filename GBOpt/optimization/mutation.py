@@ -12,6 +12,17 @@ the per-operation invocation (calling the corresponding established
 ``GBManipulator`` method directly, bypassing ``ManipulationContext`` -- see
 ``GBOpt.optimization.dispatch``'s module docstring for why) still needs a small
 name-keyed table, since that mapping is unavoidable however dispatch is structured.
+
+A ``choices`` entry that isn't one of the three legacy names is resolved by registry
+lookup (``GBOpt.manipulation.default_registry`` unless a caller supplies another) and
+dispatched through the generic ``GBManipulator.apply()``/``ManipulationContext``
+boundary instead -- this is how a third-party operation participates in MC/GA without
+editing this module: ``registry.register("my_op", MyOp())``, then add ``"my_op"`` to
+``choices``. Such an operation has no legacy tolerance to preserve, so the stricter,
+uniform boundary is safe for it. It must produce exactly one child; a different count
+is a fatal ``GBMinimizerValueError`` (not retried as mere infeasibility), since it
+indicates the operation itself is incompatible with MC/GA's single-child contract,
+not that this particular candidate was a bad fit.
 """
 
 from __future__ import annotations
@@ -21,7 +32,15 @@ from collections.abc import Callable
 import numpy as np
 
 from GBOpt import GBMaker, GBManipulator
-from GBOpt.manipulation import AtomInsertion, AtomRemoval, RightGrainTranslation, Manipulation
+from GBOpt.manipulation import (
+    AtomInsertion,
+    AtomRemoval,
+    Manipulation,
+    ManipulationLookupError,
+    ManipulationRegistry,
+    RightGrainTranslation,
+    default_registry,
+)
 from GBOpt.optimization.dispatch import LegacyInvoker, run_legacy_compat_operation
 from GBOpt.optimization.types import GBMinimizerError, GBMinimizerValueError, OperationSpec
 
@@ -69,20 +88,66 @@ _LEGACY_INVOKER_FACTORIES: dict[str, Callable[[GBMaker], LegacyInvoker]] = {
 }
 
 
+def _generic_apply_invoker(operation: Manipulation) -> LegacyInvoker:
+    """Return an invoker running ``operation`` through the generic apply() boundary.
+
+    :param operation: Registry-resolved operation, built-in or third-party.
+    :return: Invoker matching the shared ``(manipulator, rng) -> (label, atoms)`` shape,
+        so it can share retry/selection with the legacy invokers.
+    :raises GBMinimizerValueError: If a call produces a child count other than one.
+    """
+
+    def _invoke(manipulator: GBManipulator, rng: np.random.Generator):
+        del rng  # apply() draws from manipulator's own bound RNG.
+        result = manipulator.apply(operation)
+        if len(result.children) != 1:
+            raise GBMinimizerValueError(
+                f"operation {operation.name!r} produced {len(result.children)} "
+                "children; MC/GA dispatch requires exactly one"
+            )
+        (child,) = result.children
+        return operation.name, np.array(child.atoms, copy=True)
+
+    return _invoke
+
+
 class Mutator:
     """Perform randomly selected manipulations on a GB candidate.
 
-    :param choices: Mutation operation names to make available.
+    :param choices: Mutation operation names to make available. A name is either one of
+        this adapter's three legacy names, or resolved by lookup in ``registry``.
     :param manipulator: GBManipulator used to validate the requested operations.
+    :param registry: Keyword argument, optional, defaults to ``None``. Registry used to
+        resolve any non-legacy name; ``None`` uses
+        ``GBOpt.manipulation.default_registry``.
     """
 
     # TODO: Add more manipulator options to this class as we make more
     # manipulators faster.
 
-    def __init__(self, choices: list[str], manipulator: GBManipulator):
-        invalid_choices = [
-            method for method in choices if not hasattr(manipulator, method)
-        ]
+    def __init__(
+        self,
+        choices: list[str],
+        manipulator: GBManipulator,
+        *,
+        registry: ManipulationRegistry | None = None,
+    ):
+        self._registry = default_registry if registry is None else registry
+        invalid_choices = []
+        for name in choices:
+            if hasattr(manipulator, name) or name in _LEGACY_OPERATION_TYPES:
+                continue
+            try:
+                operation = self._registry.get(name)
+            except ManipulationLookupError:
+                invalid_choices.append(name)
+                continue
+            if operation.arity != 1:
+                raise GBMinimizerValueError(
+                    f"mutation choice {name!r} resolves to an operation with arity "
+                    f"{operation.arity}; only unary (arity 1) operations are usable "
+                    "as a mutation choice"
+                )
         if invalid_choices:
             raise GBMinimizerValueError(
                 "Unknown GBManipulator mutation choice(s): "
@@ -113,23 +178,26 @@ class Mutator:
         :param GB: GBMaker providing boundary dimensions and repeat factors.
         :param manipulator: GBManipulator on which to perform the mutation.
         :return: Mutation description and resulting atom positions.
-        :raises GBMinimizerValueError: If a configured choice is not one of this
-            adapter's known operation names.
+        :raises GBMinimizerValueError: If a configured choice cannot be resolved, or a
+            registry-resolved operation produces other than one child.
         :raises GBMinimizerError: If no configured mutation can produce a candidate.
         """
         specs: list[OperationSpec] = []
         legacy_invokers: dict[str, LegacyInvoker] = {}
         for name in self.choices_keys:
-            if name not in _LEGACY_OPERATION_TYPES:
-                raise GBMinimizerValueError(f"Unhandled mutation choice: {name!r}")
-            specs.append(
-                OperationSpec(
-                    name=name,
-                    operation=_LEGACY_OPERATION_TYPES[name](),
-                    weight=1.0,
+            if name in _LEGACY_OPERATION_TYPES:
+                specs.append(
+                    OperationSpec(
+                        name=name,
+                        operation=_LEGACY_OPERATION_TYPES[name](),
+                        weight=1.0,
+                    )
                 )
-            )
-            legacy_invokers[name] = _LEGACY_INVOKER_FACTORIES[name](GB)
+                legacy_invokers[name] = _LEGACY_INVOKER_FACTORIES[name](GB)
+            else:
+                operation = self._registry.get(name)
+                specs.append(OperationSpec(name=name, operation=operation, weight=1.0))
+                legacy_invokers[name] = _generic_apply_invoker(operation)
 
         return run_legacy_compat_operation(
             specs,

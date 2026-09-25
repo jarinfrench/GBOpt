@@ -7,7 +7,7 @@ import inspect
 import math
 import uuid
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from numbers import Integral, Real
 from pathlib import Path
 from time import time
@@ -58,7 +58,14 @@ from GBOpt.GBManipulator import (
     GBManipulatorError,
     ParentError,
 )
-from GBOpt.manipulation import SliceAndMerge
+from GBOpt.manipulation import (
+    Manipulation,
+    ManipulationContext,
+    ManipulationLookupError,
+    ManipulationRegistry,
+    SliceAndMerge,
+    default_registry,
+)
 from GBOpt.optimization.checkpointing import (
     _artifact_archive_root,
     _cleanup_committed_artifacts,
@@ -117,6 +124,8 @@ class GeneticAlgorithmMinimizer:
         crossover_surface: str = "periodic_wave",
         crossover_max_tilt_degrees: float = 5.0,
         crossover_attempts: int = 8,
+        binary_operations: Sequence[str] = (),
+        registry: ManipulationRegistry | None = None,
         retention_policy: ArtifactRetentionPolicy | None = None,
         calculation_context: Mapping[str, object] | None = None,
         failure_diagnostic_count: int = 3,
@@ -129,7 +138,8 @@ class GeneticAlgorithmMinimizer:
         :param gb_energy_func: Function that returns the energy of a GB structure. It
             must be callable with (GBMaker, GBManipulator, atom_positions, unique_id).
         :param choices: List of strings corresponding to GBManipulator operations. Used
-            to configure the Mutator.
+            to configure the Mutator. Any name that is not one of the three legacy
+            operation names is resolved by lookup in ``registry``.
         :param seed: Seed for numpy.random.default_rng. Keyword argument, optional,
             defaults to ``None``; ``None`` seeds from the current time.
         :param initial_structure: Keyword argument, optional, defaults to ``None``.
@@ -172,6 +182,15 @@ class GeneticAlgorithmMinimizer:
         :param crossover_attempts: Keyword argument, optional, defaults to ``8``.
             Maximum parent-pair attempts before one crossover slot falls back to
             mutation.
+        :param binary_operations: Keyword argument, optional, defaults to ``()``.
+            Additional two-parent operation names, resolved by lookup in ``registry``,
+            added to the crossover pool alongside the always-present
+            ``slice_and_merge``. Empty by default, matching pre-OperationSpec behavior
+            exactly.
+        :param registry: Keyword argument, optional, defaults to ``None``. Registry used
+            to resolve any ``choices``/``binary_operations`` name that is not one of the
+            three legacy unary names; ``None`` uses
+            ``GBOpt.manipulation.default_registry``.
         :param retention_policy: Keyword argument, optional, defaults to ``None``.
             Scientific artifact-retention policy for explicit-ownership GA execution.
             ``None`` preserves keep-all artifact behavior.
@@ -352,7 +371,8 @@ class GeneticAlgorithmMinimizer:
         self.composition_policy: tuple[tuple[str, int], ...] = tuple(
             initial_parent.unit_cell.formula_ratio
         )
-        self.mutator: Mutator = Mutator(choices, self.manipulator)
+        self._registry = default_registry if registry is None else registry
+        self.mutator: Mutator = Mutator(choices, self.manipulator, registry=self._registry)
         self.manipulator.rng = self.local_random
         self.population_size: int = population_size
         self.generations: int = generations
@@ -363,6 +383,20 @@ class GeneticAlgorithmMinimizer:
         self.crossover_surface: str = crossover_surface
         self.crossover_max_tilt_degrees: float = float(crossover_max_tilt_degrees)
         self.crossover_attempts: int = int(crossover_attempts)
+        self.binary_operations: tuple[str, ...] = tuple(dict.fromkeys(binary_operations))
+        for name in self.binary_operations:
+            try:
+                operation = self._registry.get(name)
+            except ManipulationLookupError as exc:
+                raise GBMinimizerValueError(
+                    f"Unknown binary_operations entry: {name!r}"
+                ) from exc
+            if operation.arity != 2:
+                raise GBMinimizerValueError(
+                    f"binary_operations entry {name!r} resolves to an operation with "
+                    f"arity {operation.arity}; only two-parent (arity 2) operations "
+                    "are usable as a binary_operations entry"
+                )
         self.GBE_vals: list[list[float]] = []
 
     def _make_initial_manipulator(self) -> GBManipulator:
@@ -416,17 +450,25 @@ class GeneticAlgorithmMinimizer:
     def _binary_operation_specs(self) -> list[OperationSpec]:
         """Return this run's two-parent operation pool, weighted for selection.
 
-        Only ``slice_and_merge`` is configurable through the legacy
+        ``slice_and_merge`` is always present, configurable through the legacy
         ``slice_and_merge_pct``/``crossover_surface``/``crossover_max_tilt_degrees``
-        constructor arguments today, so this pool always has exactly one member; the
-        generic weighted-selection machinery (``GBOpt.optimization.dispatch``) still
-        runs over it, which is a documented no-op on RNG state for a single-member pool.
+        constructor arguments; any ``binary_operations`` entries are additional pool
+        members, resolved by registry lookup. With no ``binary_operations`` (the
+        default), this pool always has exactly one member, and the generic
+        weighted-selection machinery (``GBOpt.optimization.dispatch``) still runs over
+        it, which is a documented no-op on RNG state for a single-member pool.
 
-        :return: One-element list containing the ``slice_and_merge`` spec.
+        :return: The ``slice_and_merge`` spec, followed by any configured
+            ``binary_operations`` specs.
         """
-        return [
+        specs = [
             OperationSpec(name="slice_and_merge", operation=SliceAndMerge(), weight=1.0)
         ]
+        for name in self.binary_operations:
+            specs.append(
+                OperationSpec(name=name, operation=self._registry.get(name), weight=1.0)
+            )
+        return specs
 
     def _owned_slice_and_merge_invoker(self):
         """Return a legacy binary invoker producing an owned-mode manipulator."""
@@ -457,6 +499,72 @@ class GeneticAlgorithmMinimizer:
                 max_tilt_degrees=self.crossover_max_tilt_degrees,
             )
             return "slice_and_merge", new_manipulator, new_structure
+
+        return _invoke
+
+    def _run_generic_binary_operation(
+        self, operation: Manipulation, candidate1, candidate2, rng
+    ) -> tuple[str, GBManipulator, np.ndarray]:
+        """Run a registry-resolved two-parent operation through ``ManipulationContext``.
+
+        Shared by the owned and legacy binary invokers below; only how each builds its
+        two ``InterfaceCandidate`` parents differs. Has no legacy tolerance to preserve
+        (this seam only ever runs a ``binary_operations`` entry, never
+        ``slice_and_merge``), so the stricter, uniform ``ManipulationContext`` boundary
+        is safe here, matching the unary registry-resolved case in
+        ``GBOpt.optimization.mutation``.
+
+        :param operation: Two-parent operation to run.
+        :param candidate1: First parent candidate.
+        :param candidate2: Second parent candidate.
+        :param rng: Random-number generator to draw from.
+        :return: The operation's name, a manipulator wrapping its single output child,
+            and that child's atom positions.
+        :raises GBMinimizerValueError: If the operation produces other than one child.
+        """
+        context = ManipulationContext(
+            parents=(candidate1, candidate2), rng=rng, params={}
+        )
+        result = operation.execute(context)
+        if len(result.children) != 1:
+            raise GBMinimizerValueError(
+                f"operation {operation.name!r} produced {len(result.children)} "
+                "children; GA dispatch requires exactly one"
+            )
+        (child,) = result.children
+        new_manipulator = GBManipulator._from_interface_candidate(
+            child,
+            unit_cell=self.GB.unit_cell,
+            gb_thickness=self.GB.gb_thickness,
+            rng=rng,
+        )
+        return operation.name, new_manipulator, np.array(child.atoms, copy=True)
+
+    def _owned_generic_binary_invoker(self, operation: Manipulation):
+        """Return a binary invoker running ``operation`` against two ``Parent``s."""
+
+        def _invoke(parent1, parent2, rng):
+            candidate1 = GBManipulator._from_parents(parent1, rng=rng).make_parent_candidate()
+            candidate2 = GBManipulator._from_parents(parent2, rng=rng).make_parent_candidate()
+            return self._run_generic_binary_operation(
+                operation, candidate1, candidate2, rng
+            )
+
+        return _invoke
+
+    def _legacy_generic_binary_invoker(self, operation: Manipulation):
+        """Return a binary invoker running ``operation`` against two parent files."""
+
+        def _invoke(parent1, parent2, rng):
+            candidate1 = GBManipulator(
+                parent1, unit_cell=self.GB.unit_cell, gb_thickness=self.GB.gb_thickness
+            ).make_parent_candidate()
+            candidate2 = GBManipulator(
+                parent2, unit_cell=self.GB.unit_cell, gb_thickness=self.GB.gb_thickness
+            ).make_parent_candidate()
+            return self._run_generic_binary_operation(
+                operation, candidate1, candidate2, rng
+            )
 
         return _invoke
 
@@ -910,6 +1018,10 @@ class GeneticAlgorithmMinimizer:
         legacy_binary_invokers = {
             "slice_and_merge": self._owned_slice_and_merge_invoker(),
         }
+        for name in self.binary_operations:
+            legacy_binary_invokers[name] = self._owned_generic_binary_invoker(
+                self._registry.get(name)
+            )
         for _ in range(n_slice):
             inadmissible_attempts = 0
             record1 = records[intermediate_indices[0]]
@@ -1230,6 +1342,10 @@ class GeneticAlgorithmMinimizer:
         legacy_binary_invokers = {
             "slice_and_merge": self._legacy_slice_and_merge_invoker(),
         }
+        for name in self.binary_operations:
+            legacy_binary_invokers[name] = self._legacy_generic_binary_invoker(
+                self._registry.get(name)
+            )
         for _ in range(N_slice):
             p1 = files[intermediate_indices[0]]
             crossed = False
