@@ -8,7 +8,9 @@ from GBOpt.BoundaryTopology import BoundaryNormalTopology
 from GBOpt.FileGrainOwnership import CandidateFileMapping, GrainOwnershipError
 from GBOpt.optimization.types import (
     GBMinimizerError,
+    GBMinimizerTypeError,
     GBMinimizerValueError,
+    OperationSpec,
     _CachedEvaluation,
     _candidate_mapping_from_state,
     _candidate_mapping_to_state,
@@ -196,3 +198,102 @@ def test_candidate_mapping_from_state_rejects_incomplete_state():
 
     with pytest.raises(GrainOwnershipError, match="incomplete or malformed"):
         _candidate_mapping_from_state(incomplete_state)
+
+
+# --------------------------------------------------------------------------------------
+# OperationSpec
+# --------------------------------------------------------------------------------------
+
+
+class _StubOperation:
+    def __init__(self, *, arity: int = 1, name: str = "stub") -> None:
+        self._arity = arity
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def arity(self) -> int:
+        return self._arity
+
+    def execute(self, context):
+        return None
+
+
+def test_operation_spec_exposes_name_operation_weight_and_arity():
+    operation = _StubOperation(arity=2, name="stub")
+    spec = OperationSpec(name="stub", operation=operation, weight=1.5)
+    assert spec.name == "stub"
+    assert spec.operation is operation
+    assert spec.weight == 1.5
+    assert spec.arity == 2
+
+
+def test_operation_spec_default_param_sampler_returns_no_params():
+    spec = OperationSpec(name="stub", operation=_StubOperation(), weight=1.0)
+    assert dict(spec.param_sampler(np.random.default_rng(0), ())) == {}
+
+
+def test_operation_spec_custom_param_sampler_is_used():
+    def sampler(rng, parents):
+        return {"amount": 3.0}
+
+    spec = OperationSpec(
+        name="stub", operation=_StubOperation(), weight=1.0, param_sampler=sampler
+    )
+    assert dict(spec.param_sampler(np.random.default_rng(0), ())) == {"amount": 3.0}
+
+
+def test_operation_spec_rejects_non_string_name():
+    with pytest.raises(GBMinimizerTypeError):
+        OperationSpec(name=1, operation=_StubOperation(), weight=1.0)
+
+
+def test_operation_spec_rejects_empty_name():
+    with pytest.raises(GBMinimizerValueError):
+        OperationSpec(name="", operation=_StubOperation(), weight=1.0)
+
+
+def test_operation_spec_rejects_operation_missing_the_protocol():
+    with pytest.raises(GBMinimizerTypeError):
+        OperationSpec(name="stub", operation=object(), weight=1.0)
+
+
+def test_operation_spec_rejects_non_positive_arity():
+    with pytest.raises(GBMinimizerValueError):
+        OperationSpec(name="stub", operation=_StubOperation(arity=0), weight=1.0)
+
+
+def test_operation_spec_rejects_boolean_weight():
+    with pytest.raises(GBMinimizerTypeError):
+        OperationSpec(name="stub", operation=_StubOperation(), weight=True)
+
+
+def test_operation_spec_rejects_negative_weight():
+    with pytest.raises(GBMinimizerValueError):
+        OperationSpec(name="stub", operation=_StubOperation(), weight=-1.0)
+
+
+def test_operation_spec_rejects_non_finite_weight():
+    with pytest.raises(GBMinimizerValueError):
+        OperationSpec(name="stub", operation=_StubOperation(), weight=float("inf"))
+
+
+def test_operation_spec_rejects_uncallable_param_sampler():
+    with pytest.raises(GBMinimizerTypeError):
+        OperationSpec(
+            name="stub", operation=_StubOperation(), weight=1.0, param_sampler="nope"
+        )
+
+
+def test_operation_spec_accepts_zero_weight():
+    spec = OperationSpec(name="stub", operation=_StubOperation(), weight=0.0)
+    assert spec.weight == 0.0
+
+
+def test_operation_spec_is_immutable():
+    spec = OperationSpec(name="stub", operation=_StubOperation(), weight=1.0)
+    with pytest.raises(AttributeError):
+        spec.weight = 2.0
