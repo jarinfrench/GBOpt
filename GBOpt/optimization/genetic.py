@@ -55,10 +55,10 @@ from GBOpt.FileGrainOwnership import (
 )
 from GBOpt.GBMaker import GBMakerError
 from GBOpt.GBManipulator import (
-    CompositionAwareCrossoverError,
     GBManipulatorError,
     ParentError,
 )
+from GBOpt.manipulation import SliceAndMerge
 from GBOpt.optimization.checkpointing import (
     _artifact_archive_root,
     _cleanup_committed_artifacts,
@@ -71,11 +71,13 @@ from GBOpt.optimization.checkpointing import (
     _run_artifact_provenance,
     _write_artifact_manifest,
 )
+from GBOpt.optimization.dispatch import run_legacy_compat_binary_operation
 from GBOpt.optimization.mutation import Mutator
 from GBOpt.optimization.types import (
     GBMinimizerError,
     GBMinimizerTypeError,
     GBMinimizerValueError,
+    OperationSpec,
     _CachedEvaluation,
     _candidate_mapping_from_state,
     _candidate_mapping_to_state,
@@ -410,6 +412,53 @@ class GeneticAlgorithmMinimizer:
         manipulator = copy_module.copy(record.manipulator)
         manipulator.rng = self.local_random
         return manipulator
+
+    def _binary_operation_specs(self) -> list[OperationSpec]:
+        """Return this run's two-parent operation pool, weighted for selection.
+
+        Only ``slice_and_merge`` is configurable through the legacy
+        ``slice_and_merge_pct``/``crossover_surface``/``crossover_max_tilt_degrees``
+        constructor arguments today, so this pool always has exactly one member; the
+        generic weighted-selection machinery (``GBOpt.optimization.dispatch``) still
+        runs over it, which is a documented no-op on RNG state for a single-member pool.
+
+        :return: One-element list containing the ``slice_and_merge`` spec.
+        """
+        return [
+            OperationSpec(name="slice_and_merge", operation=SliceAndMerge(), weight=1.0)
+        ]
+
+    def _owned_slice_and_merge_invoker(self):
+        """Return a legacy binary invoker producing an owned-mode manipulator."""
+
+        def _invoke(parent1, parent2, rng):
+            new_manipulator = GBManipulator._from_parents(parent1, parent2, rng=rng)
+            new_structure = new_manipulator.slice_and_merge(
+                surface_mode=self.crossover_surface,
+                max_tilt_degrees=self.crossover_max_tilt_degrees,
+            )
+            return "slice_and_merge", new_manipulator, new_structure
+
+        return _invoke
+
+    def _legacy_slice_and_merge_invoker(self):
+        """Return a legacy binary invoker producing a file-backed manipulator."""
+
+        def _invoke(parent1, parent2, rng):
+            new_manipulator = GBManipulator(
+                parent1,
+                parent2,
+                unit_cell=self.GB.unit_cell,
+                gb_thickness=self.GB.gb_thickness,
+            )
+            new_manipulator.rng = rng
+            new_structure = new_manipulator.slice_and_merge(
+                surface_mode=self.crossover_surface,
+                max_tilt_degrees=self.crossover_max_tilt_degrees,
+            )
+            return "slice_and_merge", new_manipulator, new_structure
+
+        return _invoke
 
     def _run_artifact_provenance(self, action: Callable[[], None]) -> None:
         """Run one non-authoritative provenance write with warning-only failure policy.
@@ -857,8 +906,12 @@ class GeneticAlgorithmMinimizer:
         )
         n_mutate = offspring_count - n_slice
 
+        binary_specs = self._binary_operation_specs()
+        legacy_binary_invokers = {
+            "slice_and_merge": self._owned_slice_and_merge_invoker(),
+        }
         for _ in range(n_slice):
-            failures: list[str] = []
+            inadmissible_attempts = 0
             record1 = records[intermediate_indices[0]]
             crossed = False
             for _attempt in range(self.crossover_attempts):
@@ -872,25 +925,23 @@ class GeneticAlgorithmMinimizer:
                 record2 = records[int(idx_2)]
                 parent1 = self._clone_owned_record(record1).parents[0]
                 parent2 = self._clone_owned_record(record2).parents[0]
-                new_manipulator = GBManipulator._from_parents(
-                    parent1,
-                    parent2,
+                outcome = run_legacy_compat_binary_operation(
+                    binary_specs,
                     rng=self.local_random,
+                    parent1=parent1,
+                    parent2=parent2,
+                    legacy_invokers=legacy_binary_invokers,
                 )
-                try:
-                    new_structure = new_manipulator.slice_and_merge(
-                        surface_mode=self.crossover_surface,
-                        max_tilt_degrees=self.crossover_max_tilt_degrees,
-                    )
-                except CompositionAwareCrossoverError as exc:
-                    failures.append(str(exc))
+                if outcome is None:
+                    inadmissible_attempts += 1
                     continue
+                label, new_manipulator, new_structure = outcome
                 provenance = dict(new_manipulator.last_crossover_provenance or ())
                 manipulators.append(new_manipulator)
                 candidates.append(new_structure)
                 lineages.append(
                     [
-                        "slice_and_merge",
+                        label,
                         str(record1.structure_path),
                         str(record2.structure_path),
                         repr(provenance),
@@ -912,7 +963,7 @@ class GeneticAlgorithmMinimizer:
                 [
                     "crossover_fallback_" + mutation,
                     str(record1.structure_path),
-                    f"{len(failures)} inadmissible crossover attempts",
+                    f"{inadmissible_attempts} inadmissible crossover attempts",
                 ]
             )
 
@@ -1175,6 +1226,10 @@ class GeneticAlgorithmMinimizer:
         N_mutate = offspring_count - N_slice
 
         # Slice & merge
+        binary_specs = self._binary_operation_specs()
+        legacy_binary_invokers = {
+            "slice_and_merge": self._legacy_slice_and_merge_invoker(),
+        }
         for _ in range(N_slice):
             p1 = files[intermediate_indices[0]]
             crossed = False
@@ -1186,25 +1241,21 @@ class GeneticAlgorithmMinimizer:
                     replace=replace,
                 )
                 p1, p2 = files[int(idx_1)], files[int(idx_2)]
-                new_manip = GBManipulator(
-                    p1,
-                    p2,
-                    unit_cell=self.GB.unit_cell,
-                    gb_thickness=self.GB.gb_thickness,
+                outcome = run_legacy_compat_binary_operation(
+                    binary_specs,
+                    rng=self.local_random,
+                    parent1=p1,
+                    parent2=p2,
+                    legacy_invokers=legacy_binary_invokers,
                 )
-                new_manip.rng = self.local_random
-                try:
-                    new_struct = new_manip.slice_and_merge(
-                        surface_mode=self.crossover_surface,
-                        max_tilt_degrees=self.crossover_max_tilt_degrees,
-                    )
-                except CompositionAwareCrossoverError:
+                if outcome is None:
                     continue
+                label, new_manip, new_struct = outcome
                 candidates.append(new_struct)
                 manipulators.append(new_manip)
                 lineages.append(
                     [
-                        "slice_and_merge",
+                        label,
                         p1,
                         p2,
                         repr(dict(new_manip.last_crossover_provenance or ())),
