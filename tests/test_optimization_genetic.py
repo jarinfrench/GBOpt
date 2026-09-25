@@ -23,7 +23,7 @@ from GBOpt.GrainOwnership import (
     GrainOwnership,
 )
 from GBOpt.manipulation import ManipulationRegistry, ManipulationResult
-from GBOpt.optimization.genetic import GeneticAlgorithmMinimizer
+from GBOpt.optimization.genetic import ENERGY_PENALTY, GeneticAlgorithmMinimizer
 from GBOpt.optimization.types import (
     GBMinimizerError,
     GBMinimizerTypeError,
@@ -298,6 +298,59 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         iter1_path = CandidateCheckpoint._derive_path(cp, 1)
         self.assertFalse(iter0_path.exists())
         self.assertFalse(iter1_path.exists())
+
+    def test_batch_evaluator_exception_penalizes_pending_candidates_without_crashing(
+        self,
+    ):
+        # Unlike the scalar gb_energy_func path, the legacy batch callback call
+        # previously had no recovery boundary at all: an exception here used to
+        # propagate and abort the whole generation. It now penalizes only the
+        # pending candidates in that batch, matching the scalar path's existing
+        # behavior and the owned-mode batch path's own established recovery
+        # boundary.
+        def raising_batch_func(GB, manips, structs, lineages, uids, **kwargs):
+            raise RuntimeError("calculator service unavailable")
+
+        minimizer = self._make_minimizer(generations=1, batch_func=raising_batch_func)
+        energies, files, manipulators = minimizer._evaluate_generation(
+            population_manipulators=[None] * minimizer.population_size,
+            population_structures=[None] * minimizer.population_size,
+            population_lineages=[["START", None]] * minimizer.population_size,
+            gen=0,
+            unique_id=99,
+        )
+
+        self.assertEqual(energies, [ENERGY_PENALTY] * minimizer.population_size)
+        self.assertEqual(files, [None] * minimizer.population_size)
+        self.assertEqual(manipulators, [None] * minimizer.population_size)
+
+    def test_batch_evaluator_exception_with_checkpoint_penalizes_and_records(self):
+        cp = Path(self.tmpdir.name) / "ga_batch_exc.json"
+
+        def raising_batch_func(GB, manips, structs, lineages, uids, **kwargs):
+            raise RuntimeError("calculator service unavailable")
+
+        minimizer = self._make_minimizer(generations=1, batch_func=raising_batch_func)
+        unique_ids = [f"GA_99_g0_c{i}" for i in range(minimizer.population_size)]
+        gen_checkpoint = CandidateCheckpoint.new_or_resume(cp, "json", 0, unique_ids)
+        energies, files, manipulators = minimizer._evaluate_generation(
+            population_manipulators=[None] * minimizer.population_size,
+            population_structures=[None] * minimizer.population_size,
+            population_lineages=[["START", None]] * minimizer.population_size,
+            gen=0,
+            unique_id=99,
+            gen_checkpoint=gen_checkpoint,
+        )
+
+        self.assertEqual(energies, [ENERGY_PENALTY] * minimizer.population_size)
+        self.assertEqual(files, [None] * minimizer.population_size)
+        self.assertEqual(manipulators, [None] * minimizer.population_size)
+        for i in range(minimizer.population_size):
+            uid = f"GA_99_g0_c{i}"
+            self.assertTrue(gen_checkpoint.is_done(uid))
+            recorded_energy, recorded_dump = gen_checkpoint.get_result(uid)
+            self.assertEqual(recorded_energy, ENERGY_PENALTY)
+            self.assertIsNone(recorded_dump)
 
     def test_gbe_vals_not_duplicated_after_intra_gen_resume(self):
         cp = Path(self.tmpdir.name) / "ga_nodup.json"

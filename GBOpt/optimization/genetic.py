@@ -48,7 +48,14 @@ from GBOpt.Checkpoint import (
     CheckpointStore,
     _wrap_batch_func_with_checkpoint,
 )
-from GBOpt.evaluation import from_candidate_evaluation
+from GBOpt.evaluation import (
+    EvaluationResult,
+    EvaluationStatus,
+    FailureStage,
+    from_batch_dict,
+    from_candidate_evaluation,
+    from_scalar_tuple,
+)
 from GBOpt.FileGrainOwnership import (
     CandidateFileMapping,
     GrainOwnership,
@@ -1128,12 +1135,20 @@ class GeneticAlgorithmMinimizer:
     ) -> tuple[list[float], list[str | None], list[GBManipulator | None]]:
         """Evaluate all candidates, optionally using a batch energy function.
 
+        Each candidate's raw callback result is classified through the same
+        ``EvaluationResult`` contract regardless of source (fresh callback, batch
+        callback, checkpoint restore, or carryover cache), so a candidate always
+        penalizes to ``ENERGY_PENALTY`` on a missing/non-finite energy or a missing
+        structure path, not just on an outright callback exception.
+
         :param gen_checkpoint: If provided, already-evaluated candidates are skipped and
             new results are recorded after each evaluation.
         :param cached_evaluations: Successful results aligned to unchanged carryover
             candidates. ``None`` entries are evaluated normally.
         :return: Aligned energies, evaluator artifact paths, and manipulators.
         :raises ValueError: If cached results are not population-aligned.
+        :raises EvaluationTypeError: If a callback result is not the documented tuple
+            or dictionary shape.
         """
 
         population_length = len(population_structures)
@@ -1151,6 +1166,11 @@ class GeneticAlgorithmMinimizer:
             batch_results: list[dict[str, object] | None] = [
                 None
             ] * population_length
+            # Indices whose batch call itself raised: from_batch_dict cannot see a
+            # raw dict for these, so their EvaluationResult is built directly with
+            # FailureStage.EVALUATOR rather than reclassified from a penalty-shaped
+            # placeholder dict (which would misattribute them to FailureStage.ARTIFACT).
+            callback_exception_indices: dict[int, str] = {}
             pending = []
             for index, uid in enumerate(all_uids):
                 cached = cached_evaluations[index]
@@ -1169,22 +1189,44 @@ class GeneticAlgorithmMinimizer:
                     pending_idxs, pending_uids = zip(*pending)
                     pending_idxs = list(pending_idxs)
                     pending_uids = list(pending_uids)
-                    new_results = self.gb_batch_energy_func(
-                        self.GB,
-                        [population_manipulators[i] for i in pending_idxs],
-                        [population_structures[i] for i in pending_idxs],
-                        [population_lineages[i] for i in pending_idxs],
-                        pending_uids,
-                        checkpoint=gen_checkpoint,
-                    )
-                    # Record any results the batch func did not record itself
-                    for uid, result in zip(pending_uids, new_results):
-                        if not gen_checkpoint.is_done(uid):
-                            gen_checkpoint.record(
-                                uid,
-                                float(result.get("energy", ENERGY_PENALTY)),
-                                result.get("final_dump", None),
-                            )
+                    try:
+                        new_results = self.gb_batch_energy_func(
+                            self.GB,
+                            [population_manipulators[i] for i in pending_idxs],
+                            [population_structures[i] for i in pending_idxs],
+                            [population_lineages[i] for i in pending_idxs],
+                            pending_uids,
+                            checkpoint=gen_checkpoint,
+                        )
+                    except Exception as exc:
+                        # The external batch evaluator callback is a deliberate
+                        # recovery boundary: any failure here penalizes only the
+                        # pending candidates in this batch rather than aborting
+                        # the generation.
+                        logger.warning(
+                            "gb_batch_energy_func failed for candidates %r: %s: %s",
+                            pending_uids,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        message = f"{type(exc).__name__}: {exc}"
+                        for index, uid in zip(pending_idxs, pending_uids):
+                            callback_exception_indices[index] = message
+                            batch_results[index] = {
+                                "energy": ENERGY_PENALTY,
+                                "final_dump": None,
+                            }
+                            if not gen_checkpoint.is_done(uid):
+                                gen_checkpoint.record(uid, ENERGY_PENALTY, None)
+                    else:
+                        # Record any results the batch func did not record itself
+                        for uid, result in zip(pending_uids, new_results):
+                            if not gen_checkpoint.is_done(uid):
+                                gen_checkpoint.record(
+                                    uid,
+                                    float(result.get("energy", ENERGY_PENALTY)),
+                                    result.get("final_dump", None),
+                                )
                 for index, uid in enumerate(all_uids):
                     if batch_results[index] is not None:
                         continue
@@ -1196,30 +1238,63 @@ class GeneticAlgorithmMinimizer:
             else:
                 if pending:
                     pending_idxs, pending_uids = zip(*pending)
-                    raw_results = self.gb_batch_energy_func(
-                        self.GB,
-                        [population_manipulators[i] for i in pending_idxs],
-                        [population_structures[i] for i in pending_idxs],
-                        [population_lineages[i] for i in pending_idxs],
-                        list(pending_uids),
-                    )
-                    for index, result in zip(
-                        pending_idxs,
-                        raw_results,
-                        strict=True,
-                    ):
-                        batch_results[index] = result
+                    try:
+                        raw_results = self.gb_batch_energy_func(
+                            self.GB,
+                            [population_manipulators[i] for i in pending_idxs],
+                            [population_structures[i] for i in pending_idxs],
+                            [population_lineages[i] for i in pending_idxs],
+                            list(pending_uids),
+                        )
+                    except Exception as exc:
+                        # The external batch evaluator callback is a deliberate
+                        # recovery boundary: any failure here penalizes only the
+                        # pending candidates in this batch rather than aborting
+                        # the generation.
+                        logger.warning(
+                            "gb_batch_energy_func failed for candidates %r: %s: %s",
+                            pending_uids,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        message = f"{type(exc).__name__}: {exc}"
+                        for index in pending_idxs:
+                            callback_exception_indices[index] = message
+                            batch_results[index] = {
+                                "energy": ENERGY_PENALTY,
+                                "final_dump": None,
+                            }
+                    else:
+                        for index, result in zip(
+                            pending_idxs,
+                            raw_results,
+                            strict=True,
+                        ):
+                            batch_results[index] = result
 
             gen_energies = []
             gen_files = []
             evaluated_manipulators = []
-            for result in batch_results:
-                if result is None:
+            for index, raw_result in enumerate(batch_results):
+                if raw_result is None:
                     raise RuntimeError("batch evaluation lost candidate alignment")
-                energy = float(result.get("energy", ENERGY_PENALTY))
-                dump = result.get("final_dump", None)
+                uid = all_uids[index]
+                if index in callback_exception_indices:
+                    result = EvaluationResult(
+                        candidate_id=uid,
+                        input_index=index,
+                        status=EvaluationStatus.FAILED,
+                        selection_energy=ENERGY_PENALTY,
+                        failure_stage=FailureStage.EVALUATOR,
+                        failure_message=callback_exception_indices[index],
+                    )
+                else:
+                    result = from_batch_dict(
+                        uid, index, raw_result, penalty=ENERGY_PENALTY
+                    )
+                gen_energies.append(result.selection_energy)
+                dump = result.artifact.path if result.artifact is not None else None
 
-                gen_energies.append(energy)
                 if self._is_valid_file(dump):
                     gen_files.append(dump)
                     try:
@@ -1255,10 +1330,17 @@ class GeneticAlgorithmMinimizer:
             uid = all_uids[idx]
             cached = cached_evaluations[idx]
             if cached is not None and self._is_valid_file(cached.structure_path):
-                gbe = cached.energy
-                dump_file_name = cached.structure_path
+                result = from_scalar_tuple(
+                    uid,
+                    idx,
+                    (cached.energy, cached.structure_path),
+                    penalty=ENERGY_PENALTY,
+                )
             elif gen_checkpoint is not None and gen_checkpoint.is_done(uid):
                 gbe, dump_file_name = gen_checkpoint.get_result(uid)
+                result = from_scalar_tuple(
+                    uid, idx, (gbe, dump_file_name), penalty=ENERGY_PENALTY
+                )
             else:
                 try:
                     gbe, dump_file_name = self.gb_energy_func(
@@ -1274,10 +1356,25 @@ class GeneticAlgorithmMinimizer:
                         exc,
                     )
                     gbe, dump_file_name = ENERGY_PENALTY, None
+                    result = EvaluationResult(
+                        candidate_id=uid,
+                        input_index=idx,
+                        status=EvaluationStatus.FAILED,
+                        selection_energy=ENERGY_PENALTY,
+                        failure_stage=FailureStage.EVALUATOR,
+                        failure_message=f"{type(exc).__name__}: {exc}",
+                    )
+                else:
+                    result = from_scalar_tuple(
+                        uid, idx, (gbe, dump_file_name), penalty=ENERGY_PENALTY
+                    )
                 if gen_checkpoint is not None:
                     gen_checkpoint.record(uid, gbe, dump_file_name)
 
-            gen_energies.append(float(gbe))
+            gen_energies.append(result.selection_energy)
+            dump_file_name = (
+                result.artifact.path if result.artifact is not None else None
+            )
             if self._is_valid_file(dump_file_name):
                 gen_files.append(dump_file_name)
                 try:

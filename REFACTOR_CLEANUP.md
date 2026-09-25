@@ -1,5 +1,57 @@
 # Refactor cleanup backlog
 
+## R23's legacy GA scalar/batch path adds a batch-callback recovery boundary that did not exist before, and does not route reconstruction through `CandidateLoader`
+
+Issue #83 requires "every MC/GA evaluation produces an `EvaluationResult`" and asks to
+"route all scalar/batch callbacks through R22 adapters and reconstruct returned
+structures through R14 `CandidateLoader`." `GeneticAlgorithmMinimizer._evaluate_generation`
+(the legacy, non-owned path) now classifies every candidate's raw callback result
+through `from_scalar_tuple`/`from_batch_dict` regardless of source (fresh callback,
+batch callback, checkpoint restore, or carryover cache), so `gen_energies` is always
+`result.selection_energy` and reconstruction always reads `result.artifact.path`.
+
+Two disclosed, deliberate deviations from a fully literal reading:
+
+1. **The batch callback call itself (`self.gb_batch_energy_func(...)`) previously had
+   no recovery boundary at all** -- only the scalar callback and both reconstruction
+   points did (matching this file's/CLAUDE.md's own documented count of exactly three
+   `except Exception` boundaries in this method before R23). An exception from
+   `gb_batch_energy_func` used to propagate and abort the whole generation. It now
+   penalizes only the pending candidates in that batch (`FailureStage.EVALUATOR`,
+   `ENERGY_PENALTY`), at both of the method's two batch-call sites (checkpoint-enabled
+   and not), matching the scalar callback's existing behavior and
+   `ExplicitOwnershipEvaluator.evaluate_generation`'s own established batch-exception
+   handling. This is a real, intentional behavior change (a previously-crashing run now
+   degrades gracefully), required by "every MC/GA evaluation produces an
+   `EvaluationResult`" and "evaluator exceptions... retain typed failure provenance"
+   taken literally -- pinned by
+   `test_batch_evaluator_exception_penalizes_pending_candidates_without_crashing`/
+   `..._with_checkpoint_penalizes_and_records` in `tests/test_optimization_genetic.py`.
+2. **Reconstruction (`_make_manipulator_from_file`) does not route through
+   `CandidateLoader`.** `CandidateLoader.reload()` unconditionally requires a
+   `CandidateFileMapping` (persistent grain-ownership state); the legacy path has none
+   -- `_make_manipulator_from_file` itself asserts `self.initial_ownership is None` as a
+   precondition. This is the same "share the pure computation, not the value-typed
+   boundary" fork this file already documents for R16's `translate_right_grain` (a
+   value type's constructor invariant is unconditional, with no bypass for a caller that
+   genuinely lacks the state it requires): the owned-mode path already goes through
+   `CandidateLoader` (via `reload_explicit_manipulator`, confirmed unchanged and
+   already-resolved at R14); the legacy path's reconstruction stays a bare
+   `GBManipulator(filename, ...)` construction, now just fed by the classified
+   `EvaluationResult.artifact.path` instead of a raw dict/tuple value.
+
+Also disclosed as a side effect, not a separate design choice: routing through
+`from_scalar_tuple`/`from_batch_dict` is strictly more defensive than the code it
+replaced, which did `float(gbe)` unconditionally (crashing on a non-numeric value) and
+never checked for a non-finite energy at all (a NaN would previously flow silently into
+`gen_energies` and selection comparisons). Both cases are now classified as an ordinary
+`FailureStage.VALIDATION` failure with `ENERGY_PENALTY`, matching R12's own precedent for
+routing existing code through a newer, already-validating value type.
+
+**Resolve at**: no action needed unless a later step wants legacy-mode reconstruction to
+carry real ownership state (at which point routing through `CandidateLoader` becomes
+possible, not just desirable).
+
 ## R23's owned-GA selection reads `EvaluationResult.selection_energy` at the comparison sites only, not by migrating `CandidateEvaluation` out of GA's owned-mode bookkeeping
 
 Issue #83 requires "every MC/GA evaluation produces an `EvaluationResult`" and "GA
