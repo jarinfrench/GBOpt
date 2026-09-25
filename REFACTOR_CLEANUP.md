@@ -1,5 +1,36 @@
 # Refactor cleanup backlog
 
+## R23 net tooling deltas: ruff +4 (disclosed reproduced-pattern debt from new recovery boundaries), mypy net -2, bandit unchanged, pyscn unchanged (41 quality issues, 46 clone pairs)
+
+Baseline taken at the R23 branch point (`d7b15c1`, R22 merged with R14): ruff 179,
+mypy 300 errors in 32 files, bandit 7 Low + 1 Medium, pyscn 41 quality issues / 46
+clone pairs. Current (after all four R23 commits): ruff 183, mypy 298 errors in 32
+files, bandit unchanged, pyscn unchanged.
+
+The ruff +4 is fully accounted for by two files, both from the same deliberate
+pattern this file already documents at length (the new batch-callback and
+MC-proposal recovery boundaries): `genetic.py` +3 (2 new `BLE001`, 1 new `B905`,
+from the two new `except Exception` blocks wrapping `gb_batch_energy_func` and the
+`zip(pending_idxs, pending_uids)` pairing inside one of them) and `monte_carlo.py`
++1 (1 new `BLE001`, from the new proposal-evaluation `except Exception` block; the
+initial-evaluation one does not trip `BLE001` since it re-raises as `GBMinimizerError`
+rather than swallowing). Per this file's own established discipline, these are not
+narrowed -- `BLE001` is not automatically safe to narrow, and this codebase has a
+deliberate, already-documented precedent for exactly this evaluator/reconstruction-
+boundary shape. (An earlier commit message in this same step, "R23: legacy GA
+scalar/batch path routes through EvaluationResult," inaccurately reported "ruff...
+net 0" -- it verified the *test file's* ruff delta after fixing an unrelated `RUF059`
+finding but never re-checked `genetic.py` itself for the +3 shown here; this entry is
+the corrected, full account.)
+
+The mypy net -2 is `genetic.py`'s only mypy change, already explained in the "legacy
+GA scalar/batch path" entry below (`StructureArtifact.path`'s concrete `str` typing
+replacing a `dict.get()`-inferred `object` in the batch branch removes 3 findings
+whose argument-type errors no longer apply; one unrelated finding shape persists at a
+shifted line, netting -2 once line-shift noise is excluded).
+
+**Resolve at**: no action needed.
+
 ## R23 gives MC's evaluator calls the recovery boundary they never had, resolving R21's documented MC/GA asymmetry
 
 R21's `CLAUDE.md` entry (docstring-parity/asymmetry) documented that GA's evaluator
