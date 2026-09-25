@@ -1,5 +1,144 @@
 # Refactor cleanup backlog
 
+## R24 net tooling deltas: ruff +6 (disclosed established-convention debt in the new package), mypy +15 (one disclosed root cause), bandit unchanged, pyscn unchanged (41 quality issues, +1 disclosed clone pair)
+
+Baseline taken at the R24 branch point (`d2c95ba`, tip of `refactor/r23-mc-ga-
+evaluation`): ruff 183 repo-wide; mypy `GBOpt/optimization` 273 errors in 31 files;
+bandit 7 Low + 1 Medium; pyscn 41 quality issues / 46 clone pairs. Current (after both
+R24 commits): ruff 189, mypy `GBOpt/optimization` 288 errors in 31 files (`GBOpt/
+observability` itself: 0), bandit unchanged, pyscn unchanged at 41 quality issues / 47
+clone pairs.
+
+ruff +6 is entirely the new `GBOpt/observability/__init__.py`/`sinks.py`/`types.py`
+reproducing this codebase's own established conventions at new call sites (3 `RUF022`
+on grouped-not-alphabetized `__all__`, matching every other subpackage's `__init__.py`;
+3 `UP042` on `(str, Enum)`, matching `EvaluationStatus`/`FailureStage`/
+`BoundaryNormalTopology`/`ArtifactPin`) -- not new-shape debt. `monte_carlo.py`/
+`genetic.py` are both net 0 (identical rule/message sets, only line numbers shifted).
+
+mypy +15 (7 in `monte_carlo.py`, 8 in `genetic.py`) is one single root cause in both
+files: `_emit()`'s `**fields: object` spread into `OptimizationEvent`'s individually-
+typed keyword parameters. `**fields: object` is left as-is -- it is honestly typed (the
+values really do vary in type by call site, and `_emit` is a private dispatch helper,
+not a public contract mypy could usefully narrow) -- per this file's own "leave it typed
+honestly and let mypy report the finding" mypy-debugging discipline, rather than
+restructured into a `TypedDict`/`Unpack` scheme purely to appease the checker. `genetic.py`'s
++8 additionally includes one `[no-redef]` finding (a new `results` local declared in
+both of `_evaluate_generation`'s existing two branches) reproducing that method's own
+pre-existing "Name already defined" pattern verbatim (already present for
+`gen_energies`/`gen_files`/`evaluated_manipulators` before R24). `GBOpt/observability`
+itself carries 0 new-shape findings on any of its own paths.
+
+bandit: unchanged (7 Low, 1 Medium, 0 High) -- the new package and both wired
+minimizers introduce no subprocess/eval/pickle-shaped code for bandit to flag.
+
+pyscn: 41 quality issues both before and after (`monte_carlo.py`/`genetic.py` each grew
+in SLOC/complexity from the added straight-line `_emit()` calls and, in `genetic.py`'s
+case, one new selection-membership branch per accept/reject decision, but neither
+crossed either gate's threshold for the first time -- all four affected methods
+(`run_MC`, `run_GA`, `_run_owned_GA`, `_evaluate_generation`) were already well over
+both the complexity and SLOC gates before R24, so no decomposition pass was undertaken
+for that pre-existing, out-of-scope debt). Clone pairs: 46 -> 47 (+1, informational
+only) -- `MonteCarloMinimizer._emit`/`GeneticAlgorithmMinimizer._emit` are a genuine,
+disclosed near-duplicate (identical shape and docstring, differing only in the log
+message's "MC step"/"GA generation" wording), matching this codebase's existing,
+un-refactored parallel-duplication convention between the two minimizer classes (which
+already had its own pre-existing clone pair, e.g. their respective
+`_make_initial_manipulator` methods) rather than introducing a shared base class or
+mixin neither class currently has.
+
+**Resolve at**: no action needed.
+
+## R24's event `operation_parameters` is always `None` -- no call site retains a `ManipulationResult` to source it from
+
+Issue #84's "candidate/evaluation/operation fields come from authoritative `EvaluationResult`
+and `ManipulationResult` data" is satisfiable for candidate/evaluation fields (every event is
+built from `evaluation_event_fields()`, itself sourced directly from an `EvaluationResult`/
+`CandidateEvaluation`), but not literally for `operation_parameters` today. Auditing every MC/GA
+dispatch path that could produce one: `Mutator.mutate()` (legacy `choices` adapter, both the
+three-legacy-name table and the registry-resolved generic path) returns only
+`(label: str, atoms: np.ndarray)`; `GeneticAlgorithmMinimizer`'s binary/crossover invokers
+(`_owned_slice_and_merge_invoker`/`_legacy_slice_and_merge_invoker`/`_run_generic_binary_operation`)
+return only `(label, manipulator, atoms)`. Every one of these discards the real
+`ManipulationResult` (`result.parameters`/`.lineage`) `operation.execute(context)`/
+`manipulator.apply(operation)` actually produced, keeping only the label string --
+`GBOpt.optimization.dispatch`'s own established `(manipulator, rng) -> (label, atoms)` /
+`(parent1, parent2, rng) -> (label, manipulator, atoms)` return shapes predate R24 and are used
+by other callers too, so R24 does not change them. `OptimizationEvent.operation_name` is
+therefore sourced from this same label (whatever `Mutator.mutate()`/the binary invokers already
+return -- the mutation-dispatch label for the three legacy unary operations, or
+`operation.name` for a registry-resolved one), the only operation-identity data actually
+reaching MC/GA's own loops; `operation_parameters` has no authoritative source to draw from and
+is left `None` everywhere, rather than fabricated from label-string parsing.
+
+**Resolve at**: no action needed unless a later step changes `Mutator.mutate()`'s (or the binary
+invokers') return contract to also surface the `ManipulationResult` itself, at which point
+`operation_parameters` can be populated from its `.parameters` mapping the same way
+`evaluation_event_fields()` already sources candidate/evaluation fields from `EvaluationResult`.
+
+## R24's GA accept/reject events map to next-generation selection, not a Metropolis-style decision
+
+Issue #84 asks for "accept/reject" as one of MC and GA's shared lifecycle events, modeled on
+Monte Carlo's own single-current-state Metropolis criterion. The genetic algorithm has no
+equivalent concept -- every evaluated population member is either carried over unchanged
+(`keep_top_pct`), used as a crossover/mutation parent (`intermediate_pct`), or dropped, with no
+notion of "the current state." `GeneticAlgorithmMinimizer._emit()`'s `CANDIDATE_ACCEPTED`/
+`CANDIDATE_REJECTED` calls (both `run_GA`'s legacy path and `_run_owned_GA`) therefore mean
+"this candidate's structure survives into the next generation's population" (selected via
+`_select_indices_by_energy`'s `lowest_indices`/`intermediate_indices`, or -- for the legacy path
+only -- also carried indirectly by contributing offspring through `_make_next_generation`) versus
+"this candidate contributes nothing to the next generation" (a failed evaluation, or a
+successful one outside the selected/bred set). This is disclosed on
+`OptimizationEventType`'s own docstring in `GBOpt/observability/types.py` as the authoritative
+definition; this entry exists so the interpretive fork itself -- not just its resolution -- is
+on record.
+
+**Resolve at**: no action needed; revisit only if a future step wants MC- and GA-comparable
+accept/reject semantics badly enough to redefine one of the two algorithms' own established
+selection/acceptance policy, which is out of scope for an event-vocabulary step.
+
+## R24 legacy `run_GA`'s initial evaluation gains a try/except purely to emit `RUN_FAILED`, not a recovery boundary
+
+Unlike `MonteCarloMinimizer.run_MC`'s initial evaluation and `_run_owned_GA`'s (both of which
+already have some form of failure handling before R24), the legacy `run_GA` path's initial
+`self.gb_energy_func(...)` call had no `try`/`except` at all -- any exception propagated
+directly, uncaught, matching this file's own "GA docstring... is about the public call
+signature, not... failure-handling shape" precedent (R21) that MC/GA's evaluator-boundary code
+is not assumed symmetric without checking. Issue #84 asks only for a `RUN_FAILED` event at this
+point, not a new recovery boundary, so the added `try/except Exception as exc: self._emit(...);
+raise` re-raises the identical original exception unchanged (a bare `raise`, not
+`raise GBMinimizerError(...) from exc`) -- the run still ends exactly as it did before R24,
+just with one more event emitted along the way. Adding real recovery here (penalizing and
+continuing, matching `MonteCarloMinimizer`'s own established pattern) would be a genuine
+behavior change no acceptance criterion asked for.
+
+**Resolve at**: no action needed unless a later step's acceptance criteria require a real
+recovery boundary at legacy `run_GA`'s initial evaluation, the way R23 added one for MC's.
+
+## R24 legacy `_evaluate_generation`'s returned `EvaluationResult` now reflects a candidate-reconstruction failure too
+
+`_evaluate_generation`'s per-candidate `EvaluationResult` was, before R24, constructed and then
+immediately discarded after reading only its `.selection_energy`/`.artifact.path` -- a
+subsequent `_make_manipulator_from_file(dump)` failure (the evaluator's file exists but fails to
+parse/load) was reflected only in the scalar `gen_energies`/`gen_files` outputs (mutated to
+`ENERGY_PENALTY`/`None` in the `except` block), never in the `EvaluationResult` object itself,
+which kept reporting `SUCCESS` with the pre-reconstruction-failure energy. This was invisible
+because nothing outside the function ever read that `EvaluationResult`. R24 changes
+`_evaluate_generation`'s return contract to also surface it (a fourth tuple element, `results:
+list[EvaluationResult]`) so `run_GA` can emit `PROPOSAL_EVALUATED`/accept-reject/best-update
+events from authoritative per-candidate data instead of re-deriving a coarser one from the
+already-penalized scalar outputs -- once external code can actually observe this value, its
+prior inaccuracy on the reconstruction-failure path becomes a real, disclosed defect to fix, not
+just an internal implementation detail. Both the batch and scalar branches now replace `result`
+with a new `EvaluationResult(status=FAILED, failure_stage=FailureStage.ARTIFACT, ...)` in that
+`except` block, matching `FailureStage.ARTIFACT`'s existing R23-established meaning ("a missing/
+invalid/reused structure path" family). This changes nothing about any value the function
+already returned (`gen_energies`/`gen_files`/`evaluated_manipulators` are untouched) -- only the
+newly-added, previously-nonexistent fourth return value's accuracy.
+
+**Resolve at**: no action needed; noted for the record as a disclosed accuracy fix enabled by,
+not required independently of, R24's own return-contract change.
+
 ## R23 net tooling deltas: ruff +4 (disclosed reproduced-pattern debt from new recovery boundaries), mypy net -2, bandit unchanged, pyscn unchanged (41 quality issues, 46 clone pairs)
 
 Baseline taken at the R23 branch point (`d7b15c1`, R22 merged with R14): ruff 179,
