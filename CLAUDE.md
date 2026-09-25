@@ -345,6 +345,22 @@ the issue or step that produced it.
   is configured" (#85's own acceptance criterion) means mechanically: the default stays
   `NullEventSink` because nothing wires `JsonlEventSink` in by default, not because of any
   new guard condition.
+- **A frozen dataclass with an enum or `MappingProxyType` field is not JSON-serializable
+  via `dataclasses.asdict()`/`json.dumps()` without an explicit per-field translation,
+  even when its enums already subclass `str`.** Writing `journal.py`'s
+  `_event_to_json_dict`/`_manifest_to_json_dict`/`_run_to_json_dict`, `json.dumps` turned
+  out to serialize a `(str, Enum)` member (e.g. `OptimizationEventType.RUN_STARTED`)
+  correctly to its bare `.value` string with no help needed -- it *is* a `str` instance at
+  the C level, so the encoder uses its character data directly, not `__str__`'s
+  `"ClassName.MEMBER"` rendering. `MappingProxyType` (`OptimizationEvent.operation_parameters`'s
+  read-only wrapper, from R24) has no such shortcut: `json.dumps` raises `TypeError: Object
+  of type mappingproxy is not JSON serializable` outright, so every mapping field needs an
+  explicit `dict(...)` conversion at the serialization boundary. Verified with a throwaway
+  interpreter check before relying on either behavior rather than assuming from the enum
+  case that the mapping case would also "just work." Any later step serializing an
+  `observability`/`evaluation`/`artifacts` value type to JSON should expect the same split:
+  free for a `str`-subclassing enum, but an explicit conversion for any `Mapping`-typed
+  field that isn't already a plain `dict`.
 - Before opening a PR, run `ruff`, `mypy`, `bandit`, and `pyscn` (see
   "Tooling" below) and report the results.
 - **Never open a PR without being explicitly told to.** The user reviews
