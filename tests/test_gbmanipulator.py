@@ -982,6 +982,69 @@ class TestGBManipulatorApply(unittest.TestCase):
             manipulator.apply_named("missing", registry=registry)
 
 
+class TestGBManipulatorFromInterfaceCandidate(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.seed = 100
+        cls.tilt = _make_exact_gb(
+            1.0,
+            "fcc",
+            "Cu",
+            gb_thickness=10.0,
+            interaction_distance=1.0,
+            repeat_factor=2,
+        )
+
+    def test_round_trips_atoms_geometry_and_ownership(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        candidate = manipulator.make_parent_candidate()
+        rebuilt = GBManipulator._from_interface_candidate(
+            candidate,
+            unit_cell=self.tilt.unit_cell,
+            gb_thickness=self.tilt.gb_thickness,
+        )
+        self.assertIsNone(rebuilt.parents[1])
+        rebuilt_candidate = rebuilt.make_parent_candidate()
+        np.testing.assert_array_equal(rebuilt_candidate.atoms, candidate.atoms)
+        np.testing.assert_allclose(rebuilt_candidate.box_dims, candidate.box_dims)
+        self.assertAlmostEqual(rebuilt_candidate.gb_plane_x, candidate.gb_plane_x)
+        np.testing.assert_allclose(
+            rebuilt_candidate.left_grain_x_bounds, candidate.left_grain_x_bounds
+        )
+        np.testing.assert_allclose(
+            rebuilt_candidate.right_grain_x_bounds, candidate.right_grain_x_bounds
+        )
+        self.assertEqual(rebuilt_candidate.inplane_periodic, candidate.inplane_periodic)
+        self.assertIs(rebuilt_candidate.normal_topology, candidate.normal_topology)
+        np.testing.assert_array_equal(
+            rebuilt_candidate.grain_labels, candidate.grain_labels
+        )
+
+    def test_round_trips_an_operation_output(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        result = manipulator.apply(_EchoManipulation(arity=1))
+        (child,) = result.children
+        rebuilt = GBManipulator._from_interface_candidate(
+            child,
+            unit_cell=self.tilt.unit_cell,
+            gb_thickness=self.tilt.gb_thickness,
+            rng=np.random.default_rng(self.seed),
+        )
+        np.testing.assert_array_equal(rebuilt.make_parent_candidate().atoms, child.atoms)
+
+    def test_attaches_the_given_rng(self):
+        manipulator = GBManipulator(self.tilt, seed=self.seed)
+        candidate = manipulator.make_parent_candidate()
+        rng = np.random.default_rng(7)
+        rebuilt = GBManipulator._from_interface_candidate(
+            candidate,
+            unit_cell=self.tilt.unit_cell,
+            gb_thickness=self.tilt.gb_thickness,
+            rng=rng,
+        )
+        self.assertIs(rebuilt.rng, rng)
+
+
 class TestParent(unittest.TestCase):
     def setUp(self):
         self.unit_cell = UnitCell()

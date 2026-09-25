@@ -436,6 +436,53 @@ class Parent:
         obj.__finish_init()
         return obj
 
+    @classmethod
+    def from_interface_candidate(
+        cls,
+        candidate: InterfaceCandidate,
+        *,
+        unit_cell: UnitCell,
+        gb_thickness: float = 10,
+    ) -> "Parent":
+        """Construct a Parent from a composable manipulation-operation output.
+
+        The inverse of :meth:`_to_interface_candidate`. ``InterfaceCandidate`` carries
+        no unit cell or GB thickness (see ``GBOpt.manipulation``'s own operations, which
+        take both as explicit ``context.params`` for the same reason), so both are
+        required here. Candidate-local atom IDs are synthesized in row order
+        (``GrainOwnership.from_interface_candidate``'s own default), matching the
+        candidate's own row order exactly, so no reordering occurs during ownership
+        alignment.
+
+        :param candidate: Keyword argument, required. Operation output to restore.
+        :param unit_cell: Keyword argument, required. Nominal unit cell of the bulk
+            structure.
+        :param gb_thickness: Keyword argument, optional, defaults to ``10``. Thickness
+            of the GB region, given in angstroms.
+        :return: A fully constructed Parent with persistent explicit ownership restored
+            from the candidate's own labels and geometry.
+        :raises ParentValueError: If ``unit_cell`` is not given.
+        :raises GrainOwnershipError: If the candidate's own geometry is inconsistent.
+        """
+        ownership = GrainOwnership.from_interface_candidate(candidate)
+        box = candidate.box_dims
+        structure = StructureData(
+            atoms=candidate.atoms,
+            cell=np.diag(box[:, 1] - box[:, 0]),
+            origin=box[:, 0].copy(),
+            periodicity=(
+                candidate.normal_topology.periodic_outer_x_interface,
+                *candidate.inplane_periodic,
+            ),
+            external_ids=ownership.atom_ids,
+        )
+        return cls.from_structure(
+            structure,
+            unit_cell=unit_cell,
+            gb_thickness=gb_thickness,
+            grain_ownership=ownership,
+        )
+
     def __finish_init(self) -> None:
         """Derive GB-region membership shared by every construction path.
 
@@ -1038,6 +1085,37 @@ class GBManipulator:
         result.__num_processes = mp.cpu_count() // 2 or 1
         result.__candidate_grain_labels = result.__initial_candidate_labels()
         return result
+
+    @classmethod
+    def _from_interface_candidate(
+        cls,
+        candidate: InterfaceCandidate,
+        *,
+        unit_cell: UnitCell,
+        gb_thickness: float = 10,
+        rng: np.random.Generator | None = None,
+    ) -> "GBManipulator":
+        """Construct a one-parent manipulator from a manipulation-operation output.
+
+        Composes :meth:`Parent.from_interface_candidate` with :meth:`_from_parents`, so
+        a caller holding a ``ManipulationResult`` child (from any ``Manipulation``,
+        built-in or third-party) can continue manipulating it exactly as it would a
+        freshly constructed manipulator.
+
+        :param candidate: Keyword argument, required. Operation output to wrap.
+        :param unit_cell: Keyword argument, required. Nominal unit cell of the bulk
+            structure.
+        :param gb_thickness: Keyword argument, optional, defaults to ``10``. Thickness
+            of the GB region, given in angstroms.
+        :param rng: Keyword argument, optional, defaults to ``None``. Random-number
+            generator to attach to the manipulator.
+        :return: One-parent manipulator wrapping the candidate.
+        :raises GrainOwnershipError: If the candidate's own geometry is inconsistent.
+        """
+        parent = Parent.from_interface_candidate(
+            candidate, unit_cell=unit_cell, gb_thickness=gb_thickness
+        )
+        return cls._from_parents(parent, rng=rng)
 
     def __initial_candidate_labels(self) -> np.ndarray | None:
         """Return labels aligned with the first parent's current row order."""
