@@ -361,6 +361,57 @@ the issue or step that produced it.
   `observability`/`evaluation`/`artifacts` value type to JSON should expect the same split:
   free for a `str`-subclassing enum, but an explicit conversion for any `Mapping`-typed
   field that isn't already a plain `dict`.
+- **A harness-assigned branch turned out identical to `main`'s tip for the fifth step in
+  a row.** Starting R26, `claude/gbopt-r26-refactor-4jmh94` matched `origin/main` exactly
+  -- same failure mode as R23/R24/R25's own entries above. Same fix:
+  `git checkout -B claude/gbopt-r26-refactor-4jmh94 origin/refactor/r25-event-journal`,
+  verified with `git rev-parse`/`git log`. Issue #86 lists no roadmap prerequisite, but
+  "no prerequisite" means R26 doesn't depend on any specific roadmap step's *new
+  contract* -- it still needs the checkpoint code as it actually stands, which only
+  exists at `refactor/r25-event-journal`'s tip (the branch containing R01's original
+  `feature/checkpointing` merge plus every roadmap step since). Confirmed via
+  `git merge-base --is-ancestor origin/feature/checkpointing
+  origin/refactor/r25-event-journal` before branching. Expect this on every future step;
+  it is not a one-off.
+- **R26 confirmed it is not the checkpoint-serialization step R22's/R23's
+  `REFACTOR_CLEANUP.md` entries floated for "R23 or R26+"** -- issue #86's own
+  acceptance criteria state "No typed v2 snapshot model is introduced yet," and its
+  actual scope (uniform schema-v1 envelope validation, atomic same-directory publish
+  with flush/fsync/`os.replace`) never touches `EvaluationResult`/`CandidateEvaluation`
+  serialization at all. Confirmed by reading #86's criteria directly rather than
+  inferring from "R26" matching the entries' own guessed number, the same discipline
+  R25 used to rule itself out of an adjacent-sounding but textually distinct step.
+- **Issue #86's "uneven envelope validation" across MC, legacy GA, and ownership-aware
+  GA undersold the actual asymmetry -- two of the three paths had *no* envelope
+  validation at all, not merely a weaker version of it.** Before this step,
+  `MonteCarloMinimizer.run_MC` and `GeneticAlgorithmMinimizer.run_GA`'s legacy (unowned)
+  path read `state["state"]["GBE_vals"]`-shaped fields directly off a loaded checkpoint
+  with no check of `schema_version`/`minimizer`/`progress_unit` and no
+  `KeyError`/`TypeError` translation into `GBMinimizerError` -- only the owned
+  (explicit-ownership) GA path validated the envelope inline first. This was found by
+  reading each restore path's actual code before starting, not by trusting the issue
+  prose's "uneven" framing, which reads as "all three validate, just differently
+  strictly." The new `GBOpt.Checkpoint.validate_checkpoint_envelope` (checks the
+  envelope is a dict, carries every field in `REQUIRED_ENVELOPE_FIELDS`, matches the
+  expected minimizer/schema/progress unit, and has a well-formed non-negative-integer
+  `progress_index`) is called from all three restore paths, each wrapped in the same
+  `except GBMinimizerError: raise` / `except (CheckpointCompatibilityError, KeyError,
+  TypeError, ValueError)` translation the owned GA path already used -- "centralize" and
+  "add validation where none existed" turned out to be the same fix once the actual
+  code, not the issue's summary of it, was the source of truth.
+- **A same-directory atomic-publish helper's own `mkdir(parents=True, exist_ok=True)`
+  call has to live inside the function's translating `try` block, not before it, or the
+  function's own docstring becomes wrong.** `GBOpt.Checkpoint._save_checkpoint_payload`'s
+  first draft of the new parent-directory-creation policy called `mkdir` before the
+  `try:` that turns every write failure into `CheckpointError`, so a failure to create
+  the parent (e.g. a path segment already occupied by a plain file) would have leaked a
+  raw `OSError` -- contradicting the docstring's own `:raises CheckpointError: If the
+  parent directory cannot be created...`. Caught by writing the dedicated regression
+  test (a file blocking the parent path) before assuming the docstring described the
+  real control flow, not by any tool; fixed in a small follow-up commit rather than
+  amending the commit that introduced it. Any future change to a function with a
+  documented `:raises:` contract should check that every code path claimed to be
+  translated is actually inside the block doing the translating.
 - Before opening a PR, run `ruff`, `mypy`, `bandit`, and `pyscn` (see
   "Tooling" below) and report the results.
 - **Never open a PR without being explicitly told to.** The user reviews

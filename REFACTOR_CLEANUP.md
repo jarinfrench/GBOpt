@@ -1,5 +1,77 @@
 # Refactor cleanup backlog
 
+## R26 net tooling deltas: ruff net 0, mypy net 0, bandit unchanged, pyscn unchanged (41 quality issues, 47 clone pairs)
+
+Baseline taken at the R26 branch point (`a33cddd`, tip of `refactor/r25-event-journal`):
+ruff (`GBOpt`/`tests`) 241 errors; mypy `GBOpt/optimization` 288 errors in 31 files (7
+source files checked), `GBOpt/observability` 202 errors in 23 files (5 source files
+checked); bandit 7 Low + 1 Medium + 0 High; pyscn 41 quality issues / 47 clone pairs.
+Current (after all four R26 commits): identical on every metric -- ruff 241, mypy
+unchanged in both scopes, bandit unchanged, pyscn unchanged at 41/47. Per-file ruff
+counts for every file this step touched (`GBOpt/Checkpoint.py`,
+`GBOpt/optimization/genetic.py`, `GBOpt/optimization/monte_carlo.py`,
+`tests/test_checkpoint.py`, `tests/test_optimization_genetic.py`,
+`tests/test_optimization_monte_carlo.py`) were diffed individually against their
+pre-R26 copies, not just the repo-wide total, per `CLAUDE.md`'s own R23 lesson about a
+per-file check being necessary even when the whole-repo total doesn't move -- every
+file's own count matched exactly.
+
+**Resolve at**: no action needed.
+
+## R26 confirmed it is not the checkpoint-serialization step R22's/R23's `REFACTOR_CLEANUP.md` entries floated for "R23 or R26+"
+
+Issue #86's own acceptance criteria are explicit: "No typed v2 snapshot model is
+introduced yet." #86 is entirely about hardening the *existing* schema-v1 envelope
+(uniform validation before MC/GA state access, atomic same-directory publish with
+flush/fsync/`os.replace`) -- it adds no `to_state`/`from_state` serialization to
+`EvaluationResult`/`CandidateEvaluation`, and doesn't touch the checkpoint *format* at
+all. Confirmed by reading #86's acceptance criteria directly, the same discipline R25
+used to rule itself out as this step. The gap remains open for whichever later step
+actually is the checkpoint-serialization migration.
+
+## None of R24's four new `REFACTOR_CLEANUP.md` entries, or R25's `OptimizationEvent` artifact-file-reference gap, needed any action at R26
+
+Rechecked each against #86's real acceptance criteria before assuming so. #86 is
+entirely scoped to checkpoint envelope validation and publish durability -- it says
+nothing about `operation_parameters`, GA accept/reject semantics, legacy `run_GA`'s
+`RUN_FAILED`-only try/except, `_evaluate_generation`'s reconstruction-failure accuracy,
+or joining a journal entry back to its structure artifact. Each remains open for
+whichever step's own criteria actually touch it.
+
+## R26 found MC's and legacy GA's checkpoint-restore paths had *no* envelope validation at all before this step, not just uneven validation
+
+Issue #86's motivation describes "uneven envelope validation" across MC, legacy GA,
+and ownership-aware GA, which reads like all three had *some* validation that merely
+differed in strictness. Reading the actual restore code before touching it found a
+sharper asymmetry: `MonteCarloMinimizer.run_MC` and `GeneticAlgorithmMinimizer.run_GA`'s
+legacy (unowned) path accessed `state["state"]["GBE_vals"]`-shaped fields directly, with
+no check of `schema_version`/`minimizer`/`progress_unit` and no try/except translating a
+resulting `KeyError`/`TypeError` into `GBMinimizerError` at all -- a corrupt or
+wrong-minimizer checkpoint would surface a raw Python exception. Only the owned
+(explicit-ownership) GA path validated the envelope inline before this step. The fix
+(`GBOpt.Checkpoint.validate_checkpoint_envelope`, called from all three restore paths,
+each wrapped in the same `except GBMinimizerError: raise` / `except
+(CheckpointCompatibilityError, KeyError, TypeError, ValueError)` pattern the owned path
+already used) treats "uniform validation" and "validation that currently doesn't exist
+in two of the three places" as the same fix, since centralizing necessarily adds the
+check where it was missing.
+
+**Resolve at**: no action needed.
+
+## R26's own `_save_checkpoint_payload` hardening initially left `mkdir` outside its own try/except, contradicting its docstring
+
+While implementing the parent-directory-creation policy, the first draft called
+`path.parent.mkdir(parents=True, exist_ok=True)` before the function's `try:` block that
+translates every other write failure into `CheckpointError` -- so a failure to create
+the parent directory (e.g. a path segment already occupied by a regular file) would
+have leaked a raw `OSError`, contradicting the docstring's own `:raises CheckpointError:
+If the parent directory cannot be created...`. Caught by writing the corresponding test
+(`test_save_translates_parent_directory_creation_failure`) before assuming the
+docstring was accurate, not by any tool. Fixed by moving the `mkdir` call inside the
+try block, in a small follow-up commit rather than amending the commit that introduced
+it. Any future edit to this function should keep every failure mode the docstring
+promises to translate actually inside the translating `try`.
+
 ## R25 net tooling deltas: ruff +1 (disclosed established-convention debt), mypy net 0, bandit unchanged, pyscn unchanged (41 quality issues, 47 clone pairs)
 
 Baseline taken at the R25 branch point (`96db29c`, tip of `refactor/r24-event-vocabulary`,
