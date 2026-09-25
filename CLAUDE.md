@@ -5,16 +5,26 @@ Guidance for working in this repository, distilled from the R01 (#62,
 the refactor roadmap (issue #61, implementation issues #62-#90 = R01-R30) as
 much as to one-off work.
 
-`REFACTOR_CLEANUP.md` (repo root, untracked — local to this working directory only,
-via `.git/info/exclude`, same as this file) is the backlog of issues and judgment
-calls identified while working a roadmap step but deliberately deferred rather
-than fixed in that step's PR, each tagged with the roadmap step where it's
-expected to be resolved. Check it before starting a roadmap step for anything
-tagged to resolve there, and add to it — rather than fixing unilaterally or
-silently letting it drop — whenever you notice a real issue that's out of the
-current PR's scope per the "Refactor-issue discipline" rules below. Because it's
-untracked, a fresh worktree or clone won't have it — copy it over manually if
-you start one.
+`REFACTOR_CLEANUP.md` (repo root) is the backlog of issues and judgment calls
+identified while working a roadmap step but deliberately deferred rather than
+fixed in that step's PR, each tagged with the roadmap step where it's expected
+to be resolved. Check it before starting a roadmap step for anything tagged to
+resolve there, and add to it — rather than fixing unilaterally or silently
+letting it drop — whenever you notice a real issue that's out of the current
+PR's scope per the "Refactor-issue discipline" rules below.
+
+Both this file and `REFACTOR_CLEANUP.md` were originally untracked (this file
+via the user's global git ignore, `REFACTOR_CLEANUP.md` via this repo's
+`.git/info/exclude`) on the assumption they were local-only working notes for
+sessions running directly in the user's own checkout. As of the R21 branch tip,
+both are tracked instead: a cloud-run session gets a fresh clone with none of
+the working directory's untracked state or ignore rules, so an untracked file
+is invisible to it no matter how established the convention is locally. If a
+future session (local or cloud) finds either file back to being untracked
+again, don't assume that's a mistake to silently fix — the two setups have
+genuinely different needs, and which one is current is itself worth
+confirming with the user before proceeding as if either file's guidance is
+visible to whatever session picks up the next roadmap step.
 
 An entry's description of *what the code currently does* can go stale, not
 just its line-number references — R07 found a `REFACTOR_CLEANUP.md` entry
@@ -48,6 +58,41 @@ the issue or step that produced it.
   (`#62`-`#90`, plus `#27` as R17) with its own acceptance criteria and
   non-goals — read the specific issue, not just the roadmap summary, before
   starting.
+- **Issues and pull requests are disabled on this fork (`jarinfrench/GBOpt`) —
+  `#61`/`#62`-`#90` live on the upstream repo, `IdahoLabResearch/GBOpt`, not
+  here.** Starting R22 in a fresh Claude Code on the web session, `GET
+  /repos/jarinfrench/gbopt/issues/82` returned 404 and `list_issues`/
+  `list_pull_requests` both returned empty for the whole fork — not a
+  permission error, just genuinely nothing there, consistent with GitHub
+  disabling Issues/PRs by default on a fork (this repo's history includes an
+  "Add daily workflow to sync fork main with upstream" commit). The session's
+  GitHub tool access was scoped only to `jarinfrench/gbopt`, and attaching
+  `IdahoLabResearch/GBOpt` too failed on a same-basename checkout collision
+  (`gbopt` already occupied) — spinning up a separate helper cloud session to
+  fetch the issue text also didn't pan out, since cross-session messaging
+  tools don't reliably bridge two independent cloud containers. The working
+  fix was simply asking the user to paste issue #82/#61's text directly. Any
+  cloud session starting a new roadmap step should expect this and either ask
+  the user for the issue text up front or get `IdahoLabResearch/GBOpt`
+  attached as this session's *only* GitHub-scoped repo (not alongside a
+  same-named fork checkout).
+- **A cloud session's checkout only has what's actually been pushed to
+  `origin` — verify with `git ls-remote`/`git branch -a` before trusting any
+  inherited summary of prior roadmap branch state, including claims about
+  this file's own tracked status.** Starting R22, a detailed prior-session
+  summary described `refactor/r11-structure-io` through `r21-optimizer-
+  logging` as already existing and merged, and described `CLAUDE.md`/
+  `REFACTOR_CLEANUP.md` in the "untracked, local-only" terms this file used
+  to use (see the git-mechanics note below on that specific claim now being
+  stale) — none of which existed in the fresh cloud clone (`git ls-remote`
+  showed only `refactor/r01-...`; no issues at all on the fork). The
+  branches, and these two files, turned out to be real but simply not yet
+  pushed from the user's local machine to `origin`; asking the user to push
+  them resolved it in minutes. The general check: when a task description's
+  claims about branch topology or tracked files don't match a fresh
+  `git ls-remote origin`/`git ls-files`, don't assume the description is
+  fabricated or proceed around the mismatch — say what doesn't match and ask
+  whether the missing state needs to be pushed first.
 - PR branches are based on `feature/artifact-retention` (PR #92), not `main`,
   until that PR merges. **Branch topology depends on whether the issue lists
   a roadmap prerequisite.** R01 and R02 have no prerequisite between them
@@ -1257,6 +1302,26 @@ Established by `GBOpt/crystallography/` and `GBOpt/artifacts/`, and now also
   above). Always take the numeric baseline from the same exact command
   you'll re-run afterward, not from a different, more readable invocation
   used only to inspect what the findings are.
+- **mypy cannot narrow an `X | None` value through a derived `bool` flag
+  computed in a separate statement, even when the flag is provably
+  equivalent to an `is not None` check -- narrow through a typed local
+  instead.** R22's first draft of `GBOpt/evaluation/adapters.py` computed
+  `has_path = isinstance(structure_path, str) and bool(structure_path.strip())`
+  and then branched on `if numeric_energy is None or not has_path:` before
+  using `structure_path` (typed `Any | None` from a `dict.get(...)`/tuple
+  unpack) in the success path below. mypy has no way to know `has_path`
+  being `True` implies `structure_path` is a non-`None` `str` -- it isn't an
+  `isinstance`/`is None` check on the value itself, so the success branch's
+  `StructureArtifact(path=structure_path, ...)` still reported `path` as
+  possibly `None`/`Any`. The fix was a small helper,
+  `_normalize_structure_path(value) -> str | None`, returning the validated
+  string or `None`; branching on `if ... or structure_path is None:` against
+  its own typed return value let mypy correctly narrow `structure_path` to
+  `str` in the success fallthrough, with no behavior change and no cast.
+  Same root idea as this file's existing `UnitCell | None` guard-clause
+  entry above (a domain check mypy can verify beats one it can't), just
+  showing up as "restructure the boolean into the value's own type" instead
+  of "add a `None`-check guard clause."
 
 ## Tooling
 
@@ -1286,6 +1351,62 @@ source .venv-scratch/Scripts/activate   # Windows Git Bash
 python -m pip install -q "numpy<=2.1" scipy numba pandas matplotlib spglib pytest setuptools
 python -m pip install -q --no-build-isolation -e .
 ```
+
+## Cloud session environment notes
+
+The sections above (Tooling's venv recipe aside, and all of Editor setup and
+Git mechanics below) describe the user's own local Windows machine. A Claude
+Code on the web / cloud-container session is a different environment with its
+own quirks, first hit during R22:
+
+- **The container's `python3`/`python` can resolve to an older interpreter
+  than the one this codebase needs for its own syntax.** R22's container had
+  `python3` at 3.11.15 and `python3.12` also on `PATH`; `UnitCell.py` uses a
+  nested-same-quote f-string that's only valid syntax from Python 3.12
+  onward (PEP 701). Creating the scratch venv with plain `python3 -m venv`
+  produces a 3.11 venv that fails to even install the package
+  (`SyntaxError: f-string: expecting '}'` from `setup.py`'s own import of
+  `GBOpt`), and separately, a `mypy`/`bandit` installed globally via `uv tool
+  install` (found on `PATH` already) runs under whatever Python `uv`
+  provisioned it with — also 3.11 in this container — and hits the exact
+  same parse error the instant it tries to follow an import into
+  `UnitCell.py`, aborting with zero findings rather than reporting one.
+  Check `python3.12 --version`/`ls /usr/bin/python3.1*` up front, create the
+  scratch venv with `python3.12 -m venv` explicitly, and `pip install mypy
+  bandit` *into that same venv* rather than trusting whatever `mypy`/
+  `bandit` binary is already on `PATH` — `ruff` doesn't have this problem
+  (its own Rust parser handles the syntax regardless of host Python), but
+  mypy and bandit are only as new-syntax-capable as the interpreter running
+  them.
+- **`bandit` and `pyscn` are not preinstalled in a fresh cloud container**,
+  unlike the user's machine (where `pyscn` is already on `PATH` and the
+  Tooling section's `pyscn` MCP server may be installed). Both are
+  `pip install`-able (`pip install bandit pyscn` — the `pyscn` PyPI package
+  provides the same CLI the Tooling section describes as a fallback). Check
+  `ToolSearch` for `mcp__plugin_pyscn-mcp_pyscn-mcp__*` first as usual, but
+  expect it to be genuinely absent (not just unloaded) in a fresh cloud
+  session and fall back to the CLI without spending time trying to install
+  the plugin.
+- **This repo's CRLF convention (see Git mechanics below) is a property of
+  the user's local git config, not of the repository itself — a fresh cloud
+  container has no reason to reproduce it.** `git config --get
+  core.autocrlf`/`core.safecrlf` are unset in a fresh container, there's no
+  committed `.gitattributes` forcing CRLF, and `git check-attr` on a tracked
+  `.py` file confirms `eol: unspecified`. The repository's actual git blobs
+  are LF (git stores `core.autocrlf=true` content as LF and only converts to
+  CRLF on checkout on a machine configured to do so); a cloud container
+  without that config checks files out as the plain LF they're stored as, and
+  `Write`/`Edit` output (also LF) matches that natively. Applying Git
+  mechanics' CRLF-conversion recipe in a cloud session would be solving a
+  problem the container doesn't have, and would risk introducing the exact
+  mismatched-line-ending state that section warns against. Confirm with
+  `git config --get core.autocrlf` before assuming either convention applies.
+- **A same-named repository can't be attached twice to one cloud session, and
+  a separately-spawned helper cloud session isn't a reliable way around
+  it.** See the "Issues and pull requests are disabled on this fork" entry
+  under Roadmap context above for the concrete case (needing
+  `IdahoLabResearch/GBOpt`'s issue tracker while already working in
+  `jarinfrench/GBOpt`, both of which check out to a `gbopt`-named directory).
 
 ## Editor setup
 
