@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import pickle
-import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -86,8 +86,16 @@ def _save_checkpoint_payload(
     *,
     kind: str,
     json_indent: int | None = None,
+    fsync: bool = False,
 ) -> None:
-    """Atomically serialize one checkpoint payload via a temporary file.
+    """Atomically publish one checkpoint payload via a same-directory temporary file.
+
+    The destination's parent directory is created if it does not already exist,
+    matching every other artifact-writing path in this codebase (e.g.
+    ``_materialize_archive_file``, ``_ArtifactProvenance``). The temporary file is
+    written next to the destination (so the final rename is same-filesystem and
+    atomic), flushed, optionally ``fsync``ed, and published with :func:`os.replace`.
+    A failed publish leaves no temporary file behind.
 
     :param path: Checkpoint file path.
     :param fmt: Serialization format.
@@ -96,17 +104,32 @@ def _save_checkpoint_payload(
         diagnostics.
     :param json_indent: Keyword argument, optional, defaults to ``None``. JSON
         indentation level.
-    :raises CheckpointError: If the payload cannot be written.
+    :param fsync: Keyword argument, optional, defaults to ``False``. When ``True``,
+        ``fsync`` the temporary file's contents before the atomic replace, so the
+        published bytes survive a crash immediately after this call returns. This is
+        opt-in rather than the default because it is a real, measurable write-latency
+        cost (particularly on network filesystems common in HPC checkpoint
+        destinations), not something every run needs. It fsyncs the file's own
+        contents only; it does not additionally fsync the containing directory entry.
+    :raises CheckpointError: If the parent directory cannot be created or the payload
+        cannot be written or published.
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
         if fmt == "json":
             with open(tmp, "w") as fp:
                 json.dump(_to_serializable(payload), fp, indent=json_indent)
+                fp.flush()
+                if fsync:
+                    os.fsync(fp.fileno())
         else:
             with open(tmp, "wb") as fp:
                 pickle.dump(payload, fp, protocol=pickle.HIGHEST_PROTOCOL)
-        shutil.move(str(tmp), str(path))
+                fp.flush()
+                if fsync:
+                    os.fsync(fp.fileno())
+        os.replace(tmp, path)
     except Exception as exc:
         if tmp.exists():
             tmp.unlink()
@@ -149,10 +172,12 @@ class CheckpointStore:
         path: Path,
         fmt: str,
         interval: int,
+        fsync: bool = False,
     ):
         self._path = path
         self._fmt = fmt
         self._interval = interval
+        self._fsync = fsync
         self._disabled = False
 
     @classmethod
@@ -176,12 +201,16 @@ class CheckpointStore:
         path: Path | str | None,
         fmt: str = "json",
         interval: int = 1,
+        fsync: bool = False,
     ) -> CheckpointStore:
         """Return :meth:`disabled` when *path* is ``None``, else a live store.
 
         :param path: Destination path, or ``None`` to disable checkpointing.
         :param fmt: Serialization format — ``"json"`` (default) or ``"pickle"``.
         :param interval: Persist state every *interval* steps/generations.
+        :param fsync: Optional, defaults to ``False``. Passed through to every publish
+            — see :func:`_save_checkpoint_payload` for what it does and does not
+            guarantee.
         :raises CheckpointValueError: If *fmt* is not ``"json"`` or ``"pickle"``, or if
             *interval* is less than 1
 
@@ -199,7 +228,7 @@ class CheckpointStore:
         _validate_checkpoint_format(fmt)
         if interval < 1:
             raise CheckpointValueError(f"interval must be >= 1, got {interval!r}")
-        return cls(Path(path), fmt, interval)
+        return cls(Path(path), fmt, interval, fsync)
 
     @property
     def enabled(self) -> bool:
@@ -261,13 +290,14 @@ class CheckpointStore:
         _delete_checkpoint_file(self._path)
 
     def _save(self, state: dict) -> None:
-        """Atomically write *state* to disk via a tmp-then-move."""
+        """Atomically publish *state* to disk. See :func:`_save_checkpoint_payload`."""
         _save_checkpoint_payload(
             self._path,
             self._fmt,
             state,
             kind="checkpoint",
             json_indent=2,
+            fsync=self._fsync,
         )
 
 
@@ -494,7 +524,7 @@ class CandidateCheckpoint:
     # persistence
 
     def _save(self) -> None:
-        """Atomically write checkpoint state to disk via a tmp-then-move."""
+        """Atomically publish checkpoint state. See :func:`_save_checkpoint_payload`."""
         payload = {
             "iteration_index": self.iteration_index,
             "unique_ids": list(self._unique_ids),

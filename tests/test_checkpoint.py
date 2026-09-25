@@ -203,6 +203,45 @@ def test_exists_tracks_saved_file(checkpoint_path):
     assert not CheckpointStore.disabled().exists
 
 
+def test_save_creates_missing_parent_directories(tmp_path):
+    path = tmp_path / "nested" / "does" / "not" / "exist" / "run.json"
+    store = CheckpointStore.from_optional(path)
+
+    store.save_final(_make_state())
+
+    assert path.exists()
+    assert json.loads(path.read_text())["schema_version"] == 1
+
+
+def test_save_publishes_with_no_leftover_temporary_file(checkpoint_path):
+    store = CheckpointStore.from_optional(checkpoint_path)
+
+    store.save_final(_make_state())
+
+    assert checkpoint_path.exists()
+    assert not checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp").exists()
+
+
+def test_save_leaves_no_temporary_file_on_write_failure(checkpoint_path):
+    store = CheckpointStore.from_optional(checkpoint_path)
+    state = _make_state()
+    state["state"]["value"] = object()  # not JSON-serializable
+
+    with pytest.raises(CheckpointError, match="Failed to save checkpoint"):
+        store.save_final(state)
+
+    assert not checkpoint_path.exists()
+    assert not checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp").exists()
+
+
+def test_fsync_option_still_publishes_a_readable_checkpoint(checkpoint_path):
+    store = CheckpointStore.from_optional(checkpoint_path, fsync=True)
+
+    store.save_final(_make_state(3))
+
+    assert store.load()["progress_index"] == 3
+
+
 # ---------------------------------------------------------------------------
 # CandidateCheckpoint
 # ---------------------------------------------------------------------------
