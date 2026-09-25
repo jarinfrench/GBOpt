@@ -11,7 +11,7 @@ import pytest
 from GBOpt.artifacts import ArtifactRetentionPolicy, KeepBest
 from GBOpt.GBMaker import GBMaker
 from GBOpt.manipulation import ManipulationRegistry, ManipulationResult
-from GBOpt.optimization.monte_carlo import MonteCarloMinimizer
+from GBOpt.optimization.monte_carlo import MC_ENERGY_PENALTY, MonteCarloMinimizer
 from GBOpt.optimization.types import GBMinimizerError, GBMinimizerValueError
 
 _TEST_CALCULATION_CONTEXT = {"calculator": {"name": "test-evaluator"}}
@@ -72,6 +72,30 @@ def _make_minimizer(gb, energy_func):
         ["translate_right_grain"],
         seed=0,
     )
+
+
+def _install_mutate_crash(mc, crash_after):
+    """Make ``mc``'s mutator raise after ``crash_after`` successful calls.
+
+    Evaluator exceptions no longer abort an MC run (a failed proposal is now
+    deterministically rejected instead), so a test that needs a genuine mid-run
+    crash -- to inspect checkpoint state at a specific, otherwise-unreachable
+    intermediate step -- raises from the mutator instead, which still propagates
+    uncaught. Returns the original ``mutate`` bound method so a caller that resumes
+    the same minimizer can restore non-crashing behavior first.
+    """
+    original_mutate = mc.mutator.mutate
+    call_count = 0
+
+    def crashing_mutate(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count > crash_after:
+            raise RuntimeError(f"Simulated crash at mutate call {call_count}")
+        return original_mutate(*args, **kwargs)
+
+    mc.mutator.mutate = crashing_mutate
+    return original_mutate
 
 
 def _make_sequence_energy_func(energies, root, *, start_index=0):
@@ -421,7 +445,8 @@ def test_run_mc_checkpoint_kept_on_completion(gb, tmp_path):
 
 
 def test_run_mc_checkpoint_file_is_valid_json(gb, tmp_path):
-    mc = _make_minimizer(gb, _make_energy_func(gb, crash_after=3))
+    mc = _make_minimizer(gb, _make_energy_func(gb))
+    _install_mutate_crash(mc, crash_after=2)
     checkpoint = tmp_path / "mc.json"
 
     with pytest.raises(RuntimeError):
@@ -453,7 +478,8 @@ def test_run_mc_checkpoint_file_is_valid_json(gb, tmp_path):
 
 
 def test_run_mc_checkpoint_format_pickle(gb, tmp_path):
-    mc = _make_minimizer(gb, _make_energy_func(gb, crash_after=3))
+    mc = _make_minimizer(gb, _make_energy_func(gb))
+    _install_mutate_crash(mc, crash_after=2)
     checkpoint = tmp_path / "mc.pkl"
 
     with pytest.raises(RuntimeError):
@@ -472,7 +498,8 @@ def test_run_mc_checkpoint_format_pickle(gb, tmp_path):
 
 
 def test_run_mc_resume_from_json(gb, tmp_path):
-    mc = _make_minimizer(gb, _make_energy_func(gb, crash_after=3))
+    mc = _make_minimizer(gb, _make_energy_func(gb))
+    original_mutate = _install_mutate_crash(mc, crash_after=2)
     checkpoint = tmp_path / "mc_resume.json"
 
     with pytest.raises(RuntimeError):
@@ -483,7 +510,7 @@ def test_run_mc_resume_from_json(gb, tmp_path):
     gbe_count_before_resume = len(mc.GBE_vals)
     assert resumed_from_step > 0
 
-    mc.gb_energy_func = _make_energy_func(gb)
+    mc.mutator.mutate = original_mutate
     mc.run_MC(max_steps=10, unique_id=5, checkpoint_file=checkpoint)
 
     assert checkpoint.exists()
@@ -491,7 +518,8 @@ def test_run_mc_resume_from_json(gb, tmp_path):
 
 
 def test_run_mc_resume_from_pickle(gb, tmp_path):
-    mc = _make_minimizer(gb, _make_energy_func(gb, crash_after=3))
+    mc = _make_minimizer(gb, _make_energy_func(gb))
+    original_mutate = _install_mutate_crash(mc, crash_after=2)
     checkpoint = tmp_path / "mc_resume.pkl"
 
     with pytest.raises(RuntimeError):
@@ -503,7 +531,7 @@ def test_run_mc_resume_from_pickle(gb, tmp_path):
         )
 
     assert checkpoint.exists()
-    mc.gb_energy_func = _make_energy_func(gb)
+    mc.mutator.mutate = original_mutate
     mc.run_MC(
         max_steps=10,
         unique_id=6,
@@ -536,9 +564,10 @@ def test_run_mc_invalid_format_raises(gb, tmp_path):
 
 
 def test_run_mc_checkpoint_interval_respected(gb, tmp_path):
-    # Calls 1-5 succeed and call 6 (step 5) raises. With interval=3, only step 3
-    # has been checkpointed at that point.
-    mc = _make_minimizer(gb, _make_energy_func(gb, crash_after=5))
+    # Steps 1-4 succeed and step 5's mutate call raises. With interval=3, only
+    # step 3 has been checkpointed at that point.
+    mc = _make_minimizer(gb, _make_energy_func(gb))
+    _install_mutate_crash(mc, crash_after=4)
     checkpoint = tmp_path / "mc_interval.json"
 
     with pytest.raises(RuntimeError):
@@ -551,6 +580,36 @@ def test_run_mc_checkpoint_interval_respected(gb, tmp_path):
 
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
     assert state["progress_index"] == 3
+
+
+def test_proposal_evaluator_exception_rejects_step_without_crashing(gb, tmp_path):
+    # call 1 = initial (succeeds), call 2 = step 1 (succeeds); every call after that
+    # (steps 2 and 3) raises. A proposal-step evaluator exception no longer aborts
+    # the run: each failed step is deterministically rejected, exactly like a normal
+    # Metropolis rejection, and the run reaches max_steps regardless.
+    energy_func = _make_energy_func(gb, crash_after=2)
+    mc = _make_minimizer(gb, energy_func)
+
+    mc.run_MC(max_steps=3, unique_id=100)
+
+    assert len(mc.GBE_vals) == 4
+    assert mc.GBE_vals[1] != MC_ENERGY_PENALTY
+    assert mc.GBE_vals[2] == MC_ENERGY_PENALTY
+    assert mc.GBE_vals[3] == MC_ENERGY_PENALTY
+    assert mc.operation_list[-2][1] is False
+    assert mc.operation_list[-1][1] is False
+    assert 2 not in mc.accepted_idx
+    assert 3 not in mc.accepted_idx
+
+
+def test_initial_evaluator_exception_raises(gb, tmp_path):
+    # There is no sensible penalized starting point for a whole MC run, so an
+    # initial-evaluation failure is fatal rather than gracefully rejected.
+    energy_func = _make_energy_func(gb, crash_after=0)
+    mc = _make_minimizer(gb, energy_func)
+
+    with pytest.raises(GBMinimizerError, match="initial evaluation failed"):
+        mc.run_MC(max_steps=3, unique_id=101)
 
 
 def test_resume_without_unique_id_restores_original_label(gb, tmp_path):

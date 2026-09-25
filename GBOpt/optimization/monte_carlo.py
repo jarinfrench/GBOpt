@@ -35,6 +35,12 @@ from GBOpt.Checkpoint import (
     CheckpointError,
     CheckpointStore,
 )
+from GBOpt.evaluation import (
+    EvaluationResult,
+    EvaluationStatus,
+    FailureStage,
+    from_scalar_tuple,
+)
 from GBOpt.GBManipulator import (
     GBManipulatorError,
     ParentError,
@@ -59,6 +65,8 @@ from GBOpt.optimization.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+MC_ENERGY_PENALTY: float = 1.0e30
 
 
 class MonteCarloMinimizer:
@@ -542,13 +550,40 @@ class MonteCarloMinimizer:
             unique_id = str(uuid.uuid4()) if unique_id is None else str(unique_id)
             init_system = np.array(
                 self.manipulator.parents[0].whole_system, copy=True)
-            init_gbe, _current_dump = self.gb_energy_func(
-                self.GB,
-                self.manipulator,
-                init_system,
-                "initial" + str(unique_id),
-                **kwargs,
+            initial_candidate_id = "initial" + str(unique_id)
+            try:
+                init_gbe, _current_dump = self.gb_energy_func(
+                    self.GB,
+                    self.manipulator,
+                    init_system,
+                    initial_candidate_id,
+                    **kwargs,
+                )
+            except Exception as exc:
+                # There is no sensible penalized starting point for a whole MC run,
+                # so an initial-evaluation failure is fatal -- matching
+                # GeneticAlgorithmMinimizer's owned-mode initial evaluation, which
+                # raises the same way rather than seeding a run from a penalty value.
+                initial_result = EvaluationResult(
+                    candidate_id=initial_candidate_id,
+                    input_index=0,
+                    status=EvaluationStatus.FAILED,
+                    selection_energy=MC_ENERGY_PENALTY,
+                    failure_stage=FailureStage.EVALUATOR,
+                    failure_message=f"{type(exc).__name__}: {exc}",
+                )
+                raise GBMinimizerError(
+                    f"initial evaluation failed: {initial_result.failure_message}"
+                ) from exc
+            initial_result = from_scalar_tuple(
+                initial_candidate_id, 0, (init_gbe, _current_dump), penalty=MC_ENERGY_PENALTY
             )
+            if initial_result.status is not EvaluationStatus.SUCCESS:
+                raise GBMinimizerError(
+                    f"initial evaluation failed: {initial_result.failure_message}"
+                )
+            init_gbe = initial_result.selection_energy
+            _current_dump = initial_result.artifact.path
             self.GBE_vals.append(init_gbe)
             T = -1 * E_accept / math.log(0.5)
             rejection_count = 0
@@ -712,22 +747,65 @@ class MonteCarloMinimizer:
                 self.local_random, self.GB, self.manipulator
             )
 
-            new_gbe, dump_file_name = self.gb_energy_func(
-                self.GB,
-                self.manipulator,
-                new_system,
-                str(unique_id),
-                **kwargs,
+            step_candidate_id = str(unique_id)
+            try:
+                new_gbe, dump_file_name = self.gb_energy_func(
+                    self.GB,
+                    self.manipulator,
+                    new_system,
+                    step_candidate_id,
+                    **kwargs,
+                )
+            except Exception as exc:
+                # The external evaluator callback is a deliberate recovery boundary:
+                # any failure here penalizes and deterministically rejects only this
+                # step rather than aborting the run, matching GA's own established
+                # per-candidate recovery-boundary pattern.
+                logger.warning(
+                    "gb_energy_func failed for MC step %d (candidate %r): %s: %s",
+                    i,
+                    step_candidate_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                step_result = EvaluationResult(
+                    candidate_id=step_candidate_id,
+                    input_index=i,
+                    status=EvaluationStatus.FAILED,
+                    selection_energy=MC_ENERGY_PENALTY,
+                    failure_stage=FailureStage.EVALUATOR,
+                    failure_message=f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                step_result = from_scalar_tuple(
+                    step_candidate_id,
+                    i,
+                    (new_gbe, dump_file_name),
+                    penalty=MC_ENERGY_PENALTY,
+                )
+
+            new_gbe = step_result.selection_energy
+            dump_file_name = (
+                step_result.artifact.path if step_result.artifact is not None else None
             )
             self.GBE_vals.append(new_gbe)
 
-            accepted = new_gbe <= prev_gbe or self.local_random.uniform(
-                0, 1
-            ) <= math.exp(-(new_gbe - prev_gbe) / T)
+            if step_result.status is not EvaluationStatus.SUCCESS:
+                # A failed proposal is deterministically rejected -- it never becomes
+                # the new current/best structure, and this rejection does not consume
+                # the acceptance-draw RNG state.
+                accepted = False
+            else:
+                accepted = new_gbe <= prev_gbe or self.local_random.uniform(
+                    0, 1
+                ) <= math.exp(-(new_gbe - prev_gbe) / T)
 
             trial_candidate_id = None
             trial_manipulator = None
-            if self.artifact_store is not None:
+            if (
+                self.artifact_store is not None
+                and step_result.status is EvaluationStatus.SUCCESS
+            ):
                 trial_candidate_id = self._mc_candidate_id(str(unique_id), i)
                 trial_manipulator = self._register_mc_retention_candidate(
                     candidate_id=trial_candidate_id,

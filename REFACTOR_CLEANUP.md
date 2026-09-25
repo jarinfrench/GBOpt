@@ -1,5 +1,48 @@
 # Refactor cleanup backlog
 
+## R23 gives MC's evaluator calls the recovery boundary they never had, resolving R21's documented MC/GA asymmetry
+
+R21's `CLAUDE.md` entry (docstring-parity/asymmetry) documented that GA's evaluator
+callback has a recovery boundary (`except Exception` -> `ENERGY_PENALTY`) but MC's
+`gb_energy_func` call has none at all -- any evaluator exception there propagated
+directly and crashed the whole run, and R21 left resolving that asymmetry to whichever
+later step's own acceptance criteria required it. Issue #83's "every MC/GA evaluation
+produces an `EvaluationResult`" and "evaluator exceptions... retain typed failure
+provenance" require it unconditionally, so R23 adds it at both of
+`MonteCarloMinimizer.run_MC`'s evaluation call sites, each now classifying its raw
+callback result through `from_scalar_tuple`/a directly-constructed `EvaluationResult`
+(mirroring the legacy GA scalar path's pattern below), with a new module-level
+`MC_ENERGY_PENALTY = 1.0e30` constant local to `monte_carlo.py` (not imported from
+`genetic.py`'s own `ENERGY_PENALTY` -- `CLAUDE.md`'s subpackage conventions
+already forbid sibling optimizer modules importing each other).
+
+The two call sites are handled differently, deliberately:
+
+- **Initial evaluation** (before the step loop) raises `GBMinimizerError` on failure,
+  exactly like `GeneticAlgorithmMinimizer`'s owned-mode initial evaluation -- there is
+  no sensible penalized state to start a whole MC run from (`T`/`min_gbe`/`prev_gbe` are
+  all derived from it).
+- **Proposal evaluation** (inside the step loop) is deterministically rejected on
+  failure (`accepted = False`, skipping the Metropolis draw entirely rather than
+  relying on `MC_ENERGY_PENALTY` alone making acceptance vanishingly unlikely) and is
+  not registered for artifact retention (there is no real relaxed structure to
+  register) -- otherwise falling through the loop's existing rejection path
+  unchanged (`operation_list`, `rejection_count`, cooldown). This is a real,
+  intentional behavior change (a previously-crashing run now degrades gracefully),
+  pinned by `test_proposal_evaluator_exception_rejects_step_without_crashing`/
+  `test_initial_evaluator_exception_raises` in `tests/test_optimization_monte_carlo.py`.
+
+Five pre-existing checkpoint tests (`test_run_mc_checkpoint_file_is_valid_json`,
+`..._format_pickle`, `..._resume_from_json`, `..._resume_from_pickle`,
+`..._interval_respected`) used an evaluator exception purely as a mechanism to
+interrupt a run mid-way so they could inspect intermediate checkpoint state -- not to
+test evaluation semantics. Since an evaluator exception no longer interrupts anything,
+they now use a `mutator.mutate` patch (`_install_mutate_crash`, still uncaught,
+still propagates) as the interruption mechanism instead, preserving each test's
+original step-count-to-checkpoint-state relationship.
+
+**Resolve at**: no action needed; this closes R21's own asymmetry note.
+
 ## R23's legacy GA scalar/batch path adds a batch-callback recovery boundary that did not exist before, and does not route reconstruction through `CandidateLoader`
 
 Issue #83 requires "every MC/GA evaluation produces an `EvaluationResult`" and asks to
