@@ -208,6 +208,67 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
             minimizer.run_GA(unique_id=16, checkpoint_file=cp,
                              checkpoint_format="yaml")
 
+    def _rewrite_checkpoint(self, cp, mutate):
+        with open(cp) as f:
+            state = json.load(f)
+        mutate(state)
+        with open(cp, "w") as f:
+            json.dump(state, f)
+
+    def test_run_ga_checkpoint_missing_required_field_raises(self):
+        cp = Path(self.tmpdir.name) / "ga_missing_field.json"
+        self._make_minimizer(generations=1).run_GA(unique_id=18, checkpoint_file=cp)
+        self._rewrite_checkpoint(cp, lambda state: state.pop("state"))
+
+        with self.assertRaisesRegex(
+            GBMinimizerError, "Invalid GeneticAlgorithmMinimizer"
+        ):
+            self._make_minimizer(generations=2).run_GA(
+                unique_id=18, checkpoint_file=cp
+            )
+
+    def test_run_ga_checkpoint_wrong_minimizer_raises(self):
+        cp = Path(self.tmpdir.name) / "ga_wrong_minimizer.json"
+        self._make_minimizer(generations=1).run_GA(unique_id=19, checkpoint_file=cp)
+        self._rewrite_checkpoint(
+            cp, lambda state: state.__setitem__("minimizer", "MonteCarloMinimizer")
+        )
+
+        with self.assertRaisesRegex(
+            GBMinimizerError, "Invalid GeneticAlgorithmMinimizer"
+        ):
+            self._make_minimizer(generations=2).run_GA(
+                unique_id=19, checkpoint_file=cp
+            )
+
+    def test_run_ga_checkpoint_unsupported_schema_version_raises(self):
+        cp = Path(self.tmpdir.name) / "ga_bad_schema.json"
+        self._make_minimizer(generations=1).run_GA(unique_id=20, checkpoint_file=cp)
+        self._rewrite_checkpoint(
+            cp, lambda state: state.__setitem__("schema_version", 99)
+        )
+
+        with self.assertRaisesRegex(
+            GBMinimizerError, "Invalid GeneticAlgorithmMinimizer"
+        ):
+            self._make_minimizer(generations=2).run_GA(
+                unique_id=20, checkpoint_file=cp
+            )
+
+    def test_run_ga_checkpoint_malformed_progress_index_raises(self):
+        cp = Path(self.tmpdir.name) / "ga_bad_progress.json"
+        self._make_minimizer(generations=1).run_GA(unique_id=21, checkpoint_file=cp)
+        self._rewrite_checkpoint(
+            cp, lambda state: state.__setitem__("progress_index", -1)
+        )
+
+        with self.assertRaisesRegex(
+            GBMinimizerError, "Invalid GeneticAlgorithmMinimizer"
+        ):
+            self._make_minimizer(generations=2).run_GA(
+                unique_id=21, checkpoint_file=cp
+            )
+
 
 class TestGAIntraGenerationCheckpointing(unittest.TestCase):
 
@@ -2115,6 +2176,68 @@ def test_owned_resume_rejects_invalid_checkpoint_state(owned_ga, tmp_path):
     )
     with pytest.raises(GBMinimizerError, match="supported explicit-ownership"):
         resumed.run_GA(unique_id=208, checkpoint_file=checkpoint)
+
+
+def test_owned_resume_rejects_checkpoint_missing_a_required_field(owned_ga, tmp_path):
+    energy = _owned_checkpoint_energy(tmp_path)
+    checkpoint = tmp_path / "missing_field.json"
+    _make_owned_checkpoint_minimizer(owned_ga, energy, generations=1).run_GA(
+        unique_id=209, checkpoint_file=checkpoint
+    )
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    del state["run_params"]
+    checkpoint.write_text(json.dumps(state), encoding="utf-8")
+
+    resumed = _make_owned_checkpoint_minimizer(owned_ga, energy, generations=2)
+    with pytest.raises(GBMinimizerError, match="Invalid explicit-ownership GA"):
+        resumed.run_GA(unique_id=209, checkpoint_file=checkpoint)
+
+
+def test_owned_resume_rejects_checkpoint_from_a_different_minimizer(
+    owned_ga, tmp_path
+):
+    energy = _owned_checkpoint_energy(tmp_path)
+    checkpoint = tmp_path / "wrong_minimizer.json"
+    _make_owned_checkpoint_minimizer(owned_ga, energy, generations=1).run_GA(
+        unique_id=210, checkpoint_file=checkpoint
+    )
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    state["minimizer"] = "MonteCarloMinimizer"
+    checkpoint.write_text(json.dumps(state), encoding="utf-8")
+
+    resumed = _make_owned_checkpoint_minimizer(owned_ga, energy, generations=2)
+    with pytest.raises(GBMinimizerError, match="Invalid explicit-ownership GA"):
+        resumed.run_GA(unique_id=210, checkpoint_file=checkpoint)
+
+
+def test_owned_resume_rejects_unsupported_schema_version(owned_ga, tmp_path):
+    energy = _owned_checkpoint_energy(tmp_path)
+    checkpoint = tmp_path / "bad_schema.json"
+    _make_owned_checkpoint_minimizer(owned_ga, energy, generations=1).run_GA(
+        unique_id=211, checkpoint_file=checkpoint
+    )
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    state["schema_version"] = 42
+    checkpoint.write_text(json.dumps(state), encoding="utf-8")
+
+    resumed = _make_owned_checkpoint_minimizer(owned_ga, energy, generations=2)
+    with pytest.raises(GBMinimizerError, match="Invalid explicit-ownership GA"):
+        resumed.run_GA(unique_id=211, checkpoint_file=checkpoint)
+
+
+def test_owned_resume_rejects_malformed_progress_index(owned_ga, tmp_path):
+    energy = _owned_checkpoint_energy(tmp_path)
+    checkpoint = tmp_path / "bad_progress.json"
+    _make_owned_checkpoint_minimizer(owned_ga, energy, generations=1).run_GA(
+        unique_id=212, checkpoint_file=checkpoint
+    )
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    state["progress_index"] = -1
+    checkpoint.write_text(json.dumps(state), encoding="utf-8")
+
+    resumed = _make_owned_checkpoint_minimizer(owned_ga, energy, generations=2)
+    with pytest.raises(GBMinimizerError, match="Invalid explicit-ownership GA"):
+        resumed.run_GA(unique_id=212, checkpoint_file=checkpoint)
 
 
 def test_owned_checkpointing_is_optional(owned_ga, tmp_path):

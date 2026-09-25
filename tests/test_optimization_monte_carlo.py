@@ -771,6 +771,86 @@ def test_resume_restores_seed_from_checkpoint(gb, tmp_path):
 
 
 # --------------------------------------------------------------------------------------
+# Checkpoint envelope validation (issue #86)
+# --------------------------------------------------------------------------------------
+
+
+def _make_mc_checkpoint(gb, tmp_path, name="mc_envelope.json"):
+    checkpoint = tmp_path / name
+    _make_minimizer(gb, _make_energy_func(gb)).run_MC(
+        max_steps=2,
+        unique_id="mc-envelope",
+        checkpoint_file=checkpoint,
+    )
+    return checkpoint
+
+
+def _rewrite_checkpoint(checkpoint, mutate):
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    mutate(saved)
+    checkpoint.write_text(json.dumps(saved), encoding="utf-8")
+
+
+def test_resume_rejects_checkpoint_missing_a_required_field(gb, tmp_path):
+    checkpoint = _make_mc_checkpoint(gb, tmp_path)
+    _rewrite_checkpoint(checkpoint, lambda saved: saved.pop("state"))
+
+    with pytest.raises(GBMinimizerError, match="Invalid MonteCarloMinimizer"):
+        _make_minimizer(gb, _make_energy_func(gb)).run_MC(
+            max_steps=4, checkpoint_file=checkpoint
+        )
+
+
+def test_resume_rejects_checkpoint_from_a_different_minimizer(gb, tmp_path):
+    checkpoint = _make_mc_checkpoint(gb, tmp_path)
+    _rewrite_checkpoint(
+        checkpoint, lambda saved: saved.__setitem__(
+            "minimizer", "GeneticAlgorithmMinimizer"
+        )
+    )
+
+    with pytest.raises(GBMinimizerError, match="Invalid MonteCarloMinimizer"):
+        _make_minimizer(gb, _make_energy_func(gb)).run_MC(
+            max_steps=4, checkpoint_file=checkpoint
+        )
+
+
+def test_resume_rejects_unsupported_schema_version(gb, tmp_path):
+    checkpoint = _make_mc_checkpoint(gb, tmp_path)
+    _rewrite_checkpoint(
+        checkpoint, lambda saved: saved.__setitem__("schema_version", 2)
+    )
+
+    with pytest.raises(GBMinimizerError, match="Invalid MonteCarloMinimizer"):
+        _make_minimizer(gb, _make_energy_func(gb)).run_MC(
+            max_steps=4, checkpoint_file=checkpoint
+        )
+
+
+@pytest.mark.parametrize("bad_index", [-1, 1.5, "3"])
+def test_resume_rejects_malformed_progress_index(gb, tmp_path, bad_index):
+    checkpoint = _make_mc_checkpoint(gb, tmp_path)
+    _rewrite_checkpoint(
+        checkpoint, lambda saved: saved.__setitem__("progress_index", bad_index)
+    )
+
+    with pytest.raises(GBMinimizerError, match="Invalid MonteCarloMinimizer"):
+        _make_minimizer(gb, _make_energy_func(gb)).run_MC(
+            max_steps=4, checkpoint_file=checkpoint
+        )
+
+
+def test_resume_rejects_a_corrupted_non_dict_envelope(gb, tmp_path):
+    checkpoint = _make_mc_checkpoint(gb, tmp_path)
+    checkpoint.write_text(json.dumps(["not", "an", "envelope"]), encoding="utf-8")
+
+    with pytest.raises(GBMinimizerError, match="Invalid MonteCarloMinimizer"):
+        _make_minimizer(gb, _make_energy_func(gb)).run_MC(
+            max_steps=4, checkpoint_file=checkpoint
+        )
+
+
+# --------------------------------------------------------------------------------------
 # Third-party operations via choices + registry (issue #80 AC7/AC8)
 # --------------------------------------------------------------------------------------
 

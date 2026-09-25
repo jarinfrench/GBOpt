@@ -44,9 +44,11 @@ from GBOpt.artifacts.types import (
 from GBOpt.Checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     CandidateCheckpoint,
+    CheckpointCompatibilityError,
     CheckpointError,
     CheckpointStore,
     _wrap_batch_func_with_checkpoint,
+    validate_checkpoint_envelope,
 )
 from GBOpt.evaluation import (
     EvaluationResult,
@@ -1982,62 +1984,74 @@ class GeneticAlgorithmMinimizer:
             raise GBMinimizerValueError(str(e)) from e
 
         if state is not None:
-            self.GBE_vals = state["state"]["GBE_vals"]
-            self.history = state["state"]["history"]
-            self.local_random.bit_generator.state = state["rng_state"]
-            self.seed = state["run_params"].get("seed", self.seed)
-            _start_gen = state["progress_index"] + 1
-            best_energy = state["best_energy"]
-            best_dump = state["best_dump"]
-            # Drop any stale iter checkpoint for the just-completed generation
-            stale = CandidateCheckpoint._derive_path(
-                checkpoint_file, state["progress_index"])
-            if stale.exists():
-                stale.unlink()
-            population_lineages = state["state"]["population_lineages"]
-            cached_states = state["state"].get(
-                "population_cached_evaluations",
-                [None] * self.population_size,
-            )
-            if not isinstance(cached_states, list) or len(cached_states) != len(
-                population_lineages
-            ):
-                raise GBMinimizerError(
-                    "checkpoint cached evaluations are not population-aligned"
+            try:
+                validate_checkpoint_envelope(
+                    state, minimizer="GeneticAlgorithmMinimizer",
+                    progress_unit="generation",
                 )
-            population_cached_evaluations = [
-                self._cached_evaluation_from_state(cached_state)
-                for cached_state in cached_states
-            ]
-            population_checkpoint_paths = state["state"].get(
-                "population_checkpoint_paths",
-                [lin[1] for lin in state["state"]["population_lineages"]]
-            )
-            population_manipulators = []
-            population_structures = []
-            for cp_path in population_checkpoint_paths:
-                try:
-                    manip = self._make_manipulator_from_file(cp_path)
-                except Exception as exc:
+                self.GBE_vals = state["state"]["GBE_vals"]
+                self.history = state["state"]["history"]
+                self.local_random.bit_generator.state = state["rng_state"]
+                self.seed = state["run_params"].get("seed", self.seed)
+                _start_gen = state["progress_index"] + 1
+                best_energy = state["best_energy"]
+                best_dump = state["best_dump"]
+                # Drop any stale iter checkpoint for the just-completed generation
+                stale = CandidateCheckpoint._derive_path(
+                    checkpoint_file, state["progress_index"])
+                if stale.exists():
+                    stale.unlink()
+                population_lineages = state["state"]["population_lineages"]
+                cached_states = state["state"].get(
+                    "population_cached_evaluations",
+                    [None] * self.population_size,
+                )
+                if not isinstance(cached_states, list) or len(cached_states) != len(
+                    population_lineages
+                ):
                     raise GBMinimizerError(
-                        f"Checkpoint population path {cp_path} is missing/unreadable."
-                    ) from exc
-                population_manipulators.append(manip)
-                population_structures.append(
-                    np.array(manip.parents[0].whole_system, copy=True)
+                        "checkpoint cached evaluations are not population-aligned"
+                    )
+                population_cached_evaluations = [
+                    self._cached_evaluation_from_state(cached_state)
+                    for cached_state in cached_states
+                ]
+                population_checkpoint_paths = state["state"].get(
+                    "population_checkpoint_paths",
+                    [lin[1] for lin in state["state"]["population_lineages"]]
                 )
-            run_context = RunContext(
-                run_id=str(unique_id),
-                seed=self.seed,
-                algorithm=OptimizationAlgorithm.GENETIC_ALGORITHM,
-                case_id=self.case_id,
-                campaign_id=self.campaign_id,
-            )
-            self._emit(
-                OptimizationEventType.RUN_STARTED,
-                run_context=run_context,
-                iteration=_start_gen - 1,
-            )
+                population_manipulators = []
+                population_structures = []
+                for cp_path in population_checkpoint_paths:
+                    try:
+                        manip = self._make_manipulator_from_file(cp_path)
+                    except Exception as exc:
+                        raise GBMinimizerError(
+                            f"Checkpoint population path {cp_path} is "
+                            "missing/unreadable."
+                        ) from exc
+                    population_manipulators.append(manip)
+                    population_structures.append(
+                        np.array(manip.parents[0].whole_system, copy=True)
+                    )
+                run_context = RunContext(
+                    run_id=str(unique_id),
+                    seed=self.seed,
+                    algorithm=OptimizationAlgorithm.GENETIC_ALGORITHM,
+                    case_id=self.case_id,
+                    campaign_id=self.campaign_id,
+                )
+                self._emit(
+                    OptimizationEventType.RUN_STARTED,
+                    run_context=run_context,
+                    iteration=_start_gen - 1,
+                )
+            except GBMinimizerError:
+                raise
+            except (CheckpointCompatibilityError, KeyError, TypeError, ValueError) as exc:
+                raise GBMinimizerError(
+                    f"Invalid GeneticAlgorithmMinimizer checkpoint envelope: {exc}"
+                ) from exc
         else:
             run_context = RunContext(
                 run_id=str(unique_id),
@@ -2437,18 +2451,10 @@ class GeneticAlgorithmMinimizer:
         materializable_records: dict[str, CandidateEvaluation] = {}
         if state is not None:
             try:
-                if not isinstance(state, dict):
-                    raise GBMinimizerError(
-                        "checkpoint envelope must be a dictionary"
-                    )
-                if (
-                    state.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
-                    or state.get("minimizer") != "GeneticAlgorithmMinimizer"
-                    or state.get("progress_unit") != "generation"
-                ):
-                    raise GBMinimizerError(
-                        "checkpoint envelope is not a supported genetic-algorithm state"
-                    )
+                validate_checkpoint_envelope(
+                    state, minimizer="GeneticAlgorithmMinimizer",
+                    progress_unit="generation",
+                )
                 owned_state = state["state"]
                 if (
                     owned_state.get("ga_mode") != "explicit_ownership"
@@ -2492,15 +2498,9 @@ class GeneticAlgorithmMinimizer:
                             "the minimizer configuration"
                         )
 
+                # progress_index's non-negative-integer shape is already validated by
+                # validate_checkpoint_envelope above.
                 progress_index = state["progress_index"]
-                if (
-                    isinstance(progress_index, (bool, np.bool_))
-                    or not isinstance(progress_index, Integral)
-                    or progress_index < 0
-                ):
-                    raise GBMinimizerError(
-                        "owned checkpoint progress_index is invalid"
-                    )
                 self.GBE_vals = owned_state["GBE_vals"]
                 self.history = owned_state["history"]
                 if (
@@ -2689,7 +2689,9 @@ class GeneticAlgorithmMinimizer:
                 )
             except GBMinimizerError:
                 raise
-            except (KeyError, TypeError, ValueError) as exc:
+            except (
+                CheckpointCompatibilityError, KeyError, TypeError, ValueError,
+            ) as exc:
                 raise GBMinimizerError(
                     f"Invalid explicit-ownership GA checkpoint state: {exc}"
                 ) from exc

@@ -32,8 +32,10 @@ from GBOpt.artifacts.types import (
 )
 from GBOpt.Checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
+    CheckpointCompatibilityError,
     CheckpointError,
     CheckpointStore,
+    validate_checkpoint_envelope,
 )
 from GBOpt.evaluation import (
     EvaluationResult,
@@ -559,67 +561,79 @@ class MonteCarloMinimizer:
         current_candidate_id: str | None = None
         best_candidate_id: str | None = None
         if state is not None:
-            self.GBE_vals = state["state"]["GBE_vals"]
-            self.accepted_idx = state["state"]["accepted_idx"]
-            self.operation_list = state["state"]["operation_list"]
-            self.local_random.bit_generator.state = state["rng_state"]
-            unique_id = str(state["run_params"]["unique_id"])
-            min_steps = state["run_params"]["min_steps"]
-            cooldown_rate = state["run_params"]["cooldown_rate"]
-            self.seed = state["run_params"].get("seed", self.seed)
-            _resume_step = state["progress_index"] + 1
-            T = state["state"]["T"]
-            rejection_count = state["state"]["rejection_count"]
-            min_gbe = state["best_energy"]
-            prev_gbe = state["state"]["prev_gbe"]
-            best_dump = state["best_dump"]
-            _current_dump = state["state"]["current_structure_dump"]
-            self.manipulator = self._load_mc_relaxed_manipulator(
-                _current_dump,
-                type_dict=type_dict,
-            )
+            try:
+                validate_checkpoint_envelope(
+                    state, minimizer="MonteCarloMinimizer", progress_unit="step"
+                )
+                self.GBE_vals = state["state"]["GBE_vals"]
+                self.accepted_idx = state["state"]["accepted_idx"]
+                self.operation_list = state["state"]["operation_list"]
+                self.local_random.bit_generator.state = state["rng_state"]
+                unique_id = str(state["run_params"]["unique_id"])
+                min_steps = state["run_params"]["min_steps"]
+                cooldown_rate = state["run_params"]["cooldown_rate"]
+                self.seed = state["run_params"].get("seed", self.seed)
+                _resume_step = state["progress_index"] + 1
+                T = state["state"]["T"]
+                rejection_count = state["state"]["rejection_count"]
+                min_gbe = state["best_energy"]
+                prev_gbe = state["state"]["prev_gbe"]
+                best_dump = state["best_dump"]
+                _current_dump = state["state"]["current_structure_dump"]
+                self.manipulator = self._load_mc_relaxed_manipulator(
+                    _current_dump,
+                    type_dict=type_dict,
+                )
 
-            retention_state = state["state"].get("artifact_store")
-            if retention_state is None:
-                if self.retention_policy is not None:
-                    raise GBMinimizerError(
-                        "checkpoint retention policy does not match the minimizer "
-                        "configuration"
+                retention_state = state["state"].get("artifact_store")
+                if retention_state is None:
+                    if self.retention_policy is not None:
+                        raise GBMinimizerError(
+                            "checkpoint retention policy does not match the "
+                            "minimizer configuration"
+                        )
+                    self.artifact_store = None
+                else:
+                    try:
+                        self.artifact_store = ArtifactStore.from_state(
+                            retention_state,
+                            policy=self.retention_policy,
+                        )
+                    except ArtifactStoreError as exc:
+                        raise GBMinimizerError(str(exc)) from exc
+                    try:
+                        for artifact in self.artifact_store.records():
+                            if artifact.archive_path is not None and not Path(
+                                artifact.archive_path
+                            ).is_file():
+                                raise GBMinimizerError(
+                                    f"retained archive path {artifact.archive_path} "
+                                    "is missing"
+                                )
+                    except ArtifactStoreError as exc:
+                        raise GBMinimizerError(str(exc)) from exc
+                    current_candidate_id = self._mc_pin_owner(
+                        ArtifactPin.RUN_CHECKPOINT
                     )
-                self.artifact_store = None
-            else:
-                try:
-                    self.artifact_store = ArtifactStore.from_state(
-                        retention_state,
-                        policy=self.retention_policy,
-                    )
-                except ArtifactStoreError as exc:
-                    raise GBMinimizerError(str(exc)) from exc
-                try:
-                    for artifact in self.artifact_store.records():
-                        if artifact.archive_path is not None and not Path(
-                            artifact.archive_path
-                        ).is_file():
-                            raise GBMinimizerError(
-                                f"retained archive path {artifact.archive_path} is "
-                                "missing"
-                            )
-                except ArtifactStoreError as exc:
-                    raise GBMinimizerError(str(exc)) from exc
-                current_candidate_id = self._mc_pin_owner(ArtifactPin.RUN_CHECKPOINT)
-                best_candidate_id = self._mc_pin_owner(ArtifactPin.BEST_RESULT)
-            run_context = RunContext(
-                run_id=unique_id,
-                seed=self.seed,
-                algorithm=OptimizationAlgorithm.MONTE_CARLO,
-                case_id=self.case_id,
-                campaign_id=self.campaign_id,
-            )
-            self._emit(
-                OptimizationEventType.RUN_STARTED,
-                run_context=run_context,
-                iteration=_resume_step - 1,
-            )
+                    best_candidate_id = self._mc_pin_owner(ArtifactPin.BEST_RESULT)
+                run_context = RunContext(
+                    run_id=unique_id,
+                    seed=self.seed,
+                    algorithm=OptimizationAlgorithm.MONTE_CARLO,
+                    case_id=self.case_id,
+                    campaign_id=self.campaign_id,
+                )
+                self._emit(
+                    OptimizationEventType.RUN_STARTED,
+                    run_context=run_context,
+                    iteration=_resume_step - 1,
+                )
+            except GBMinimizerError:
+                raise
+            except (CheckpointCompatibilityError, KeyError, TypeError, ValueError) as exc:
+                raise GBMinimizerError(
+                    f"Invalid MonteCarloMinimizer checkpoint envelope: {exc}"
+                ) from exc
         else:
             _resume_step = 1
             unique_id = str(uuid.uuid4()) if unique_id is None else str(unique_id)
