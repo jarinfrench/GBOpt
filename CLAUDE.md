@@ -239,6 +239,21 @@ the issue or step that produced it.
   reproduced the baseline's exact 41/46 counts. Don't read a large tool-count jump as
   a real regression before confirming the same config file was actually in place for
   both runs being compared.
+  **Correction from R24:** the config file being genuinely present and correctly
+  configured is not sufficient either -- `pyscn` resolves `.pyscn.toml` by searching
+  upward from the *target file's own path*, not from the current working directory, so
+  checking a pre-change baseline copy into a location outside the repo tree (e.g.
+  `/tmp/baseline/monte_carlo.py`, copied there via `git show HEAD:... > /tmp/...` to
+  avoid disturbing the working tree) silently falls back to `pyscn`'s hardcoded
+  defaults for that one invocation, with no warning distinguishing it from the
+  in-repo run that *did* find the real config -- both commands "succeed," but only one
+  used the configured thresholds (confirmed by comparing `pyscn check
+  /tmp/baseline/monte_carlo.py`'s complexity threshold, 10, against `pyscn check
+  GBOpt/optimization/monte_carlo.py`'s, 20, on the exact same underlying file
+  contents). Put every baseline comparison file inside the repo tree (a scratch
+  subdirectory such as `.baseline_scratch/`, deleted before staging) rather than in
+  `/tmp` or any other path outside it, so `.pyscn.toml`'s upward search finds the same
+  config for both sides of the comparison.
 - **A recovery boundary an earlier roadmap step's `CLAUDE.md` entry documented as
   missing (not a bug, just an asymmetry noted for "whichever later step's own
   acceptance criteria require it") should be added the moment a later step's
@@ -254,6 +269,42 @@ the issue or step that produced it.
   GA's per-candidate recovery-boundary pattern) -- disclosed as a real, intentional
   behavior change in `REFACTOR_CLEANUP.md`, with dedicated regression tests, rather
   than left as a subject for yet another future step.
+- **A `REFACTOR_CLEANUP.md` entry's "no action needed unless a later step's issue
+  explicitly asks for broader lifecycle instrumentation" is exactly the kind of thing
+  to re-check against a new step's real acceptance criteria, not assume still
+  deferred.** R21 scoped its logging instrumentation narrowly (only MC's termination
+  `print()` calls and GA's three evaluator/reload-failure warnings), explicitly noting
+  that broader "run start, initial evaluation, best updates, generation summaries"
+  instrumentation the issue's own prose mentioned was left for a future step to decide
+  it actually needs. R24 (#84, "introduce one versioned event vocabulary for MC and GA
+  lifecycle reporting... silent by default") is exactly that future step -- its
+  acceptance criteria literally ask for start/initial-evaluation/proposal/accept-
+  reject/best-update/generation-boundary/reseed/termination/failure emissions, the
+  same list R21's prose gestured at and its own criteria didn't require. Confirmed by
+  re-reading R21's `REFACTOR_CLEANUP.md` entry before starting, not assumed from the
+  roadmap summary alone; R24 does not touch R21's own narrower logging calls
+  (`logger.info`/`logger.warning`), which remain as R21 left them -- it adds a
+  separate, parallel event-emission mechanism, not a replacement for logging.
+- **An earlier step's `REFACTOR_CLEANUP.md` entry gesturing at "a later step" needing
+  a checkpoint-serialization form is not automatically that later step, even when the
+  later step is squarely about the same subsystem -- check the later issue's actual
+  acceptance criteria for what it says about checkpoints specifically.** R22's/R23's
+  entries both flagged "no action needed unless a later step... needs `EvaluationResult`
+  a checkpoint-serialization form," naming R23/R26+ as candidates. R24 is about MC/GA
+  the same evaluation subsystem, but its own acceptance criteria explicitly wall events
+  off from checkpoints in both directions ("checkpoint files are not used as event
+  logs and events are not accepted as restart state") -- the literal opposite of a
+  request to add checkpoint-serialization support to `EvaluationResult`. Confirmed by
+  reading the criterion text itself rather than assuming "touches the same objects" is
+  enough to resolve a vaguely-worded earlier deferral.
+- **A harness-created branch for a new roadmap step reproduced the exact "identical to
+  `main`'s tip" failure mode documented for R23, on the very next step.** Starting R24,
+  the harness had created `claude/affectionate-darwin-oljxid`; `git rev-parse` showed it
+  matched `origin/main` exactly, zero roadmap commits. Same fix as R23's own entry
+  describes (`git checkout -B <branch> origin/<real-prerequisite-branch>`, verified with
+  `git rev-parse`/`git log` before building anything on top of it) -- recorded here only
+  to confirm this is a recurring harness behavior worth checking every single time, not
+  a one-off from R23 specifically.
 - Before opening a PR, run `ruff`, `mypy`, `bandit`, and `pyscn` (see
   "Tooling" below) and report the results.
 - **Never open a PR without being explicitly told to.** The user reviews
@@ -1145,6 +1196,29 @@ Established by `GBOpt/crystallography/` and `GBOpt/artifacts/`, and now also
   acceptance criterion was therefore only meaningfully actionable for GA;
   confirmed by grep before writing any fix, not inferred from the two
   classes' shared docstring language or from one class's own fix pattern.
+- **A new type's field that mirrors an existing authoritative field must copy that
+  field's own validation contract, not a superficially-similar sibling field's.**
+  R24's `OptimizationEvent` has both an `iteration` field (an MC step/GA generation
+  index, always genuinely non-negative) and an `input_index` field (meant to mirror
+  `EvaluationResult.input_index`/`CandidateEvaluation.input_index` exactly). The first
+  draft normalized both through the same "non-negative integer" helper, since they
+  look like the same kind of thing (a small integer index) -- but
+  `CandidateEvaluation.input_index` uses `-1` as an established sentinel for "the
+  owned-mode initial candidate, not a submitted population member"
+  (`_run_owned_GA`'s `self._owned_evaluator.evaluate_candidate(..., -1)` call), and
+  `EvaluationResult.input_index`'s own normalizer (`GBOpt/evaluation/types.py`'s
+  `_normalize_input_index`) already accepts any integer, never enforcing
+  non-negativity. Reusing the stricter helper meant every owned-mode
+  `INITIAL_EVALUATION` event raised `ObservabilityValueError` the instant a real run
+  tried to emit one -- caught only by writing a test that actually ran the owned-mode
+  initial-evaluation path with a real event sink, not by the type's own unit tests
+  (which never happened to construct that specific value). The fix was a second,
+  separate normalizer matching the authoritative source's own actual contract, not a
+  stricter one chosen because two fields both happen to be called "index." Before
+  writing a new validator for a field that mirrors an existing one, check that
+  existing field's own normalizer/constructor for exactly what it allows, rather than
+  designing from the field's name or its resemblance to a different field on the same
+  type.
 
 ## Mypy and lint debugging patterns
 
