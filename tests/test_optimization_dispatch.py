@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 
 from GBOpt.GBManipulator import GBManipulatorValueError
-from GBOpt.optimization.dispatch import run_legacy_compat_operation, select_operation_order
+from GBOpt.optimization.dispatch import (
+    run_legacy_compat_binary_operation,
+    run_legacy_compat_operation,
+    select_operation_order,
+)
 from GBOpt.optimization.types import GBMinimizerError, OperationSpec
 
 # --------------------------------------------------------------------------------------
@@ -160,3 +164,69 @@ def test_does_not_catch_an_unexpected_exception_type():
         run_legacy_compat_operation(
             specs, rng=FixedRandom(), manipulator=object(), legacy_invokers=invokers
         )
+
+
+# --------------------------------------------------------------------------------------
+# run_legacy_compat_binary_operation
+# --------------------------------------------------------------------------------------
+
+
+def test_binary_returns_the_first_successful_invocation():
+    class FixedRandom:
+        def permutation(self, size):
+            return np.array(range(size))
+
+    specs = [_spec("cross", weight=1.0)]
+    invokers = {
+        "cross": lambda p1, p2, rng: ("cross", "manipulator", "atoms"),
+    }
+    result = run_legacy_compat_binary_operation(
+        specs, rng=FixedRandom(), parent1="p1", parent2="p2", legacy_invokers=invokers
+    )
+    assert result == ("cross", "manipulator", "atoms")
+
+
+def test_binary_returns_none_when_every_spec_is_infeasible_for_this_pair():
+    class FixedRandom:
+        def permutation(self, size):
+            return np.array(range(size))
+
+    specs = [_spec("cross", weight=1.0)]
+    invokers = {
+        "cross": lambda p1, p2, rng: (_ for _ in ()).throw(
+            GBManipulatorValueError("incompatible pair")
+        ),
+    }
+    result = run_legacy_compat_binary_operation(
+        specs, rng=FixedRandom(), parent1="p1", parent2="p2", legacy_invokers=invokers
+    )
+    assert result is None
+
+
+def test_binary_does_not_catch_an_unexpected_exception_type():
+    class FixedRandom:
+        def permutation(self, size):
+            return np.array(range(size))
+
+    specs = [_spec("cross", weight=1.0)]
+    invokers = {
+        "cross": lambda p1, p2, rng: (_ for _ in ()).throw(RuntimeError("boom")),
+    }
+    with pytest.raises(RuntimeError, match="boom"):
+        run_legacy_compat_binary_operation(
+            specs, rng=FixedRandom(), parent1="p1", parent2="p2", legacy_invokers=invokers
+        )
+
+
+def test_binary_single_member_pool_consumes_no_rng_state():
+    rng = np.random.default_rng(123)
+    state_before = rng.bit_generator.state
+    specs = [_spec("cross", weight=1.0)]
+    run_legacy_compat_binary_operation(
+        specs,
+        rng=rng,
+        parent1="p1",
+        parent2="p2",
+        legacy_invokers={"cross": lambda p1, p2, rng: ("cross", "m", "atoms")},
+    )
+    assert rng.bit_generator.state == state_before

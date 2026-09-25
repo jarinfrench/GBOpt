@@ -65,6 +65,51 @@ def select_operation_order(
     return np.argsort(-keys, kind="stable")
 
 
+LegacyBinaryInvoker = Callable[
+    [object, object, np.random.Generator], tuple[str, GBManipulator, np.ndarray]
+]
+
+
+def run_legacy_compat_binary_operation(
+    specs: Sequence[OperationSpec],
+    *,
+    rng: np.random.Generator,
+    parent1: object,
+    parent2: object,
+    legacy_invokers: Mapping[str, LegacyBinaryInvoker],
+) -> tuple[str, GBManipulator, np.ndarray] | None:
+    """Try ``specs`` in weighted order against one parent pair; ``None`` if all fail.
+
+    Unlike :func:`run_legacy_compat_operation`, a failure here does not mean "try
+    another configured operation against the same input forever" -- a two-parent
+    operation's own infeasibility for one specific parent *pair* is expected to be
+    retried against a *different* pair by the caller (matching
+    ``GeneticAlgorithmMinimizer``'s established ``crossover_attempts``-bounded retry),
+    not treated as fatal the way a unary operation's exhaustion is. So this returns
+    ``None`` on exhaustion instead of raising, leaving the pair-retry policy to the
+    caller.
+
+    :param specs: Keyword argument omitted; nonempty two-parent specs to try.
+    :param rng: Keyword argument, required. Random-number generator to draw from.
+    :param parent1: Keyword argument, required. First parent, in whatever
+        representation ``legacy_invokers`` expects (a ``Parent`` or a file path,
+        depending on caller).
+    :param parent2: Keyword argument, required. Second parent.
+    :param legacy_invokers: Keyword argument, required. Maps each spec's ``name`` to a
+        callable performing that operation directly against ``(parent1, parent2, rng)``.
+    :return: The successful operation's label, resulting manipulator, and atom
+        positions; ``None`` if every configured operation was infeasible for this pair.
+    """
+    order = select_operation_order(rng, specs)
+    for index in order:
+        spec = specs[int(index)]
+        try:
+            return legacy_invokers[spec.name](parent1, parent2, rng)
+        except GBManipulatorValueError:
+            continue
+    return None
+
+
 def run_legacy_compat_operation(
     specs: Sequence[OperationSpec],
     *,
@@ -105,6 +150,8 @@ def run_legacy_compat_operation(
 
 __all__ = [
     "LegacyInvoker",
+    "LegacyBinaryInvoker",
     "select_operation_order",
     "run_legacy_compat_operation",
+    "run_legacy_compat_binary_operation",
 ]
