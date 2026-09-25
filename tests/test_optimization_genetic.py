@@ -159,6 +159,34 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
         minimizer2.run_GA(unique_id=14, checkpoint_file=cp)
         self.assertEqual(len(minimizer2.history), minimizer2.generations)
 
+    def test_resolved_seed_is_retained_on_the_minimizer(self):
+        minimizer = self._make_minimizer()
+        self.assertEqual(minimizer.seed, 0)
+
+    def test_resolved_seed_from_none_is_retained_on_the_minimizer(self):
+        minimizer = GeneticAlgorithmMinimizer(
+            self.gb,
+            self._fake_energy_func,
+            ["insert_atoms", "remove_atoms", "translate_right_grain"],
+            seed=None,
+            population_size=4,
+            generations=2,
+            keep_top_pct=25,
+            intermediate_pct=75,
+        )
+        self.assertIsInstance(minimizer.seed, int)
+
+    def test_resume_restores_seed_from_checkpoint(self):
+        cp = Path(self.tmpdir.name) / "ga_seed.json"
+        minimizer = self._make_minimizer(generations=1)
+        minimizer.run_GA(unique_id=17, checkpoint_file=cp)
+        minimizer2 = self._make_minimizer(generations=2)
+        minimizer2.run_GA(unique_id=17, checkpoint_file=cp)
+        with open(cp) as f:
+            state = json.load(f)
+        self.assertEqual(state["run_params"]["seed"], 0)
+        self.assertEqual(minimizer2.seed, 0)
+
     def test_run_ga_corrupted_checkpoint_raises(self):
         cp = Path(self.tmpdir.name) / "corrupt.json"
         cp.write_bytes(b"not valid json {{{")
@@ -1780,6 +1808,32 @@ def test_owned_ga_checkpoint_json_contains_reconstruction_state(owned_ga, tmp_pa
     assert mapping["right_grain_x_bounds"]
     assert state["state"]["best_evaluation"]["mapping"] is not None
     assert len(state["state"]["last_generation_evaluations"]) == 4
+
+
+def test_owned_ga_checkpoint_json_contains_resolved_seed(owned_ga, tmp_path):
+    checkpoint = tmp_path / "owned_seed.json"
+    energy = _owned_checkpoint_energy(tmp_path)
+    minimizer = _make_owned_checkpoint_minimizer(
+        owned_ga,
+        energy,
+        generations=1,
+        seed=0,
+    )
+    assert minimizer.seed == 0
+
+    minimizer.run_GA(unique_id=205, checkpoint_file=checkpoint)
+
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert state["run_params"]["seed"] == 0
+
+    resumed = _make_owned_checkpoint_minimizer(
+        owned_ga,
+        energy,
+        generations=2,
+        seed=0,
+    )
+    resumed.run_GA(unique_id=205, checkpoint_file=checkpoint)
+    assert resumed.seed == 0
 
 
 def test_owned_ga_resume_matches_continuous_variable_cell_run(owned_ga, tmp_path):

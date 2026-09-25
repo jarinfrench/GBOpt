@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy as copy_module
 import inspect
+import logging
 import math
 import uuid
 import warnings
@@ -96,6 +97,8 @@ ENERGY_PENALTY: float = 1.0e30
 
 _OWNED_GA_CHECKPOINT_VERSION = 4
 
+logger = logging.getLogger(__name__)
+
 
 class GeneticAlgorithmMinimizer:
     """
@@ -142,6 +145,8 @@ class GeneticAlgorithmMinimizer:
             operation names is resolved by lookup in ``registry``.
         :param seed: Seed for numpy.random.default_rng. Keyword argument, optional,
             defaults to ``None``; ``None`` seeds from the current time.
+        :ivar seed: The resolved seed actually passed to ``numpy.random.default_rng``
+            (the current time when the constructor's ``seed`` argument is ``None``).
         :param initial_structure: Keyword argument, optional, defaults to ``None``.
             GBMaker or file-backed initial structure.
         :param initial_ownership: Keyword argument, optional, defaults to ``None``.
@@ -342,9 +347,8 @@ class GeneticAlgorithmMinimizer:
         self.artifact_store: ArtifactStore | None = artifact_store
         self._retention_archive_mappings: dict[str, dict] = {}
         self._artifact_provenance: _ArtifactProvenance | None = None
-        self.local_random: np.random.Generator = np.random.default_rng(
-            int(time()) if seed is None else seed
-        )
+        self.seed: int = int(time()) if seed is None else seed
+        self.local_random: np.random.Generator = np.random.default_rng(self.seed)
         self._owned_evaluator: ExplicitOwnershipEvaluator | None = (
             ExplicitOwnershipEvaluator(
                 GB=GB,
@@ -1225,11 +1229,11 @@ class GeneticAlgorithmMinimizer:
                         # Reconstructing one candidate's evaluator output is a
                         # deliberate recovery boundary: any failure here penalizes
                         # only this candidate rather than aborting the generation.
-                        warnings.warn(
-                            f"Candidate reconstruction failed for {dump!r}: "
-                            f"{type(exc).__name__}: {exc}",
-                            RuntimeWarning,
-                            stacklevel=2,
+                        logger.warning(
+                            "Candidate reconstruction failed for %r: %s: %s",
+                            dump,
+                            type(exc).__name__,
+                            exc,
                         )
                         gen_files[-1] = None
                         gen_energies[-1] = ENERGY_PENALTY
@@ -1262,11 +1266,11 @@ class GeneticAlgorithmMinimizer:
                     # The external evaluator callback is a deliberate recovery
                     # boundary: any failure here penalizes only this candidate
                     # rather than aborting the generation.
-                    warnings.warn(
-                        f"gb_energy_func failed for candidate {uid!r}: "
-                        f"{type(exc).__name__}: {exc}",
-                        RuntimeWarning,
-                        stacklevel=2,
+                    logger.warning(
+                        "gb_energy_func failed for candidate %r: %s: %s",
+                        uid,
+                        type(exc).__name__,
+                        exc,
                     )
                     gbe, dump_file_name = ENERGY_PENALTY, None
                 if gen_checkpoint is not None:
@@ -1283,11 +1287,11 @@ class GeneticAlgorithmMinimizer:
                     # Reconstructing one candidate's evaluator output is a
                     # deliberate recovery boundary: any failure here penalizes
                     # only this candidate rather than aborting the generation.
-                    warnings.warn(
-                        f"Candidate reconstruction failed for {dump_file_name!r}: "
-                        f"{type(exc).__name__}: {exc}",
-                        RuntimeWarning,
-                        stacklevel=2,
+                    logger.warning(
+                        "Candidate reconstruction failed for %r: %s: %s",
+                        dump_file_name,
+                        type(exc).__name__,
+                        exc,
                     )
                     gen_files[-1] = None
                     gen_energies[-1] = ENERGY_PENALTY
@@ -1791,6 +1795,7 @@ class GeneticAlgorithmMinimizer:
             self.GBE_vals = state["state"]["GBE_vals"]
             self.history = state["state"]["history"]
             self.local_random.bit_generator.state = state["rng_state"]
+            self.seed = state["run_params"].get("seed", self.seed)
             _start_gen = state["progress_index"] + 1
             best_energy = state["best_energy"]
             best_dump = state["best_dump"]
@@ -1891,6 +1896,7 @@ class GeneticAlgorithmMinimizer:
                     "reuse_carryover_evaluations": (
                         self.reuse_carryover_evaluations
                     ),
+                    "seed": self.seed,
                 },
                 "state": {
                     "GBE_vals": self.GBE_vals,
@@ -2208,6 +2214,7 @@ class GeneticAlgorithmMinimizer:
                         "owned checkpoint energy/history progress is inconsistent"
                     )
                 self.local_random.bit_generator.state = state["rng_state"]
+                self.seed = state["run_params"].get("seed", self.seed)
                 retention_state = owned_state.get("artifact_store")
                 if retention_state is None:
                     if self.retention_policy is not None:
@@ -2469,6 +2476,7 @@ class GeneticAlgorithmMinimizer:
                         [species, coefficient]
                         for species, coefficient in self.composition_policy
                     ],
+                    "seed": self.seed,
                 },
                 "state": {
                     "ga_mode": "explicit_ownership",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import shutil
 import uuid
@@ -57,6 +58,8 @@ from GBOpt.optimization.types import (
     GBMinimizerValueError,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class MonteCarloMinimizer:
     """
@@ -70,6 +73,8 @@ class MonteCarloMinimizer:
     :param choices: A list of strings corresponding to GBManipulator operations. Used in
         setting up the Mutator class.
     :param seed: The seed to initialize the numpy.random.default_rng with.
+    :ivar seed: The resolved seed actually passed to ``numpy.random.default_rng``
+        (the current time when the constructor's ``seed`` argument is ``None``).
     """
 
     def __init__(
@@ -137,8 +142,8 @@ class MonteCarloMinimizer:
         self.mutator = Mutator(choices, self.manipulator, registry=registry)
         self.accepted_idx = [0]  # Initial guess is accepted by definition
         self.operation_list = [["START", True]]
-        self.local_random = np.random.default_rng(
-            int(time()) if seed is None else seed)
+        self.seed: int = int(time()) if seed is None else seed
+        self.local_random = np.random.default_rng(self.seed)
         self.manipulator.rng = self.local_random
         self.GBE_vals: list[float] = []
 
@@ -490,6 +495,7 @@ class MonteCarloMinimizer:
             unique_id = str(state["run_params"]["unique_id"])
             min_steps = state["run_params"]["min_steps"]
             cooldown_rate = state["run_params"]["cooldown_rate"]
+            self.seed = state["run_params"].get("seed", self.seed)
             _resume_step = state["progress_index"] + 1
             T = state["state"]["T"]
             rejection_count = state["state"]["rejection_count"]
@@ -621,6 +627,7 @@ class MonteCarloMinimizer:
                     "max_rejections": max_rejections,
                     "cooldown_rate": cooldown_rate,
                     "unique_id": str(unique_id),
+                    "seed": self.seed,
                 },
                 "state": {
                     "T": T,
@@ -778,7 +785,13 @@ class MonteCarloMinimizer:
                             raise GBMinimizerError(str(exc)) from exc
                         best_candidate_id = trial_candidate_id
                     if 0 < del_E <= E_tol and (min_steps is None or i >= min_steps):
-                        print("Meets energy tolerance criterion")
+                        logger.info(
+                            "MC run %s met energy tolerance criterion at step %d "
+                            "(best energy %.6g)",
+                            unique_id,
+                            i,
+                            min_gbe,
+                        )
                         _last_completed_step = i
                         _commit_step(i, final=True)
                         _early_exit = True
@@ -787,7 +800,13 @@ class MonteCarloMinimizer:
                 self.operation_list.append([mutation, False])
                 rejection_count += 1
                 if rejection_count > max_rejections:
-                    print("Too many rejections!")
+                    logger.info(
+                        "MC run %s terminated after %d consecutive rejections "
+                        "at step %d",
+                        unique_id,
+                        rejection_count,
+                        i,
+                    )
                     T *= cooldown_rate
                     _last_completed_step = i
                     _commit_step(i, final=True)

@@ -628,6 +628,78 @@ def test_resume_restores_min_steps_from_checkpoint(gb, tmp_path):
     assert saved["run_params"]["min_steps"] == 5
 
 
+def test_resolved_seed_is_retained_on_the_minimizer(gb):
+    minimizer = MonteCarloMinimizer(
+        gb, _make_energy_func(gb), ["translate_right_grain"], seed=0
+    )
+    assert minimizer.seed == 0
+
+
+def test_resolved_seed_from_none_is_retained_on_the_minimizer(gb):
+    minimizer = MonteCarloMinimizer(
+        gb, _make_energy_func(gb), ["translate_right_grain"], seed=None
+    )
+    assert isinstance(minimizer.seed, int)
+
+
+def test_energy_tolerance_termination_logs_instead_of_printing(gb, tmp_path, capsys):
+    root = tmp_path / "structures"
+    energy_func = _make_sequence_energy_func([2.0, 1.99995], root)
+    mc = MonteCarloMinimizer(gb, energy_func, ["translate_right_grain"], seed=0)
+
+    mc.run_MC(max_steps=5, unique_id=99)
+
+    captured = capsys.readouterr()
+    assert "Meets energy tolerance criterion" not in captured.out
+    assert captured.out == ""
+
+
+def test_energy_tolerance_termination_emits_info_log(gb, tmp_path, caplog):
+    import logging
+
+    root = tmp_path / "structures"
+    energy_func = _make_sequence_energy_func([2.0, 1.99995], root)
+    mc = MonteCarloMinimizer(gb, energy_func, ["translate_right_grain"], seed=0)
+
+    with caplog.at_level(logging.INFO, logger="GBOpt.optimization.monte_carlo"):
+        mc.run_MC(max_steps=5, unique_id=99)
+
+    assert any(
+        "met energy tolerance criterion" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_library_is_silent_by_default_without_handlers_configured(gb, tmp_path):
+    import logging
+
+    root = tmp_path / "structures"
+    energy_func = _make_sequence_energy_func([2.0, 1.99995], root)
+    mc_logger = logging.getLogger("GBOpt.optimization.monte_carlo")
+    assert mc_logger.handlers == []
+
+    mc = MonteCarloMinimizer(gb, energy_func, ["translate_right_grain"], seed=0)
+    mc.run_MC(max_steps=5, unique_id=99)
+
+    assert mc_logger.handlers == []
+
+
+def test_resume_restores_seed_from_checkpoint(gb, tmp_path):
+    checkpoint = tmp_path / "mc_seed.json"
+    _make_minimizer(gb, _make_energy_func(gb)).run_MC(
+        max_steps=2,
+        unique_id=2,
+        checkpoint_file=checkpoint,
+    )
+
+    resumed = _make_minimizer(gb, _make_energy_func(gb))
+    resumed.run_MC(max_steps=10, checkpoint_file=checkpoint)
+
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert saved["run_params"]["seed"] == 0
+    assert resumed.seed == 0
+
+
 # --------------------------------------------------------------------------------------
 # Third-party operations via choices + registry (issue #80 AC7/AC8)
 # --------------------------------------------------------------------------------------
