@@ -43,6 +43,7 @@ def _failed_candidate_evaluation(**overrides):
         "manipulator": None,
         "success": False,
         "failure_reason": "failed",
+        "failure_stage": None,
     }
     arguments.update(overrides)
     return CandidateEvaluation(**arguments)
@@ -70,11 +71,15 @@ def test_from_candidate_evaluation_preserves_successful_fields():
     assert result.manipulator is manipulator
 
 
-def test_from_candidate_evaluation_classifies_ownership_failure_from_missing_mapping():
+def test_from_candidate_evaluation_passes_through_explicit_failure_stage():
+    # ExplicitOwnershipEvaluator (R23) attributes failure_stage itself, at the real
+    # exception type/validation check that produced the failure; the adapter reads it
+    # directly rather than re-inferring it from mapping/structure_path presence.
     record = _failed_candidate_evaluation(
         mapping=None,
         structure_path=None,
         failure_reason="explicit-ownership mutation did not propagate grain labels",
+        failure_stage=FailureStage.OWNERSHIP,
     )
 
     result = from_candidate_evaluation(record)
@@ -86,11 +91,15 @@ def test_from_candidate_evaluation_classifies_ownership_failure_from_missing_map
     assert result.failure_message == record.failure_reason
 
 
-def test_from_candidate_evaluation_defaults_non_ownership_failure_to_evaluator_stage():
+def test_from_candidate_evaluation_falls_back_to_evaluator_stage_when_absent():
+    # A record with no explicit failure_stage only arises from a pre-R23 checkpoint
+    # restore, which never persisted one; the adapter's fallback matches
+    # ExplicitOwnershipEvaluator's own documented fallback for that case.
     record = _failed_candidate_evaluation(
         mapping=object(),
         structure_path="/tmp/candidate.data",
         failure_reason="RuntimeError: calculator crashed",
+        failure_stage=None,
     )
 
     result = from_candidate_evaluation(record)

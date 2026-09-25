@@ -25,9 +25,9 @@ persist an `EvaluationResult` across a checkpoint boundary, not guessed here.
 **Resolve at**: no action needed unless a later step needs `StructureArtifact` metadata
 or an `EvaluationResult` checkpoint-serialization form.
 
-## R22's adapters cannot always distinguish `CandidateEvaluation`'s collapsed failure origin
+## R22's adapters cannot always distinguish `CandidateEvaluation`'s collapsed failure origin -- RESOLVED at R23
 
-`from_candidate_evaluation` adapts today's `CandidateEvaluation.failure_reason` -- a
+`from_candidate_evaluation` adapted R22's `CandidateEvaluation.failure_reason` -- a
 single opaque string that already collapses several distinct failure origins (evaluator
 callback exception, artifact reload failure, ownership reconstruction failure, objective
 validation) by the time `_explicit_ownership_evaluation.py` constructs it. Only the
@@ -47,10 +47,25 @@ output type. `from_scalar_tuple`/`from_batch_dict`, by contrast, see the raw,
 undecided data directly and do classify precisely (`VALIDATION` for a missing/non-finite
 energy, `ARTIFACT` for a missing/blank structure path).
 
-**Resolve at**: R23 ("Normalize MC and GA evaluation flows"), if that step wires
-`ExplicitOwnershipEvaluator` itself to construct `EvaluationResult` directly (with
-access to the real exception types at each failure site) rather than adapting from
-`CandidateEvaluation` after the fact.
+**Resolved at R23**: `ExplicitOwnershipEvaluator._failed_evaluation` now takes a
+required `stage: FailureStage` keyword, and every one of its 9 call sites across
+`evaluate_candidate`/`_record_result`/`_restore_checkpointed_result`/
+`evaluate_generation` passes the precise stage for the real exception type or
+validation check that produced the failure at that point (`OWNERSHIP` for a
+`GrainOwnershipError` from `_candidate_file_mapping` or from `_reload_mapping`;
+`PARSE` for a `LammpsDataError` from `_reload_mapping`; `ARTIFACT` for an `OSError`
+from `_reload_mapping` or a missing/invalid/reused structure path; `VALIDATION` for a
+missing or non-finite objective; `EVALUATOR` for a raw evaluator-callback exception).
+`CandidateEvaluation` itself gained a `failure_stage: FailureStage | None = None`
+field (optional, not part of any checkpoint-serialized shape, so this doesn't touch
+`CandidateEvaluationSummary`/`CandidateCheckpoint`'s own contracts) carrying this
+attribution through to `from_candidate_evaluation`, which now reads `record.
+failure_stage` directly instead of re-inferring it from `mapping is None`. The one
+remaining fallback to `EVALUATOR` is `_restore_checkpointed_result`'s restore-from-
+checkpoint path: pre-R23 checkpoint metadata never persisted a stage, so a failure
+restored from an old checkpoint has no real stage to recover, and `EVALUATOR` is the
+same disclosed default this entry originally described, now scoped to exactly that one
+case instead of every non-ownership failure.
 
 ## R22's `EvaluationStatus`/`FailureStage` reproduce the existing `(str, Enum)` UP042 finding
 

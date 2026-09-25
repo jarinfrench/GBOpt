@@ -12,10 +12,10 @@ belong here.
 from __future__ import annotations
 
 from numbers import Integral, Real
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from GBOpt._explicit_ownership_evaluation import CandidateEvaluation
 from GBOpt.evaluation.types import (
     EvaluationResult,
     EvaluationStatus,
@@ -24,6 +24,9 @@ from GBOpt.evaluation.types import (
     FailureStage,
     StructureArtifact,
 )
+
+if TYPE_CHECKING:
+    from GBOpt._explicit_ownership_evaluation import CandidateEvaluation
 
 _DEFAULT_FORMAT = "lammps"
 
@@ -94,14 +97,15 @@ def _check_identity(
 def from_candidate_evaluation(record: CandidateEvaluation) -> EvaluationResult:
     """Adapt one ownership-aware evaluation into the canonical result type.
 
-    The legacy ``failure_reason`` is a single opaque string that already collapses
-    several distinct failure origins (evaluator callback, artifact reload, ownership
-    reconstruction, objective validation). Only the ownership-construction failure is
-    unambiguously identifiable from ``record`` alone (``mapping is None`` happens
-    exactly when candidate/file mapping construction itself failed, before any
-    evaluator callback runs); every other failure is attributed to ``EVALUATOR`` as a
-    disclosed, best-effort default. Full-fidelity stage attribution requires the
-    evaluator itself to classify failures at the point they occur.
+    ``ExplicitOwnershipEvaluator`` (R23) attributes ``record.failure_stage`` itself, at
+    the real exception type/validation check that produced the failure -- this adapter
+    reads that attribution directly rather than re-inferring it from the already-
+    collapsed ``failure_reason`` string. The one remaining fallback is a failure
+    restored from a pre-R23 checkpoint, whose stored metadata never persisted a stage;
+    ``ExplicitOwnershipEvaluator`` itself attributes that case to ``EVALUATOR``, so
+    ``record.failure_stage`` is never actually ``None`` on a failed record reaching this
+    adapter, but the fallback is kept here too as defense against a non-evaluator
+    ``CandidateEvaluation`` constructed without one.
 
     :param record: Explicit-ownership evaluation to adapt.
     :return: Equivalent canonical evaluation result.
@@ -109,6 +113,13 @@ def from_candidate_evaluation(record: CandidateEvaluation) -> EvaluationResult:
     :raises EvaluationValueError: If a successful ``record`` has no ``structure_path``
         (unreachable through ``CandidateEvaluation``'s own construction invariants).
     """
+    # Local import: avoids a module-init cycle. Importing GBOpt.evaluation.types (a
+    # true leaf) still runs GBOpt/evaluation/__init__.py first (Python always executes
+    # a package's __init__ before any of its submodules), which imports this module;
+    # a module-scope import back to _explicit_ownership_evaluation here would complete
+    # the cycle. This function is the only runtime user of the real class.
+    from GBOpt._explicit_ownership_evaluation import CandidateEvaluation
+
     if not isinstance(record, CandidateEvaluation):
         raise EvaluationTypeError("record must be a CandidateEvaluation")
 
@@ -132,7 +143,7 @@ def from_candidate_evaluation(record: CandidateEvaluation) -> EvaluationResult:
         if record.structure_path is not None
         else None
     )
-    stage = FailureStage.OWNERSHIP if record.mapping is None else FailureStage.EVALUATOR
+    stage = record.failure_stage or FailureStage.EVALUATOR
     return EvaluationResult(
         candidate_id=record.candidate_id,
         input_index=record.input_index,

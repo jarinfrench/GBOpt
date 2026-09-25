@@ -19,6 +19,7 @@ from GBOpt._candidate_admissibility import (
     validate_formula_composition,
 )
 from GBOpt.Checkpoint import CandidateCheckpoint
+from GBOpt.evaluation.types import FailureStage
 from GBOpt.FileGrainOwnership import (
     CandidateFileMapping,
     GrainOwnershipError,
@@ -120,6 +121,9 @@ class CandidateEvaluation:
     :param manipulator: Validated reconstructed candidate, when successful.
     :param success: Whether evaluation and reconstruction both succeeded.
     :param failure_reason: Failure context when ``success`` is false.
+    :param failure_stage: Pipeline stage the failure originated from, required when
+        ``success`` is false and the stage is known at construction time; ``None`` only
+        for a failure restored from a pre-R23 checkpoint, which did not persist a stage.
     :raises TypeError: If scalar or path fields have invalid types.
     :raises ValueError: If objective is non-finite or success/failure fields are
         internally inconsistent.
@@ -133,6 +137,7 @@ class CandidateEvaluation:
     manipulator: GBManipulator | None
     success: bool
     failure_reason: str | None = None
+    failure_stage: FailureStage | None = None
 
     def __post_init__(self) -> None:
         """Normalize scalar fields and enforce coherent result state.
@@ -168,11 +173,19 @@ class CandidateEvaluation:
                     "manipulator"
                 )
             _validate_failure_reason(success, self.failure_reason, context="evaluation")
+            if self.failure_stage is not None:
+                raise ValueError(
+                    "successful evaluation must not include a failure_stage"
+                )
             return
 
         _validate_failure_reason(success, self.failure_reason, context="evaluation")
         if self.manipulator is not None:
             raise ValueError("failed evaluation must not include a manipulator")
+        if self.failure_stage is not None and not isinstance(
+            self.failure_stage, FailureStage
+        ):
+            raise TypeError("failure_stage must be a FailureStage or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,6 +407,8 @@ class ExplicitOwnershipEvaluator:
         reason: str,
         mapping: CandidateFileMapping | None = None,
         structure_path: str | None = None,
+        *,
+        stage: FailureStage,
     ) -> CandidateEvaluation:
         """Create one penalty-bearing failed evaluation result.
 
@@ -404,6 +419,9 @@ class ExplicitOwnershipEvaluator:
             when construction reached that stage.
         :param structure_path: Optional canonical artifact path, defaults to ``None``;
             supplied when available from the evaluator.
+        :param stage: Keyword argument, required. Pipeline stage this failure
+            originated from, attributed from the real exception type or validation
+            check at the call site, not inferred after the fact.
         :return: Failed evaluation carrying both penalty and failure context.
         :raises TypeError: If candidate identity, input index, or path state is invalid.
         :raises ValueError: If candidate identity, objective, or failure state is
@@ -418,6 +436,7 @@ class ExplicitOwnershipEvaluator:
             manipulator=None,
             success=False,
             failure_reason=reason,
+            failure_stage=stage,
         )
 
     @staticmethod
@@ -532,14 +551,21 @@ class ExplicitOwnershipEvaluator:
                 input_index,
                 f"invalid structure path: {type(exc).__name__}: {exc}",
                 mapping,
+                stage=FailureStage.ARTIFACT,
             )
         if missing_fields:
+            stage = (
+                FailureStage.VALIDATION
+                if "objective" in missing_fields
+                else FailureStage.ARTIFACT
+            )
             return self._failed_evaluation(
                 candidate_id,
                 input_index,
                 "incomplete evaluator result missing " + ", ".join(missing_fields),
                 mapping,
                 diagnostic_path,
+                stage=stage,
             )
 
         try:
@@ -551,6 +577,7 @@ class ExplicitOwnershipEvaluator:
                 f"invalid objective: {exc}",
                 mapping,
                 diagnostic_path,
+                stage=FailureStage.VALIDATION,
             )
 
         if diagnostic_path is None:
@@ -559,6 +586,7 @@ class ExplicitOwnershipEvaluator:
                 input_index,
                 "evaluator did not return a structure path",
                 mapping,
+                stage=FailureStage.ARTIFACT,
             )
 
         path = Path(diagnostic_path)
@@ -569,6 +597,7 @@ class ExplicitOwnershipEvaluator:
                 "evaluator did not return a valid structure path",
                 mapping,
                 diagnostic_path,
+                stage=FailureStage.ARTIFACT,
             )
         if path in self._claimed_paths:
             return self._failed_evaluation(
@@ -580,21 +609,37 @@ class ExplicitOwnershipEvaluator:
                 ),
                 mapping,
                 diagnostic_path,
+                stage=FailureStage.ARTIFACT,
             )
 
         try:
             manipulator = self._reload_mapping(diagnostic_path, mapping)
-        except (
-            OSError,
-            LammpsDataError,
-            GrainOwnershipError,
-        ) as exc:
+        except OSError as exc:
             return self._failed_evaluation(
                 candidate_id,
                 input_index,
                 f"{type(exc).__name__}: {exc}",
                 mapping,
                 diagnostic_path,
+                stage=FailureStage.ARTIFACT,
+            )
+        except LammpsDataError as exc:
+            return self._failed_evaluation(
+                candidate_id,
+                input_index,
+                f"{type(exc).__name__}: {exc}",
+                mapping,
+                diagnostic_path,
+                stage=FailureStage.PARSE,
+            )
+        except GrainOwnershipError as exc:
+            return self._failed_evaluation(
+                candidate_id,
+                input_index,
+                f"{type(exc).__name__}: {exc}",
+                mapping,
+                diagnostic_path,
+                stage=FailureStage.OWNERSHIP,
             )
 
         self._claimed_paths.add(path)
@@ -654,12 +699,16 @@ class ExplicitOwnershipEvaluator:
             reason = metadata.get("failure_reason")
             if not isinstance(reason, str) or not reason:
                 reason = "checkpointed explicit-ownership evaluation failed"
+            # Pre-R23 checkpoint metadata did not persist a failure_stage; EVALUATOR
+            # is the documented fallback for a stage no longer recoverable from a
+            # restored, already-flattened checkpoint entry.
             return self._failed_evaluation(
                 unique_id,
                 input_index,
                 reason,
                 mapping,
                 self._diagnostic_path(structure_path),
+                stage=FailureStage.EVALUATOR,
             )
         return self._record_result(
             candidate_id=unique_id,
@@ -714,7 +763,9 @@ class ExplicitOwnershipEvaluator:
         try:
             mapping = self._candidate_file_mapping(manipulator, atoms)
         except GrainOwnershipError as exc:
-            return self._failed_evaluation(unique_id, input_index, str(exc))
+            return self._failed_evaluation(
+                unique_id, input_index, str(exc), stage=FailureStage.OWNERSHIP
+            )
 
         try:
             result = self.scalar_energy_func(
@@ -731,6 +782,7 @@ class ExplicitOwnershipEvaluator:
                 input_index,
                 f"{type(exc).__name__}: {exc}",
                 mapping,
+                stage=FailureStage.EVALUATOR,
             )
 
         return self._record_result(
@@ -835,7 +887,9 @@ class ExplicitOwnershipEvaluator:
                 try:
                     mapping = self._candidate_file_mapping(manipulator, atoms)
                 except GrainOwnershipError as exc:
-                    record = self._failed_evaluation(candidate_id, index, str(exc))
+                    record = self._failed_evaluation(
+                        candidate_id, index, str(exc), stage=FailureStage.OWNERSHIP
+                    )
                 else:
                     if gen_checkpoint is not None and gen_checkpoint.is_done(
                         candidate_id
@@ -872,7 +926,10 @@ class ExplicitOwnershipEvaluator:
                 mapping = self._candidate_file_mapping(manipulator, atoms)
             except GrainOwnershipError as exc:
                 records[index] = self._failed_evaluation(
-                    unique_ids[index], index, str(exc)
+                    unique_ids[index],
+                    index,
+                    str(exc),
+                    stage=FailureStage.OWNERSHIP,
                 )
                 continue
             valid_indices.append(index)
@@ -911,6 +968,7 @@ class ExplicitOwnershipEvaluator:
                         input_index,
                         f"{type(exc).__name__}: {exc}",
                         mapping,
+                        stage=FailureStage.EVALUATOR,
                     )
                     records[input_index] = record
                     self._checkpoint_record(
