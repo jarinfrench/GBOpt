@@ -37,6 +37,9 @@ from GBOpt.gbmaker_supercell import (
     build_supercell_matrix,
     enumerate_supercell_sites,
 )
+from GBOpt.io.lammps.data_writer import LammpsDataWriter
+from GBOpt.io.lammps.types import LammpsWriteError
+from GBOpt.io.types import StructureData, StructureValueError
 from GBOpt.UnitCell import UnitCell
 
 _LEGACY_CONSTRUCTOR_DEPRECATION = (
@@ -3291,90 +3294,43 @@ class GBMaker:
                 "'atoms' and 'box_sizes' must be specified together."
             )
 
-        atom_names = np.unique(atoms["name"])
-        if set(atom_names).issubset(self.__unit_cell.type_map.keys()):
-            name_to_int = {
-                name: self.__unit_cell.type_map[name]
-                for name in self.__unit_cell.type_map
-                if name in atom_names
-            }
-        else:
-            name_to_int = {name: i + 1 for i, name in enumerate(atom_names)}
+        box_sizes = np.asarray(box_sizes, dtype=float)
+        cell = np.diag(box_sizes[:, 1] - box_sizes[:, 0])
+        origin = box_sizes[:, 0].copy()
 
-        if charges is not None:
-            if not all(isinstance(i, (int, str)) for i in charges):
-                raise GBMakerValueError(
-                    "'charges' keys are required to be integers or strings.")
-            if not all([isinstance(i, Number) for i in charges.values()]):
-                raise GBMakerValueError(
-                    "'charges' values are required to be numeric.")
-            if type_as_int:
-                if all([isinstance(i, str) for i in charges]):
-                    for name in np.unique(atoms["name"]):
-                        charges[name_to_int[name]] = charges[name]
+        if triclinic:
+            # LAMMPS restricted-triclinic box vectors are rows [lx,0,0], [xy,ly,0],
+            # [xz,yz,lz]; cell[1, 0]/cell[2, 0]/cell[2, 1] carry the tilt factors.
+            xy, xz, yz, theta = self.__get_triclinic_params()
+            cell[1, 0] = xy
+            cell[2, 0] = xz
+            cell[2, 1] = yz
+            ct, st = math.cos(theta), math.sin(theta)
+            Rx = np.array([[1, 0, 0], [0, ct, -st], [0, st, ct]])
+            # Copy before rotating in place: 'atoms' may be the caller's own array (or
+            # self.__whole_system), which write_lammps must not mutate as a side effect.
+            atoms = atoms.copy()
+            positions = np.column_stack((atoms["x"], atoms["y"], atoms["z"]))
+            rotated_positions = (Rx @ positions.T).T
+            atoms["x"], atoms["y"], atoms["z"] = rotated_positions.T
 
-        def format_atom_line(index, name, pos, charge=None):
-            if type_as_int:
-                name = name_to_int[name]
-            if charge is not None:
-                return (f"{index} {name} {charge:.{precision}f} " +
-                        f"{pos[0]:.{precision}f} {pos[1]:.{precision}f} " +
-                        f"{pos[2]:.{precision}f}\n")
-            else:
-                return (f"{index} {name} {pos[0]:.{precision}f} " +
-                        f"{pos[1]:.{precision}f} {pos[2]:.{precision}f}\n")
+        try:
+            structure = StructureData(atoms, cell, origin)
+        except StructureValueError as exc:
+            raise GBMakerValueError(str(exc)) from exc
 
-        # Write LAMMPS data file
-        with open(file_name, "w") as fdata:
-            # First line is a comment line
-            atom_names = "".join(np.unique(atoms["name"]))
-            fdata.write(f"Crystalline {atom_names} atoms\n\n")
-
-            # --- Header ---#
-            # Specify number of atoms and atom types
-            fdata.write(f"{len(atoms)} atoms\n")
-            fdata.write("{} atom types\n".format(len(set(atoms["name"]))))
-            # Specify box dimensions
-            fdata.write(
-                f"{box_sizes[0][0]:.{precision}f} "
-                f"{box_sizes[0][1]:.{precision}f} xlo xhi\n"
+        try:
+            LammpsDataWriter().write(
+                file_name,
+                structure,
+                type_as_int=type_as_int,
+                precision=precision,
+                charges=charges,
+                type_map=self.__unit_cell.type_map,
+                triclinic=triclinic,
             )
-            fdata.write(
-                f"{box_sizes[1][0]:.{precision}f} "
-                f"{box_sizes[1][1]:.{precision}f} ylo yhi\n"
-            )
-            fdata.write(
-                f"{box_sizes[2][0]:.{precision}f} "
-                f"{box_sizes[2][1]:.{precision}f} zlo zhi\n"
-            )
-            if triclinic:
-                xy, xz, yz, theta = self.__get_triclinic_params()
-                fdata.write(
-                    f"{xy:.{precision}f} {xz:.{precision}f} "
-                    f"{yz:.{precision}f} xy xz yz\n"
-                )
-                ct, st = math.cos(theta), math.sin(theta)
-                Rx = np.array([[1, 0, 0], [0, ct, -st], [0, st, ct]])
-
-            if not type_as_int:
-                fdata.write("\nAtom Type Labels\n\n")
-                for name, value in name_to_int.items():
-                    fdata.write(f"{value} {name}\n")
-
-            # Atoms section
-            fdata.write("\nAtoms\n\n")
-
-            # Write each position.
-            for i, (name, *pos) in enumerate(atoms):
-                if charges is not None:
-                    charge = charges[name_to_int[name]
-                                     ]if type_as_int else charges[name]
-                else:
-                    charge = None
-
-                if triclinic:
-                    pos = Rx @ np.array(pos, dtype=float)
-                fdata.write(format_atom_line(i + 1, name, pos, charge))
+        except LammpsWriteError as exc:
+            raise GBMakerValueError(str(exc)) from exc
 
     # Properties with getters and setters. Automatic updates for related parameters are
     # automatically taken care of.
