@@ -371,7 +371,9 @@ class GeneticAlgorithmMinimizer:
         self.composition_policy: tuple[tuple[str, int], ...] = tuple(
             initial_parent.unit_cell.formula_ratio
         )
-        self._registry = default_registry if registry is None else registry
+        self._registry: ManipulationRegistry = (
+            default_registry if registry is None else registry
+        )
         self.mutator: Mutator = Mutator(choices, self.manipulator, registry=self._registry)
         self.manipulator.rng = self.local_random
         self.population_size: int = population_size
