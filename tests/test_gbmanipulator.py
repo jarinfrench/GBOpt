@@ -413,6 +413,17 @@ class TestGBManipulator(unittest.TestCase):
         self.manipulator_tilt = GBManipulator(self.tilt, seed=self.seed)
         self.manipulator_twist = GBManipulator(self.twist, seed=self.seed)
 
+    def test_init_with_seed_zero_is_valid_and_deterministic(self):
+        first = GBManipulator(self.tilt, seed=0)
+        second = GBManipulator(self.tilt, seed=0)
+        self.assertEqual(
+            first.rng.bit_generator.state, second.rng.bit_generator.state
+        )
+        unseeded = GBManipulator(self.tilt)
+        self.assertNotEqual(
+            first.rng.bit_generator.state, unseeded.rng.bit_generator.state
+        )
+
     def test_init_with_one_gbmaker_parent(self):
         self.assertIsNotNone(self.manipulator_tilt.parents[0])
         self.assertIsNone(self.manipulator_tilt.parents[1])

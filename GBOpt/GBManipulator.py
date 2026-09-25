@@ -976,7 +976,7 @@ class GBManipulator:
                 "grain_ownership must be a GrainOwnership instance"
             )
         # initialize the random number generator
-        if not seed:
+        if seed is None:
             self.__rng = np.random.default_rng()
         else:
             self.__rng = np.random.default_rng(seed=seed)
