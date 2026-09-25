@@ -1,5 +1,70 @@
 # Refactor cleanup backlog
 
+## R25 net tooling deltas: ruff +1 (disclosed established-convention debt), mypy net 0, bandit unchanged, pyscn unchanged (41 quality issues, 47 clone pairs)
+
+Baseline taken at the R25 branch point (`96db29c`, tip of `refactor/r24-event-vocabulary`,
+also the tip of `refactor/r25-event-journal` before any R25 commits): ruff (`GBOpt`/`tests`)
+240 errors; mypy `GBOpt/optimization` 288 errors in 31 files, `GBOpt/observability` 202
+errors in 23 files (4 own source files checked); bandit 7 Low + 1 Medium; pyscn 41 quality
+issues / 47 clone pairs. Current (after all R25 commits): ruff 241 (+1), mypy unchanged in
+both scopes (`GBOpt/observability` now checks 5 source files -- `journal.py` itself adds 0
+new findings), bandit unchanged, pyscn unchanged at 41 quality issues / 47 clone pairs (the
+new `journal.py`/`RunManifest` code trips neither the complexity/SLOC gates nor clone
+detection).
+
+ruff +1 is `journal.py`'s own `__all__` list tripping `RUF022` (not alphabetized), the same
+established, deliberate convention already reproduced by `__init__.py`/`sinks.py`/`types.py`
+in this exact subpackage (see R24's own entry for the precedent) -- not new-shape debt. A
+`PYI034` finding on `JsonlEventSink.__enter__`'s return type (this is the first context
+manager in the codebase) was fixed on the spot with `typing.Self` rather than disclosed as
+debt, since it's a pure type-hint correction with no behavior change, not a new pattern
+worth reproducing uncorrected.
+
+**Resolve at**: no action needed.
+
+## R25's `OptimizationEvent` still carries no artifact-file reference of its own
+
+Issue #85's "no atom arrays/full structures are embedded; artifact references are used" is
+satisfied by construction -- `OptimizationEvent` (R24) has never had an atom-array field to
+begin with, and this step's own JSON serialization (`journal.py`'s `_event_to_json_dict`)
+adds none. But it also means a journal reader cannot join a `PROPOSAL_EVALUATED`/
+`CANDIDATE_ACCEPTED` line back to the structure file that produced it except indirectly, via
+`candidate_id` (and only if some other, out-of-band record maps that ID to a path) --
+`EvaluationResult.artifact` (a `StructureArtifact` reference: path/format/digest, from R22)
+is never surfaced onto the event at all. This was checked against #85's actual acceptance
+criteria before treating it as in-scope: the criterion constrains what a journal entry must
+never embed (no atom arrays/full structures), it does not require adding a new authoritative
+field to the event schema -- and `evaluation_event_fields()`'s R24-established field set is
+out of this step's stated subject (durable storage of the existing schema, not a schema
+change). Left as-is, not fabricated from an unrelated field.
+
+**Resolve at**: no action needed unless a later step's acceptance criteria require joining a
+journal entry back to its structure artifact without an external candidate-ID lookup, at
+which point `OptimizationEvent` would need a new `artifact_path`-shaped field (bumping
+`EVENT_SCHEMA_VERSION`) sourced from `EvaluationResult.artifact`, the same way
+`evaluation_event_fields()` already sources every other authoritative field.
+
+## R25's manifest overwrite guard and journal write-failure policy are this step's own design decisions, not spelled out by issue #85
+
+Issue #85's "Proposed behavior" asks for append/overwrite rules, a flush policy, and a
+write-failure policy to be "defined," without specifying what they should be. The choices
+made, each documented on the relevant class/function docstring in
+`GBOpt/observability/journal.py` rather than repeated here: `JsonlEventSink` defaults to
+`mode="append"` (never silently truncates existing provenance) and flushes after every
+`emit()` (no `fsync`, disclosed as a real durability limit, not a gap); a write/flush
+`OSError` propagates to the caller unchanged rather than being caught internally, relying on
+the recovery boundaries that already exist one layer up (`CompositeEventSink`,
+`MonteCarloMinimizer._emit`/`GeneticAlgorithmMinimizer._emit`) to keep a journal failure from
+ever reaching optimizer state; `write_run_manifest` defaults to refusing to replace an
+existing manifest file (`overwrite=False`), since a manifest is one authoritative object per
+run, not a line stream. `read_journal_events`'s truncated-final-line handling (skip with a
+logged warning; any other malformed line raises) was added speculatively, matching #85's "if
+a reader is provided" phrasing, since a reader is genuinely useful for provenance inspection
+and the criterion anticipates exactly this failure mode.
+
+**Resolve at**: no action needed; recorded so a later step doesn't mistake these documented
+choices for gaps still needing a design decision.
+
 ## R24 net tooling deltas: ruff +6 (disclosed established-convention debt in the new package), mypy +15 (one disclosed root cause), bandit unchanged, pyscn unchanged (41 quality issues, +1 disclosed clone pair)
 
 Baseline taken at the R24 branch point (`d2c95ba`, tip of `refactor/r23-mc-ga-

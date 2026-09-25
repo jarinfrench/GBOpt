@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from numbers import Integral, Real
 from types import MappingProxyType
@@ -189,6 +190,70 @@ class RunContext:
         object.__setattr__(self, "algorithm", algorithm)
         object.__setattr__(self, "case_id", case_id)
         object.__setattr__(self, "campaign_id", campaign_id)
+
+
+MANIFEST_SCHEMA_VERSION: int = 1
+"""Version of the :class:`RunManifest` field contract.
+
+Independent of :data:`EVENT_SCHEMA_VERSION`: the manifest and the event journal are two
+separate serialized formats that happen to share one run's identity, not one shared
+schema. Bump this constant, and document the change, whenever a `RunManifest` field is
+added, removed, or given new meaning.
+"""
+
+
+def _normalize_created_at(value: object) -> str:
+    """Validate one non-empty manifest creation timestamp.
+
+    :param value: Timestamp value to validate.
+    :return: Validated non-empty string.
+    :raises ObservabilityTypeError: If ``value`` is not a non-empty string.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ObservabilityTypeError("created_at must be a non-empty string")
+    return value
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class RunManifest:
+    """Immutable, run-invariant metadata sharing its run identity with the event journal.
+
+    A manifest is not a checkpoint and not an event: it carries no candidate outcome,
+    iteration count, or other per-occurrence data -- only the identity and
+    configuration that stay constant for a run's entire lifetime.
+    ``GBOpt.observability.journal`` writes and reads this as a single JSON object,
+    separate from the journal's own one-object-per-line event stream. A consumer joins
+    a manifest to that run's journal entries by ``run.run_id``, never by reading either
+    file back as restart state.
+
+    :param run: Run identity this manifest describes.
+    :param created_at: Keyword argument, optional, defaults to the current UTC time.
+        ISO-8601 manifest-creation timestamp.
+    :raises ObservabilityTypeError: If ``run`` is not a ``RunContext``, or
+        ``created_at`` is neither ``None`` nor a non-empty string.
+    """
+
+    schema_version: int
+    run: RunContext
+    created_at: str
+
+    def __init__(self, *, run: RunContext, created_at: str | None = None) -> None:
+        """Construct a validated, immutable run manifest.
+
+        :param run: Keyword argument, required. Run identity this manifest describes.
+        :param created_at: Keyword argument, optional, defaults to the current UTC
+            time. ISO-8601 manifest-creation timestamp.
+        :raises ObservabilityTypeError: If ``run`` is not a ``RunContext``, or
+            ``created_at`` is neither ``None`` nor a non-empty string.
+        """
+        if not isinstance(run, RunContext):
+            raise ObservabilityTypeError("run must be a RunContext")
+        if created_at is None:
+            created_at = datetime.now(UTC).isoformat()
+        created_at = _normalize_created_at(created_at)
+        object.__setattr__(self, "schema_version", MANIFEST_SCHEMA_VERSION)
+        object.__setattr__(self, "run", run)
+        object.__setattr__(self, "created_at", created_at)
 
 
 _JSON_SAFE_SCALAR_TYPES = (str, bool, type(None))
@@ -536,9 +601,11 @@ __all__ = [
     "ObservabilityTypeError",
     "ObservabilityValueError",
     "EVENT_SCHEMA_VERSION",
+    "MANIFEST_SCHEMA_VERSION",
     "OptimizationAlgorithm",
     "OptimizationEventType",
     "TerminationReason",
     "RunContext",
     "OptimizationEvent",
+    "RunManifest",
 ]

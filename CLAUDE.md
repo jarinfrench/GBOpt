@@ -305,6 +305,46 @@ the issue or step that produced it.
   `git rev-parse`/`git log` before building anything on top of it) -- recorded here only
   to confirm this is a recurring harness behavior worth checking every single time, not
   a one-off from R23 specifically.
+- **A harness-created branch for a new roadmap step reproduced the exact "identical to
+  `main`'s tip" failure mode for the third step in a row.** Starting R25, the harness had
+  created `claude/hopeful-allen-35k8q2`; `git rev-parse` showed it matched `origin/main`
+  exactly, zero roadmap commits -- same as R23's and R24's own entries above. Same fix:
+  `git checkout -B refactor/r25-event-journal origin/refactor/r24-event-vocabulary`,
+  verified with `git rev-parse`/`git log` before building anything on top of it. This is
+  not a one-off pattern to special-case around; expect it on every future step and check
+  every single time before trusting a harness-assigned branch's contents.
+- **R25's issue (#85) lists only R24 as a prerequisite, and R24's own branch already
+  contains everything R25 needed -- no merge of a second prerequisite branch was
+  required, unlike R14/R23.** Confirmed with `git merge-base --is-ancestor
+  refactor/r23-mc-ga-evaluation refactor/r24-event-vocabulary` (true) before branching,
+  so R25 branches directly from `refactor/r24-event-vocabulary`, carrying R23/R22/R20/R14
+  transitively. Don't assume this is now the norm -- check every step's own "Dependencies
+  and related issues" section per the standing rule above; this step simply happened to
+  have one clean prerequisite.
+- **R25 is the checkpoint-serialization step R22's/R23's `REFACTOR_CLEANUP.md` entries
+  floated for "R23 or R26+" -- confirmed by rereading #85's actual acceptance criteria,
+  and the answer is no.** Issue #85 ("provide opt-in durable scientific provenance
+  through a versioned JSONL event journal plus a separate run manifest, explicitly
+  distinct from checkpoint/restart files") explicitly requires the opposite: "Documentation
+  states that journals cannot be used as checkpoints," matching R24's own criteria walling
+  events off from checkpoint state in both directions. `EvaluationResult`/
+  `CandidateEvaluation` still have no `to_state`/`from_state`; that gap remains open for
+  whichever later step actually is the checkpoint-serialization migration.
+- **None of R24's four new `REFACTOR_CLEANUP.md` entries (`operation_parameters` always
+  `None`, GA accept/reject meaning next-generation selection, legacy `run_GA`'s
+  `RUN_FAILED`-only try/except, `_evaluate_generation`'s reconstruction-failure accuracy
+  fix) needed any action at R25.** Rechecked each against #85's real acceptance criteria
+  (durable storage of the existing event schema, not a schema change) before assuming so
+  -- #85 is silent on all four, so each remains open for whichever step's own criteria
+  actually touch it.
+- **A new durable-storage sink for an established `EventSink` protocol needs no changes
+  to the classes that already emit through that protocol.** R25's `JsonlEventSink` plugs
+  into `MonteCarloMinimizer`/`GeneticAlgorithmMinimizer` exactly like `NullEventSink`/
+  `LoggingEventSink`/`CompositeEventSink` already do (R24) -- neither minimizer's own code
+  changed. This is what "default library behavior remains unchanged unless a journal sink
+  is configured" (#85's own acceptance criterion) means mechanically: the default stays
+  `NullEventSink` because nothing wires `JsonlEventSink` in by default, not because of any
+  new guard condition.
 - Before opening a PR, run `ruff`, `mypy`, `bandit`, and `pyscn` (see
   "Tooling" below) and report the results.
 - **Never open a PR without being explicitly told to.** The user reviews

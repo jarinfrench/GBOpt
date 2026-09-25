@@ -8,12 +8,14 @@ import pytest
 from GBOpt.evaluation import EvaluationStatus, FailureStage
 from GBOpt.observability.types import (
     EVENT_SCHEMA_VERSION,
+    MANIFEST_SCHEMA_VERSION,
     ObservabilityTypeError,
     ObservabilityValueError,
     OptimizationAlgorithm,
     OptimizationEvent,
     OptimizationEventType,
     RunContext,
+    RunManifest,
     TerminationReason,
 )
 
@@ -73,6 +75,48 @@ def test_run_context_is_immutable():
 
     with pytest.raises((AttributeError, TypeError)):
         run.seed = 99
+
+
+def test_run_manifest_stamps_schema_version_and_shares_run_identity():
+    run = _run(run_id="run-shared")
+
+    manifest = RunManifest(run=run, created_at="2026-01-01T00:00:00+00:00")
+
+    assert manifest.schema_version == MANIFEST_SCHEMA_VERSION
+    assert manifest.run is run
+    assert manifest.run.run_id == "run-shared"
+    assert manifest.created_at == "2026-01-01T00:00:00+00:00"
+
+
+def test_run_manifest_defaults_created_at_to_a_non_empty_timestamp():
+    manifest = RunManifest(run=_run())
+
+    assert isinstance(manifest.created_at, str)
+    assert manifest.created_at.strip()
+
+
+def test_run_manifest_rejects_non_run_context():
+    with pytest.raises(ObservabilityTypeError, match="run"):
+        RunManifest(run="not-a-run-context")
+
+
+@pytest.mark.parametrize(
+    "created_at",
+    [
+        pytest.param("", id="empty-string"),
+        pytest.param(123, id="non-string"),
+    ],
+)
+def test_run_manifest_rejects_invalid_created_at(created_at):
+    with pytest.raises(ObservabilityTypeError, match="created_at"):
+        RunManifest(run=_run(), created_at=created_at)
+
+
+def test_run_manifest_is_immutable():
+    manifest = RunManifest(run=_run())
+
+    with pytest.raises((AttributeError, TypeError)):
+        manifest.created_at = "later"
 
 
 def _event(**overrides):
