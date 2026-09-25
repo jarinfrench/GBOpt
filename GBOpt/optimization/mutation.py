@@ -42,7 +42,11 @@ from GBOpt.manipulation import (
     default_registry,
 )
 from GBOpt.optimization.dispatch import LegacyInvoker, run_legacy_compat_operation
-from GBOpt.optimization.types import GBMinimizerError, GBMinimizerValueError, OperationSpec
+from GBOpt.optimization.types import (
+    GBMinimizerError,
+    GBMinimizerValueError,
+    OperationSpec,
+)
 
 # The only three operation names the pre-OperationSpec `choices: list[str]` vocabulary
 # ever supported (Mutator._apply_mutation's former match/case), each mapped to the
