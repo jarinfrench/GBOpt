@@ -10,11 +10,8 @@ import pytest
 
 from GBOpt.artifacts import ArtifactRetentionPolicy, KeepBest
 from GBOpt.GBMaker import GBMaker
-from GBOpt.GBMinimizer import (
-    GBMinimizerError,
-    GBMinimizerValueError,
-    MonteCarloMinimizer,
-)
+from GBOpt.optimization.monte_carlo import MonteCarloMinimizer
+from GBOpt.optimization.types import GBMinimizerError, GBMinimizerValueError
 
 _TEST_CALCULATION_CONTEXT = {"calculator": {"name": "test-evaluator"}}
 
