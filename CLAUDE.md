@@ -191,6 +191,69 @@ the issue or step that produced it.
   match a stated belief, even when the belief comes from the user themself —
   it can be the "roadmap's linear numbering does not imply a linear branch
   chain" trap in a different guise.
+- **A harness-created branch for a new roadmap step is not guaranteed to start from
+  the right point in the DAG -- verify with `git rev-parse`/`git merge-base`, don't
+  assume it was pre-built correctly.** Starting R23, the harness had already created
+  `claude/mc-ga-eval-flows-f9cvnk`, but `git rev-parse` showed it was identical to
+  `main`'s tip -- zero refactor-roadmap commits at all, not even R22's own branch tip.
+  The fix was the same recipe as R14's sibling-prerequisite merge: `git checkout -B
+  <branch> origin/<real-prerequisite-branch>`, confirm with `git rev-parse`/`git log`
+  that the recreated branch now actually contains the expected lineage, then proceed.
+  Don't infer a branch's contents from its name or its existence on `origin` --
+  confirm the actual commit it points to before building anything on top of it.
+- **When an issue lists multiple roadmap prerequisites and one is missing from the
+  branch you're building on, check the issue's actual acceptance criteria for a
+  literal dependency on that prerequisite's output before deciding whether to merge it
+  in -- don't assume "listed as a prerequisite" alone settles it, and don't defer
+  without checking either.** R23's issue (#83) listed R22, R14, and R20 as
+  prerequisites; R22's branch already contained R20 but not R14. R14's own
+  `CandidateLoader` module turned out to be named explicitly in #83's acceptance
+  criteria ("Returned structures are validated through the authoritative
+  `CandidateLoader`"), confirming the merge was actually required, not just nominally
+  listed -- resolved via the same `git checkout -B <new> <base>` +
+  `git merge --no-commit --no-ff <other-prerequisite>` recipe R14 itself used,
+  verified with a full test run on the merged tip before committing.
+- **Before reporting a tooling delta in a commit message, re-check every file the
+  step actually touched -- verifying only the file you most recently edited (e.g. a
+  test file, after fixing one specific finding in it) and generalizing that to "net
+  0" for the whole change is a real mistake, not just an omission.** R23's "legacy GA
+  scalar/batch path" commit message claimed "ruff... net 0" after confirming the test
+  file's count was unchanged, but never re-checked `genetic.py` itself, which had
+  genuinely gained 3 findings (2 `BLE001`, 1 `B905`) from a new recovery boundary
+  added in the same commit. Caught only by a separate final full-repo baseline
+  comparison against the branch point, after the commit had already been pushed;
+  fixed with a follow-up commit recording the accurate, fully-reconciled delta rather
+  than silently letting the inaccurate one stand. Run the exact per-file comparison
+  for every file a commit touches, not just the one most recently in view.
+- **Restoring the tooling config files (`pyproject.toml`/`mypy.ini`/`.pyscn.toml`)
+  from `tooling/lint-typecheck-experiment` before a baseline run is not a one-time
+  setup step -- it has to happen before *every* `pyscn` invocation specifically,
+  since `pyscn` (unlike `ruff`/`mypy`) silently falls back to very different default
+  thresholds when `.pyscn.toml` is missing, rather than erroring.** After deleting
+  the three config files per this file's own "delete before staging" rule at the end
+  of an earlier phase, a later full-repo `pyscn check` (re-copying only
+  `pyproject.toml`/`mypy.ini`, forgetting `.pyscn.toml`) reported 81 quality issues
+  against a baseline of 41 -- a seemingly large regression that was actually pyscn's
+  default complexity threshold (10) silently replacing the repo's configured one
+  (20), not a real code-quality change. Restoring `.pyscn.toml` and re-running
+  reproduced the baseline's exact 41/46 counts. Don't read a large tool-count jump as
+  a real regression before confirming the same config file was actually in place for
+  both runs being compared.
+- **A recovery boundary an earlier roadmap step's `CLAUDE.md` entry documented as
+  missing (not a bug, just an asymmetry noted for "whichever later step's own
+  acceptance criteria require it") should be added the moment a later step's
+  acceptance criteria actually do require it, unconditionally -- not treated as
+  optional scope just because it wasn't the step's main subject.** R21 documented
+  that `MonteCarloMinimizer`'s evaluator call has no recovery boundary at all (unlike
+  `GeneticAlgorithmMinimizer`'s established `except Exception` -> penalty pattern) and
+  explicitly left resolving it to a later step. R23's "every MC/GA evaluation
+  produces an `EvaluationResult`" and "evaluator exceptions... retain typed failure
+  provenance" criteria require exactly this, read literally, so it was added at both
+  of MC's evaluation call sites (initial: raises, matching GA-owned's own established
+  fatal-initial-failure precedent; proposal: deterministically rejected, matching
+  GA's per-candidate recovery-boundary pattern) -- disclosed as a real, intentional
+  behavior change in `REFACTOR_CLEANUP.md`, with dedicated regression tests, rather
+  than left as a subject for yet another future step.
 - Before opening a PR, run `ruff`, `mypy`, `bandit`, and `pyscn` (see
   "Tooling" below) and report the results.
 - **Never open a PR without being explicitly told to.** The user reviews
