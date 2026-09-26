@@ -1,5 +1,24 @@
 # Refactor cleanup backlog
 
+## R28 net tooling deltas: ruff net 0, mypy net 0, bandit unchanged, pyscn unchanged (41 quality issues, 51 clone pairs)
+
+Baseline taken at the R28 branch point (`4d429d5`, tip of `refactor/r27-checkpoint-
+snapshots`, checked out in a separate worktree so mypy/pyscn resolve the real package
+layout rather than a synthetic copy -- see the `CLAUDE.md` git-mechanics-adjacent entry
+below): ruff (`GBOpt/snapshot/types.py`, `migration.py`, `GBOpt/optimization/
+monte_carlo.py`) 4 errors; mypy (`GBOpt/snapshot`, `GBOpt/optimization` scopes, filtered
+to these three files plus `GBOpt/artifacts/types.py`, which mypy pulls in
+transitively) 15 lines; bandit 0; pyscn (whole-repo) 41 quality issues / 51 clone pairs
+(this machine's real current pyscn output for the R27 tip -- not R27's own
+`REFACTOR_CLEANUP.md`-recorded 41/47, which likely reflects a different pyscn version;
+the "real baseline right now" is what this file's own tooling-comparison rule asks for,
+not the historical recorded number). Current (after every R28 commit): ruff 4 errors
+(same three findings -- one `BLE001`, two `RUF022` -- just at different line numbers,
+since new code was added above them); mypy 15 lines (same 12 errors + 3 `note:` lines,
+same message text, shifted line numbers only); bandit 0; pyscn exactly 41/51, unchanged.
+
+**Resolve at**: no action needed.
+
 ## R27 net tooling deltas: ruff +3 (disclosed established-convention debt), mypy net 0, bandit unchanged, pyscn back to baseline after an in-step decomposition (41 quality issues, 47 clone pairs)
 
 Baseline taken at the R27 branch point (`e7354db`, tip of `refactor/r26-checkpoint-
@@ -23,6 +42,74 @@ findings, a `NoReturn`-shaped narrowing gap, a wrong `Mapping`-typed default, an
 reproduced pattern, and was fixed on the spot rather than disclosed as debt.
 
 **Resolve at**: no action needed.
+
+## R28 extended `MonteCarloSnapshot` with `min_steps`/`cooldown_rate` fields R27 omitted
+
+Issue #88's acceptance criteria list "minimum steps, cooldown" among what a v2 restore
+must recover, but R27's `MonteCarloSnapshot` (designed before any real MC write path
+existed) carried neither field -- schema-v1's `run_params.min_steps`/`cooldown_rate`
+had no v2 counterpart at all. Per `CLAUDE.md`'s own "a value type from an earlier step
+isn't frozen when correcting it is driven by an actual behavior-preservation
+requirement" precedent (the R04 `positive=True` case), both fields were added directly
+to `MonteCarloSnapshot` (`GBOpt/snapshot/types.py`) with `to_state`/`from_state`
+support, rather than inventing a side channel outside the typed schema.
+`GeneticAlgorithmSnapshot` is untouched -- it has no `min_steps`/`cooldown_rate`
+equivalent and issue #88 is MC-only.
+
+`cooldown_rate`'s validator (`_normalize_cooldown_rate`) enforces the same `0 < x <= 1`
+range `MonteCarloMinimizer.run_MC` itself already checks before ever reaching a
+checkpoint write, so it can never reject a value that could have arrived through a real
+run. `min_steps`'s validator (`_normalize_optional_min_steps`) deliberately does **not**
+enforce non-negativity, even though every other integer field in this module does --
+`run_MC` has no upstream validation on `min_steps` at all, so a stricter check here
+would add a new save-time rejection path for a value the existing run loop has always
+silently tolerated. This mirrors the `positive=True`-vs-`strictly_positive=True`
+distinction this file already documents at length for `GBMaker`'s legacy validators, just
+showing up as "validate at all" vs. "don't" instead of "loosely" vs. "strictly."
+
+**Resolve at**: no action needed.
+
+## R28's MC schema-v1 migration path is narrower than MC's own pre-migration seed fallback
+
+`MonteCarloMinimizer.run_MC`'s resume branch used to fall back to `self.seed` when a
+checkpoint's `run_params` had no `"seed"` key at all (`state["run_params"].get("seed",
+self.seed)`) -- a leniency for a genuinely legacy checkpoint written before seed
+persistence existed. R27's `_monte_carlo_snapshot_from_v1` (shared with GA, and
+explicitly documented for GA as "a legacy checkpoint written before seed persistence
+cannot be migrated") builds `RunIdentitySnapshot(seed=run_params["seed"])` with a bare
+key lookup, so a schema-v1 checkpoint missing `seed` now fails migration outright
+(`SnapshotMigrationError`/`GBMinimizerError`) instead of silently falling back. R28
+reuses this already-established migrator as-is rather than special-casing MC's own
+narrower fallback into it -- the R27 migrator was already reviewed and accepted for GA
+with exactly this narrowing, and #88 says "resume v1 through the R27 migrator," not
+"extend the R27 migrator's leniency." A genuinely pre-seed-persistence MC checkpoint (if
+one still exists anywhere) can no longer resume; every checkpoint `run_MC` has written
+since seed persistence was added always has the field, so this is a narrow, disclosed
+gap rather than a live regression for any checkpoint this codebase itself has produced
+recently.
+
+**Resolve at**: no action needed unless a real pre-seed-persistence MC checkpoint needs
+to keep resuming.
+
+## R28's `MonteCarloSnapshot.retention_state` needs a tuple->list normalization before reaching `ArtifactStore.from_state`
+
+`MonteCarloSnapshot`'s own JSON-safety validation (`_reject_live_objects`, R27) recursively
+normalizes every nested sequence -- including `retention_state["records"]` -- into a
+`tuple`, matching this module's own immutable-value-type discipline. `GBOpt.artifacts.
+store.ArtifactStore.from_state` (a pre-existing, already-reviewed contract this schema
+deliberately passes `retention_state` through opaquely rather than re-typing, per R27's
+own entry below) enforces that `records` is literally a `list`, not any `Sequence`, and
+raises `ArtifactStoreError` on a tuple. This only surfaces on MC's *resume* path (restoring
+a live `ArtifactStore` from a snapshot's `retention_state`), not on save, since
+`ArtifactStore.to_state()`'s own output is fed straight into the snapshot constructor
+without a resume-side round trip in between. Fixed with a small `_tuples_to_lists`
+helper in `GBOpt/optimization/monte_carlo.py`, applied only at the one call site that
+hands `retention_state` to `ArtifactStore.from_state`; the snapshot's own tuple-based
+representation is otherwise unchanged. Any future step that resumes `ArtifactStore`
+state from a `GeneticAlgorithmSnapshot`'s `retention_state` will need the same fix.
+
+**Resolve at**: no action needed unless a later step wires `GeneticAlgorithmSnapshot`
+resume through `ArtifactStore.from_state` and hits the same tuple/list mismatch.
 
 ## R27's schema-v1 lineage entries are not uniformly `[operation_label, parent]` pairs
 
@@ -51,6 +138,30 @@ already documents at the top of this file, applied to the roadmap issue's own fi
 description rather than to a `REFACTOR_CLEANUP.md` entry's.
 
 **Resolve at**: no action needed; noted for the record.
+
+## R28 confirmed none of R27's three deferred MC-adjacent gaps are actually in issue #88's scope
+
+Rechecked each of R27's own entries against #88's real acceptance criteria before
+starting, per this file's own top-of-file discipline:
+
+- **`CandidateEvaluationSnapshot` construction from a live `EvaluationResult`.** #88's
+  criteria never mention it, and `MonteCarloSnapshot` has no field of that type at all
+  (only `MonteCarloStepRecordSnapshot`/`StructureArtifact`) -- MC's own restart schema
+  never needed `from_evaluation_result()` to run for the first time. This gap (R27's
+  entry above) remains open for whichever step actually wires GA's per-candidate
+  bookkeeping onto `EvaluationResult`.
+- **`CandidateCheckpoint`'s per-candidate `.iterN` sidecar file.** MC does not use
+  `CandidateCheckpoint` at all (confirmed by grep -- only `GeneticAlgorithmMinimizer`
+  constructs one), so this gap is entirely orthogonal to R28's MC-only scope and
+  remains exactly as R27 left it.
+- **`ArtifactStore`'s own checkpoint state as an opaque passthrough, not a re-typed
+  schema-v2 value type.** #88 asks MC's restart-critical controls to be typed, not
+  `ArtifactStore`'s own already-reviewed `to_state()`/`from_state()` contract to be
+  duplicated as a second representation -- `MonteCarloSnapshot.retention_state` keeps
+  R27's opaque-passthrough design unchanged (see the tuple/list normalization entry
+  below for the one real wrinkle this surfaced).
+
+**Resolve at**: no action needed at R28; unchanged from R27's own resolution notes.
 
 ## R27 partially resolves R22's/R23's/R26's deferred "`EvaluationResult` checkpoint-serialization form" gap -- the typed form now exists, but nothing writes it yet
 
