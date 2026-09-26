@@ -20,6 +20,7 @@ state schema-v1 never optionally omits.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import NoReturn
 
 from GBOpt.Checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
@@ -58,7 +59,7 @@ class SnapshotMigrationError(SnapshotError):
     """Raised when a schema-v1 checkpoint cannot be migrated to a schema-v2 snapshot."""
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     """Raise a uniform migration failure.
 
     :param message: Human-readable failure context.
@@ -151,12 +152,17 @@ def _lineage_step_from_v1(raw: object) -> LineageStepSnapshot:
     """
     if not isinstance(raw, (list, tuple)):
         raise SnapshotMigrationError(f"checkpoint lineage entry is malformed: {raw!r}")
-    if len(raw) == 2:
-        operation_name, parents, diagnostic_note = raw[0], raw[1:], None
-    elif len(raw) == 3:
-        operation_name, parents, diagnostic_note = raw[0], raw[1:2], raw[2]
-    elif len(raw) == 4:
-        operation_name, parents, diagnostic_note = raw[0], raw[1:3], raw[3]
+    raw_entry = list(raw)
+    if len(raw_entry) == 2:
+        operation_name, parents, diagnostic_note = raw_entry[0], raw_entry[1:], None
+    elif len(raw_entry) == 3:
+        operation_name, parents, diagnostic_note = (
+            raw_entry[0], raw_entry[1:2], raw_entry[2],
+        )
+    elif len(raw_entry) == 4:
+        operation_name, parents, diagnostic_note = (
+            raw_entry[0], raw_entry[1:3], raw_entry[3],
+        )
     else:
         raise SnapshotMigrationError(f"checkpoint lineage entry is malformed: {raw!r}")
     try:
@@ -283,15 +289,8 @@ def _ga_snapshot_from_v1_legacy(state: dict) -> GeneticAlgorithmSnapshot:
             for index, cached in enumerate(cached_states)
         )
 
-        energy_history = tuple(tuple(generation) for generation in ga_state["GBE_vals"])
-        generation_history = tuple(
-            tuple(
-                GenerationHistoryEntrySnapshot(
-                    lineage=_lineage_step_from_v1(lineage), energy=energy
-                )
-                for lineage, energy in generation
-            )
-            for generation in ga_state["history"]
+        energy_history, generation_history = _energy_and_generation_history_from_v1(
+            ga_state
         )
 
         best_dump = state["best_dump"]
@@ -366,10 +365,12 @@ def _legacy_cache_to_snapshot(
     :return: Validated candidate evaluation snapshot.
     :raises SnapshotMigrationError: If ``cached`` is malformed.
     """
+    if not isinstance(cached, dict):
+        raise SnapshotMigrationError("checkpoint cached evaluation must be a mapping")
     try:
         energy = cached["energy"]
         structure_path = cached["structure_path"]
-    except (KeyError, TypeError) as exc:
+    except KeyError as exc:
         raise SnapshotMigrationError(
             f"checkpoint cached evaluation is malformed: {exc}"
         ) from exc
@@ -393,6 +394,29 @@ def _legacy_cache_to_snapshot(
         ) from exc
 
 
+def _energy_and_generation_history_from_v1(
+    ga_state: dict,
+) -> tuple[
+    tuple[tuple[float, ...], ...], tuple[tuple[GenerationHistoryEntrySnapshot, ...], ...]
+]:
+    """Build the structured energy/generation history shared by both GA checkpoint shapes.
+
+    :param ga_state: Schema-v1 GA checkpoint envelope's ``state`` field.
+    :return: Validated ``(energy_history, generation_history)`` pair.
+    """
+    energy_history = tuple(tuple(generation) for generation in ga_state["GBE_vals"])
+    generation_history = tuple(
+        tuple(
+            GenerationHistoryEntrySnapshot(
+                lineage=_lineage_step_from_v1(lineage), energy=energy
+            )
+            for lineage, energy in generation
+        )
+        for generation in ga_state["history"]
+    )
+    return energy_history, generation_history
+
+
 def _owned_evaluation_to_snapshot(raw: object) -> CandidateEvaluationSnapshot:
     """Build a candidate evaluation snapshot from one owned-mode evaluation state.
 
@@ -400,6 +424,8 @@ def _owned_evaluation_to_snapshot(raw: object) -> CandidateEvaluationSnapshot:
     :return: Validated candidate evaluation snapshot.
     :raises SnapshotMigrationError: If ``raw`` is malformed.
     """
+    if not isinstance(raw, dict):
+        raise SnapshotMigrationError("checkpoint owned evaluation must be a mapping")
     try:
         candidate_id = raw["candidate_id"]
         input_index = raw["input_index"]
@@ -407,7 +433,7 @@ def _owned_evaluation_to_snapshot(raw: object) -> CandidateEvaluationSnapshot:
         structure_path = raw["structure_path"]
         success = raw["success"]
         failure_reason = raw.get("failure_reason")
-    except (KeyError, TypeError) as exc:
+    except KeyError as exc:
         raise SnapshotMigrationError(
             f"checkpoint owned evaluation is malformed: {exc}"
         ) from exc
@@ -448,13 +474,17 @@ def _owned_evaluation_summary_to_snapshot(raw: object) -> CandidateEvaluationSna
     :return: Validated candidate evaluation snapshot.
     :raises SnapshotMigrationError: If ``raw`` is malformed.
     """
+    if not isinstance(raw, dict):
+        raise SnapshotMigrationError(
+            "checkpoint generation evaluation must be a mapping"
+        )
     try:
         candidate_id = raw["candidate_id"]
         input_index = raw["input_index"]
         objective = raw["objective"]
         success = raw["success"]
         failure_reason = raw.get("failure_reason")
-    except (KeyError, TypeError) as exc:
+    except KeyError as exc:
         raise SnapshotMigrationError(
             f"checkpoint generation evaluation is malformed: {exc}"
         ) from exc
@@ -479,6 +509,117 @@ def _owned_evaluation_summary_to_snapshot(raw: object) -> CandidateEvaluationSna
         raise SnapshotMigrationError(
             f"checkpoint generation evaluation is invalid: {exc}"
         ) from exc
+
+
+def _owned_population_from_v1(ga_state: dict) -> tuple[PopulationCandidateSnapshot, ...]:
+    """Build the owned-mode population from one GA checkpoint's ``state`` field.
+
+    :param ga_state: Schema-v1 GA checkpoint envelope's ``state`` field.
+    :return: Validated population tuple.
+    :raises SnapshotMigrationError: If population candidates/lineages are misaligned.
+    """
+    population_candidates = ga_state["population_candidates"]
+    population_lineages = ga_state["population_lineages"]
+    if len(population_candidates) != len(population_lineages):
+        _fail("checkpoint population candidates are not aligned with lineages")
+    return tuple(
+        _owned_population_candidate_to_snapshot(candidate, lineage)
+        for candidate, lineage in zip(
+            population_candidates, population_lineages, strict=True
+        )
+    )
+
+
+def _owned_population_cache_from_v1(
+    ga_state: dict, *, population_size: int
+) -> tuple[CandidateEvaluationSnapshot | None, ...]:
+    """Build the owned-mode carryover cache from one GA checkpoint's ``state`` field.
+
+    :param ga_state: Schema-v1 GA checkpoint envelope's ``state`` field.
+    :param population_size: Keyword argument, required. Population size to align
+        against.
+    :return: Validated cache tuple.
+    :raises SnapshotMigrationError: If the cache is not population-aligned.
+    """
+    cached_states = ga_state.get(
+        "population_cached_evaluations", [None] * population_size
+    )
+    if len(cached_states) != population_size:
+        _fail("checkpoint cached evaluations are not aligned with population")
+    return tuple(
+        None if cached is None else _owned_evaluation_to_snapshot(cached)
+        for cached in cached_states
+    )
+
+
+def _owned_retention_lineages_from_v1(ga_state: dict) -> list[tuple[str, ...]] | None:
+    """Build the owned-mode retention lineages from one GA checkpoint's ``state`` field.
+
+    :param ga_state: Schema-v1 GA checkpoint envelope's ``state`` field.
+    :return: Retention lineages, or ``None`` when the checkpoint carries none.
+    """
+    raw = ga_state.get("population_retention_lineages")
+    if raw is None:
+        return None
+    return [tuple(lineage) for lineage in raw]
+
+
+def _owned_last_generation_evaluations_from_v1(
+    ga_state: dict,
+) -> tuple[CandidateEvaluationSnapshot, ...] | None:
+    """Build the owned-mode prior-generation evaluations from one GA ``state`` field.
+
+    :param ga_state: Schema-v1 GA checkpoint envelope's ``state`` field.
+    :return: Prior-generation evaluations, or ``None`` when the checkpoint carries none.
+    """
+    raw = ga_state.get("last_generation_evaluations")
+    if raw is None:
+        return None
+    return tuple(_owned_evaluation_summary_to_snapshot(entry) for entry in raw)
+
+
+def _owned_failure_diagnostics_from_v1(
+    ga_state: dict,
+) -> tuple[FailureDiagnosticSnapshot, ...]:
+    """Build the bounded failure diagnostics from one GA checkpoint's ``state`` field.
+
+    :param ga_state: Schema-v1 GA checkpoint envelope's ``state`` field.
+    :return: Validated failure diagnostics tuple.
+    :raises SnapshotMigrationError: If any diagnostic entry is malformed or invalid.
+    """
+    try:
+        return tuple(
+            FailureDiagnosticSnapshot(
+                candidate_id=entry["candidate_id"],
+                generation=entry["generation"],
+                input_index=entry["input_index"],
+                failure_reason=entry["failure_reason"],
+                source_path=entry.get("source_path"),
+            )
+            for entry in ga_state.get("failure_diagnostics", [])
+        )
+    except (KeyError, TypeError) as exc:
+        raise SnapshotMigrationError(
+            f"checkpoint failure diagnostic is malformed: {exc}"
+        ) from exc
+    except SnapshotError as exc:
+        raise SnapshotMigrationError(
+            f"checkpoint failure diagnostic is invalid: {exc}"
+        ) from exc
+
+
+def _owned_retention_archive_mappings_from_v1(ga_state: dict) -> dict:
+    """Build the owned-mode retention archive mappings from one GA ``state`` field.
+
+    :param ga_state: Schema-v1 GA checkpoint envelope's ``state`` field.
+    :return: Candidate-identity-keyed ``CandidateFileMapping`` dictionary.
+    :raises SnapshotMigrationError: If any mapping entry is invalid.
+    """
+    raw_archive_mappings = ga_state.get("retention_archive_mappings", {})
+    return {
+        candidate_id: _mapping_from_v1_state(candidate_id, mapping_state)
+        for candidate_id, mapping_state in raw_archive_mappings.items()
+    }
 
 
 def _ga_snapshot_from_v1_owned(state: dict) -> GeneticAlgorithmSnapshot:
@@ -507,75 +648,21 @@ def _ga_snapshot_from_v1_owned(state: dict) -> GeneticAlgorithmSnapshot:
     try:
         ga_state = state["state"]
         best = _owned_evaluation_to_snapshot(ga_state["best_evaluation"])
-
-        population_candidates = ga_state["population_candidates"]
-        population_lineages = ga_state["population_lineages"]
-        if len(population_candidates) != len(population_lineages):
-            _fail(
-                "checkpoint population candidates are not aligned with lineages"
-            )
-        population = tuple(
-            _owned_population_candidate_to_snapshot(candidate, lineage)
-            for candidate, lineage in zip(
-                population_candidates, population_lineages, strict=True
-            )
+        population = _owned_population_from_v1(ga_state)
+        population_cache = _owned_population_cache_from_v1(
+            ga_state, population_size=len(population)
         )
-
-        cached_states = ga_state.get(
-            "population_cached_evaluations", [None] * len(population)
+        retention_lineages = _owned_retention_lineages_from_v1(ga_state)
+        last_generation_evaluations = _owned_last_generation_evaluations_from_v1(
+            ga_state
         )
-        if len(cached_states) != len(population):
-            _fail("checkpoint cached evaluations are not aligned with population")
-        population_cache = tuple(
-            None if cached is None else _owned_evaluation_to_snapshot(cached)
-            for cached in cached_states
-        )
-
-        retention_lineages_raw = ga_state.get("population_retention_lineages")
-        retention_lineages = (
-            None
-            if retention_lineages_raw is None
-            else [tuple(lineage) for lineage in retention_lineages_raw]
-        )
-
-        last_generation_raw = ga_state.get("last_generation_evaluations")
-        last_generation_evaluations = (
-            None
-            if last_generation_raw is None
-            else tuple(
-                _owned_evaluation_summary_to_snapshot(entry)
-                for entry in last_generation_raw
-            )
-        )
-
-        failure_diagnostics = tuple(
-            FailureDiagnosticSnapshot(
-                candidate_id=entry["candidate_id"],
-                generation=entry["generation"],
-                input_index=entry["input_index"],
-                failure_reason=entry["failure_reason"],
-                source_path=entry.get("source_path"),
-            )
-            for entry in ga_state.get("failure_diagnostics", [])
-        )
-
+        failure_diagnostics = _owned_failure_diagnostics_from_v1(ga_state)
         claimed_paths = tuple(ga_state.get("claimed_paths", []))
-
-        raw_archive_mappings = ga_state.get("retention_archive_mappings", {})
-        retention_archive_mappings = {
-            candidate_id: _mapping_from_v1_state(candidate_id, mapping_state)
-            for candidate_id, mapping_state in raw_archive_mappings.items()
-        }
-
-        energy_history = tuple(tuple(generation) for generation in ga_state["GBE_vals"])
-        generation_history = tuple(
-            tuple(
-                GenerationHistoryEntrySnapshot(
-                    lineage=_lineage_step_from_v1(lineage), energy=energy
-                )
-                for lineage, energy in generation
-            )
-            for generation in ga_state["history"]
+        retention_archive_mappings = _owned_retention_archive_mappings_from_v1(
+            ga_state
+        )
+        energy_history, generation_history = _energy_and_generation_history_from_v1(
+            ga_state
         )
 
         snapshot = GeneticAlgorithmSnapshot(
@@ -617,10 +704,14 @@ def _owned_population_candidate_to_snapshot(
     :return: Validated population candidate snapshot.
     :raises SnapshotMigrationError: If either argument is malformed.
     """
+    if not isinstance(candidate, dict):
+        raise SnapshotMigrationError(
+            "checkpoint population candidate must be a mapping"
+        )
     try:
         structure_path = candidate["structure_path"]
         mapping_state = candidate.get("mapping")
-    except (KeyError, TypeError) as exc:
+    except KeyError as exc:
         raise SnapshotMigrationError(
             f"checkpoint population candidate is malformed: {exc}"
         ) from exc

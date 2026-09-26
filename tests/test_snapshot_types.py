@@ -3,7 +3,12 @@
 import numpy as np
 import pytest
 
-from GBOpt.evaluation import EvaluationResult, EvaluationStatus, FailureStage, StructureArtifact
+from GBOpt.evaluation import (
+    EvaluationResult,
+    EvaluationStatus,
+    FailureStage,
+    StructureArtifact,
+)
 from GBOpt.FileGrainOwnership import BoundaryNormalTopology, CandidateFileMapping
 from GBOpt.snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
@@ -253,22 +258,24 @@ class TestPopulationCandidateSnapshot:
 
 class TestMonteCarloSnapshot:
     def _snapshot(self, **overrides):
-        kwargs = dict(
-            run=_run(),
-            rng=RngStateSnapshot.from_generator(np.random.default_rng(1)),
-            completed_step=3,
-            temperature=0.5,
-            rejection_count=1,
-            previous_energy=2.0,
-            best_energy=1.5,
-            current_artifact=_artifact("current.data"),
-            best_artifact=_artifact("best.data"),
-            energy_history=(2.0, 1.8, 1.5),
-            accepted_steps=(0, 2),
-            step_history=(
-                MonteCarloStepRecordSnapshot(operation_name="translate_right_grain", accepted=True),
+        kwargs = {
+            "run": _run(),
+            "rng": RngStateSnapshot.from_generator(np.random.default_rng(1)),
+            "completed_step": 3,
+            "temperature": 0.5,
+            "rejection_count": 1,
+            "previous_energy": 2.0,
+            "best_energy": 1.5,
+            "current_artifact": _artifact("current.data"),
+            "best_artifact": _artifact("best.data"),
+            "energy_history": (2.0, 1.8, 1.5),
+            "accepted_steps": (0, 2),
+            "step_history": (
+                MonteCarloStepRecordSnapshot(
+                    operation_name="translate_right_grain", accepted=True
+                ),
             ),
-        )
+        }
         kwargs.update(overrides)
         return MonteCarloSnapshot(**kwargs)
 
@@ -299,18 +306,18 @@ class TestGeneticAlgorithmSnapshot:
             PopulationCandidateSnapshot(artifact=_artifact("p0.data"), lineage=_lineage()),
             PopulationCandidateSnapshot(artifact=_artifact("p1.data"), lineage=_lineage()),
         )
-        kwargs = dict(
-            run=_run(),
-            rng=RngStateSnapshot.from_generator(np.random.default_rng(2)),
-            completed_generation=1,
-            best=_success_eval(),
-            population=population,
-            population_cache=(None, _success_eval("cache-1")),
-            energy_history=((2.0, 1.5), (1.8, 1.4)),
-            generation_history=(
+        kwargs = {
+            "run": _run(),
+            "rng": RngStateSnapshot.from_generator(np.random.default_rng(2)),
+            "completed_generation": 1,
+            "best": _success_eval(),
+            "population": population,
+            "population_cache": (None, _success_eval("cache-1")),
+            "energy_history": ((2.0, 1.5), (1.8, 1.4)),
+            "generation_history": (
                 (GenerationHistoryEntrySnapshot(lineage=_lineage(), energy=2.0),),
             ),
-            failure_diagnostics=(
+            "failure_diagnostics": (
                 FailureDiagnosticSnapshot(
                     candidate_id="c-fail",
                     generation=0,
@@ -318,7 +325,7 @@ class TestGeneticAlgorithmSnapshot:
                     failure_reason="evaluator crashed",
                 ),
             ),
-        )
+        }
         kwargs.update(overrides)
         return GeneticAlgorithmSnapshot(**kwargs)
 

@@ -3,7 +3,6 @@
 import json
 import math
 import pickle
-from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -116,11 +115,13 @@ def _run_ga_then_crash_after_first_save(minimizer, checkpoint, fmt, unique_id):
         if call_count >= 1:
             raise RuntimeError("simulated crash after first checkpoint commit")
 
-    with patch.object(CheckpointStore, "_save", save_then_crash):
-        with pytest.raises(RuntimeError):
-            minimizer.run_GA(
-                unique_id=unique_id, checkpoint_file=checkpoint, checkpoint_format=fmt,
-            )
+    with (
+        patch.object(CheckpointStore, "_save", save_then_crash),
+        pytest.raises(RuntimeError),
+    ):
+        minimizer.run_GA(
+            unique_id=unique_id, checkpoint_file=checkpoint, checkpoint_format=fmt,
+        )
     assert checkpoint.exists()
 
 

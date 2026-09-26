@@ -185,12 +185,7 @@ def _reject_live_objects(value: object, *, path: str) -> object:
     if isinstance(value, (str, bool, type(None))):
         return value
     if isinstance(value, Mapping):
-        normalized: dict[str, object] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise SnapshotValueError(f"{path} keys must be strings")
-            normalized[key] = _reject_live_objects(item, path=f"{path}.{key}")
-        return normalized
+        return _reject_live_objects_mapping(value, path=path)
     if isinstance(value, (Sequence, tuple)) and not isinstance(value, (str, bytes)):
         return tuple(
             _reject_live_objects(item, path=f"{path}[{index}]")
@@ -212,6 +207,25 @@ def _reject_live_objects(value: object, *, path: str) -> object:
         f"{path} must be a JSON-safe scalar, mapping, or sequence; got "
         f"{type(value).__name__}"
     )
+
+
+def _reject_live_objects_mapping(
+    value: Mapping[str, object], *, path: str
+) -> dict[str, object]:
+    """Recursively validate one mapping's keys/values are all JSON-safe.
+
+    :param value: Mapping to validate.
+    :param path: Keyword argument, required. Diagnostic path to ``value``.
+    :return: Plain ``dict[str, object]`` with every value JSON-safe-normalized.
+    :raises SnapshotTypeError: If any value is not JSON-safe.
+    :raises SnapshotValueError: If any key is not a string.
+    """
+    normalized: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise SnapshotValueError(f"{path} keys must be strings")
+        normalized[key] = _reject_live_objects(item, path=f"{path}.{key}")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -248,7 +262,7 @@ class RngStateSnapshot:
         bit_generator = _normalize_identity(bit_generator, name="bit_generator")
         if not isinstance(state, Mapping):
             raise SnapshotTypeError("state must be a mapping")
-        normalized_state = _reject_live_objects(state, path="state")
+        normalized_state = _reject_live_objects_mapping(state, path="state")
         if normalized_state.get("bit_generator") != bit_generator:
             raise SnapshotValueError(
                 "state['bit_generator'] must match the bit_generator argument"
@@ -725,7 +739,9 @@ def _validate_optional_retention_state(value: object) -> Mapping[str, object] | 
         return None
     if not isinstance(value, Mapping):
         raise SnapshotTypeError("retention_state must be a mapping or None")
-    return MappingProxyType(_reject_live_objects(value, path="retention_state"))
+    return MappingProxyType(
+        _reject_live_objects_mapping(value, path="retention_state")
+    )
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -912,7 +928,9 @@ class GeneticAlgorithmSnapshot:
         failure_diagnostics: Sequence[FailureDiagnosticSnapshot] = (),
         claimed_paths: Sequence[str] = (),
         retention_state: Mapping[str, object] | None = None,
-        retention_archive_mappings: Mapping[str, CandidateFileMapping] = (),
+        retention_archive_mappings: Mapping[str, CandidateFileMapping] = MappingProxyType(
+            {}
+        ),
     ) -> None:
         """Construct a validated, immutable genetic-algorithm restart snapshot.
 
@@ -930,31 +948,11 @@ class GeneticAlgorithmSnapshot:
         if best.status is not EvaluationStatus.SUCCESS:
             raise SnapshotValueError("best must be a successful evaluation")
 
-        population_tuple = tuple(population)
-        if not population_tuple:
-            raise SnapshotValueError("population must not be empty")
-        if not all(
-            isinstance(entry, PopulationCandidateSnapshot)
-            for entry in population_tuple
-        ):
-            raise SnapshotTypeError(
-                "population entries must be PopulationCandidateSnapshot"
-            )
+        population_tuple = _validate_ga_population(population)
         population_size = len(population_tuple)
-
-        population_cache_tuple = tuple(population_cache)
-        if population_cache_tuple and len(population_cache_tuple) != population_size:
-            raise SnapshotValueError(
-                "population_cache must be empty or aligned with population"
-            )
-        if not all(
-            entry is None or isinstance(entry, CandidateEvaluationSnapshot)
-            for entry in population_cache_tuple
-        ):
-            raise SnapshotTypeError(
-                "population_cache entries must be CandidateEvaluationSnapshot or None"
-            )
-
+        population_cache_tuple = _validate_ga_population_cache(
+            population_cache, population_size=population_size
+        )
         energy_history_tuple = tuple(
             tuple(_normalize_energy(value, name="energy_history entry") for value in gen)
             for gen in energy_history
@@ -963,44 +961,12 @@ class GeneticAlgorithmSnapshot:
             tuple(_require_generation_history_entry(entry) for entry in gen)
             for gen in generation_history
         )
-
-        retention_lineages_tuple: tuple[tuple[str, ...], ...] | None
-        if retention_lineages is None:
-            retention_lineages_tuple = None
-        else:
-            retention_lineages_tuple = tuple(
-                tuple(
-                    _normalize_identity(value, name="retention_lineages entry")
-                    for value in lineage
-                )
-                for lineage in retention_lineages
-            )
-            if len(retention_lineages_tuple) != population_size:
-                raise SnapshotValueError(
-                    "retention_lineages must be None or aligned with population"
-                )
-
-        last_generation_evaluations_tuple: (
-            tuple[CandidateEvaluationSnapshot, ...] | None
+        retention_lineages_tuple = _validate_ga_retention_lineages(
+            retention_lineages, population_size=population_size
         )
-        if last_generation_evaluations is None:
-            last_generation_evaluations_tuple = None
-        else:
-            last_generation_evaluations_tuple = tuple(last_generation_evaluations)
-            if len(last_generation_evaluations_tuple) != population_size:
-                raise SnapshotValueError(
-                    "last_generation_evaluations must be None or aligned with "
-                    "population"
-                )
-            if not all(
-                isinstance(entry, CandidateEvaluationSnapshot)
-                for entry in last_generation_evaluations_tuple
-            ):
-                raise SnapshotTypeError(
-                    "last_generation_evaluations entries must be "
-                    "CandidateEvaluationSnapshot"
-                )
-
+        last_generation_evaluations_tuple = _validate_ga_last_generation_evaluations(
+            last_generation_evaluations, population_size=population_size
+        )
         if not all(
             isinstance(entry, FailureDiagnosticSnapshot)
             for entry in failure_diagnostics
@@ -1013,16 +979,9 @@ class GeneticAlgorithmSnapshot:
             for value in claimed_paths
         )
         retention_state = _validate_optional_retention_state(retention_state)
-        retention_archive_mappings_dict = dict(retention_archive_mappings)
-        for candidate_id, mapping in retention_archive_mappings_dict.items():
-            if not isinstance(candidate_id, str) or not candidate_id.strip():
-                raise SnapshotTypeError(
-                    "retention_archive_mappings keys must be non-empty strings"
-                )
-            if not isinstance(mapping, CandidateFileMapping):
-                raise SnapshotTypeError(
-                    "retention_archive_mappings values must be CandidateFileMapping"
-                )
+        retention_archive_mappings_dict = _validate_ga_retention_archive_mappings(
+            retention_archive_mappings
+        )
 
         object.__setattr__(self, "schema_version", SNAPSHOT_SCHEMA_VERSION)
         object.__setattr__(self, "run", run)
@@ -1049,6 +1008,139 @@ class GeneticAlgorithmSnapshot:
             "retention_archive_mappings",
             MappingProxyType(retention_archive_mappings_dict),
         )
+
+
+def _validate_ga_population(
+    population: Sequence[PopulationCandidateSnapshot],
+) -> tuple[PopulationCandidateSnapshot, ...]:
+    """Validate a non-empty, well-typed GA population.
+
+    :param population: Candidate sequence to validate.
+    :return: Validated population tuple.
+    :raises SnapshotTypeError: If any entry is not a ``PopulationCandidateSnapshot``.
+    :raises SnapshotValueError: If ``population`` is empty.
+    """
+    population_tuple = tuple(population)
+    if not population_tuple:
+        raise SnapshotValueError("population must not be empty")
+    if not all(
+        isinstance(entry, PopulationCandidateSnapshot) for entry in population_tuple
+    ):
+        raise SnapshotTypeError(
+            "population entries must be PopulationCandidateSnapshot"
+        )
+    return population_tuple
+
+
+def _validate_ga_population_cache(
+    population_cache: Sequence[CandidateEvaluationSnapshot | None],
+    *,
+    population_size: int,
+) -> tuple[CandidateEvaluationSnapshot | None, ...]:
+    """Validate an optional, population-aligned carryover cache.
+
+    :param population_cache: Cache sequence to validate.
+    :param population_size: Keyword argument, required. Population size to align
+        against, when ``population_cache`` is non-empty.
+    :return: Validated cache tuple.
+    :raises SnapshotTypeError: If any entry is neither ``None`` nor a
+        ``CandidateEvaluationSnapshot``.
+    :raises SnapshotValueError: If ``population_cache`` is non-empty and misaligned.
+    """
+    population_cache_tuple = tuple(population_cache)
+    if population_cache_tuple and len(population_cache_tuple) != population_size:
+        raise SnapshotValueError(
+            "population_cache must be empty or aligned with population"
+        )
+    if not all(
+        entry is None or isinstance(entry, CandidateEvaluationSnapshot)
+        for entry in population_cache_tuple
+    ):
+        raise SnapshotTypeError(
+            "population_cache entries must be CandidateEvaluationSnapshot or None"
+        )
+    return population_cache_tuple
+
+
+def _validate_ga_retention_lineages(
+    retention_lineages: Sequence[Sequence[str]] | None,
+    *,
+    population_size: int,
+) -> tuple[tuple[str, ...], ...] | None:
+    """Validate an optional, population-aligned sequence of retention lineages.
+
+    :param retention_lineages: Lineage sequence to validate, or ``None``.
+    :param population_size: Keyword argument, required. Population size to align
+        against.
+    :return: Validated lineage tuple, or ``None``.
+    :raises SnapshotTypeError: If any lineage entry is not a non-empty string.
+    :raises SnapshotValueError: If ``retention_lineages`` is given and misaligned.
+    """
+    if retention_lineages is None:
+        return None
+    retention_lineages_tuple = tuple(
+        tuple(_normalize_identity(value, name="retention_lineages entry") for value in lineage)
+        for lineage in retention_lineages
+    )
+    if len(retention_lineages_tuple) != population_size:
+        raise SnapshotValueError(
+            "retention_lineages must be None or aligned with population"
+        )
+    return retention_lineages_tuple
+
+
+def _validate_ga_last_generation_evaluations(
+    last_generation_evaluations: Sequence[CandidateEvaluationSnapshot] | None,
+    *,
+    population_size: int,
+) -> tuple[CandidateEvaluationSnapshot, ...] | None:
+    """Validate an optional, population-aligned sequence of prior-generation results.
+
+    :param last_generation_evaluations: Evaluation sequence to validate, or ``None``.
+    :param population_size: Keyword argument, required. Population size to align
+        against.
+    :return: Validated evaluation tuple, or ``None``.
+    :raises SnapshotTypeError: If any entry is not a ``CandidateEvaluationSnapshot``.
+    :raises SnapshotValueError: If given and misaligned with ``population_size``.
+    """
+    if last_generation_evaluations is None:
+        return None
+    last_generation_evaluations_tuple = tuple(last_generation_evaluations)
+    if len(last_generation_evaluations_tuple) != population_size:
+        raise SnapshotValueError(
+            "last_generation_evaluations must be None or aligned with population"
+        )
+    if not all(
+        isinstance(entry, CandidateEvaluationSnapshot)
+        for entry in last_generation_evaluations_tuple
+    ):
+        raise SnapshotTypeError(
+            "last_generation_evaluations entries must be CandidateEvaluationSnapshot"
+        )
+    return last_generation_evaluations_tuple
+
+
+def _validate_ga_retention_archive_mappings(
+    retention_archive_mappings: Mapping[str, CandidateFileMapping],
+) -> dict[str, CandidateFileMapping]:
+    """Validate a candidate-identity-keyed mapping of persistent ownership state.
+
+    :param retention_archive_mappings: Mapping to validate.
+    :return: Validated, detached ``dict`` copy.
+    :raises SnapshotTypeError: If a key is not a non-empty string, or a value is not a
+        ``CandidateFileMapping``.
+    """
+    retention_archive_mappings_dict = dict(retention_archive_mappings)
+    for candidate_id, mapping in retention_archive_mappings_dict.items():
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            raise SnapshotTypeError(
+                "retention_archive_mappings keys must be non-empty strings"
+            )
+        if not isinstance(mapping, CandidateFileMapping):
+            raise SnapshotTypeError(
+                "retention_archive_mappings values must be CandidateFileMapping"
+            )
+    return retention_archive_mappings_dict
 
 
 def _require_generation_history_entry(
