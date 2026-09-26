@@ -358,36 +358,58 @@ class RunIdentitySnapshot:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class LineageStepSnapshot:
     """One structured operation/parent-provenance step, never a prose description.
 
+    An operation may draw from one parent (mutation, carryover, the fixed ``"START"``
+    marker) or two (crossover), so :attr:`parent_references` holds however many a real
+    step actually used rather than assuming a fixed arity. :attr:`diagnostic_note`
+    carries free-text context schema-v1 itself already recorded alongside some lineage
+    entries (e.g. crossover provenance parameters, a fallback attempt count) -- it is
+    explicitly non-authoritative diagnostic text, never a substitute for
+    :attr:`operation_name`/:attr:`parent_references`' own structured identity.
+
     :param operation_name: Name of the manipulation operation (or fixed lineage marker,
-        e.g. ``"START"``) that produced this candidate from its parent.
-    :param parent_reference: Stable reference to the parent this operation applied to
-        -- a structure artifact path or a candidate identity, depending on which
+        e.g. ``"START"``) that produced this candidate from its parent(s).
+    :param parent_references: Stable references to the parent(s) this operation applied
+        to -- structure artifact paths or candidate identities, depending on which
         identity was authoritative when this step was recorded.
-    :raises SnapshotTypeError: If either field is not a non-empty string.
+    :param diagnostic_note: Keyword argument, optional, defaults to ``None``.
+        Non-authoritative free-text context recorded alongside this step.
+    :raises SnapshotTypeError: If ``operation_name``/``diagnostic_note`` is not a
+        string, or ``parent_references`` is not a sequence of non-empty strings.
+    :raises SnapshotValueError: If ``parent_references`` is empty.
     """
 
     operation_name: str
-    parent_reference: str
+    parent_references: tuple[str, ...]
+    diagnostic_note: str | None
 
-    def __post_init__(self) -> None:
-        """Validate both fields are non-empty strings.
+    def __init__(
+        self,
+        *,
+        operation_name: str,
+        parent_references: Sequence[str],
+        diagnostic_note: str | None = None,
+    ) -> None:
+        """Construct a validated, immutable lineage step.
 
-        :raises SnapshotTypeError: If either field is not a non-empty string.
+        See the class docstring for parameter semantics and raised exceptions.
         """
-        object.__setattr__(
-            self,
-            "operation_name",
-            _normalize_identity(self.operation_name, name="operation_name"),
+        operation_name = _normalize_identity(operation_name, name="operation_name")
+        parent_references_tuple = tuple(
+            _normalize_identity(value, name="parent_references entry")
+            for value in parent_references
         )
-        object.__setattr__(
-            self,
-            "parent_reference",
-            _normalize_identity(self.parent_reference, name="parent_reference"),
+        if not parent_references_tuple:
+            raise SnapshotValueError("parent_references must not be empty")
+        diagnostic_note = _normalize_optional_identity(
+            diagnostic_note, name="diagnostic_note"
         )
+        object.__setattr__(self, "operation_name", operation_name)
+        object.__setattr__(self, "parent_references", parent_references_tuple)
+        object.__setattr__(self, "diagnostic_note", diagnostic_note)
 
 
 @dataclass(frozen=True, slots=True)

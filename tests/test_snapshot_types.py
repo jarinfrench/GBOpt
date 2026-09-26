@@ -68,7 +68,9 @@ def _failed_eval(candidate_id="c2"):
 
 
 def _lineage():
-    return LineageStepSnapshot(operation_name="translate_right_grain", parent_reference="parent.data")
+    return LineageStepSnapshot(
+        operation_name="translate_right_grain", parent_references=("parent.data",)
+    )
 
 
 class TestRngStateSnapshot:
@@ -199,6 +201,32 @@ class TestCandidateEvaluationSnapshot:
             failure_message="boom",
         )
         assert failed.input_index == -1
+
+
+class TestLineageStepSnapshot:
+    def test_single_parent(self):
+        step = LineageStepSnapshot(
+            operation_name="mutate", parent_references=("parent.data",)
+        )
+        assert step.parent_references == ("parent.data",)
+        assert step.diagnostic_note is None
+
+    def test_two_parents_with_diagnostic_note(self):
+        step = LineageStepSnapshot(
+            operation_name="slice_and_merge",
+            parent_references=("p1.data", "p2.data"),
+            diagnostic_note="{'surface_mode': 'periodic_wave'}",
+        )
+        assert step.parent_references == ("p1.data", "p2.data")
+        assert step.diagnostic_note == "{'surface_mode': 'periodic_wave'}"
+
+    def test_empty_parent_references_rejected(self):
+        with pytest.raises(SnapshotValueError):
+            LineageStepSnapshot(operation_name="mutate", parent_references=())
+
+    def test_empty_operation_name_rejected(self):
+        with pytest.raises(SnapshotTypeError):
+            LineageStepSnapshot(operation_name="", parent_references=("p.data",))
 
 
 class TestPopulationCandidateSnapshot:
