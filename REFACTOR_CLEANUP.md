@@ -1,5 +1,202 @@
 # Refactor cleanup backlog
 
+## R29 net tooling deltas: ruff net 0, mypy net -8 (two real fixes, one pre-existing looseness surfaced), bandit unchanged, pyscn +2 quality issues (disclosed, not decomposed), clones 8 -> 5
+
+Baseline taken at the R29 branch point (`4d429d5`, tip of `refactor/r27-checkpoint-
+snapshots` -- R29 does not merge R28, per this step's own explicit instructions).
+ruff: identical finding shape/count on every touched file (`GBOpt/snapshot/types.py`
+1 `RUF022` both before and after, matching the established not-alphabetized `__all__`
+convention; `GBOpt/snapshot/migration.py`/`__init__.py` 1 `RUF022` each, unchanged;
+`GBOpt/optimization/genetic.py` 8 `B905` + 5 `BLE001`, unchanged;
+`GBOpt/optimization/checkpointing.py` 0, unchanged; `tests/test_optimization_genetic.py`
+6 `B905` + 9 `SIM117`, unchanged). mypy: `GBOpt/snapshot/types.py`/`migration.py` went
+from 0 new-file findings to 0 (two real findings were introduced and fixed in the same
+step, not left as debt -- see the dedicated entry below);
+`GBOpt/optimization/genetic.py` gained 5 new findings, all disclosed as real, not
+appeased with a cast (see the dedicated entry below). bandit: 0 issues both before and
+after (`bandit -r GBOpt/snapshot GBOpt/optimization/genetic.py
+GBOpt/optimization/checkpointing.py`). pyscn: `GeneticAlgorithmSnapshot.__init__`
+(128 SLOC) and `_run_owned_GA._build_owned_state` (128 SLOC) are two new SLOC-gate
+trips (10 -> 12 quality issues), left undecomposed given this step's time budget --
+disclosed below rather than silently accepted or hastily decomposed under time
+pressure. `_run_owned_GA`'s own pre-existing over-threshold complexity/SLOC grew
+further (92->95 complexity, 834->902 SLOC) and `run_GA`'s did too (45->48, 433->475),
+as an expected consequence of wiring typed-snapshot construction into methods already
+well over threshold before this step -- not a fresh threshold crossing. Clone pairs
+dropped 8 -> 5, apparently from incidental shared-helper reuse (e.g. reusing
+`_lineage_step_from_v1`/`_owned_evaluation_to_snapshot` from `migration.py` rather than
+duplicating their logic in `genetic.py`); not investigated further given time.
+
+**Resolve at**: a future tooling-focused pass should decompose
+`GeneticAlgorithmSnapshot.__init__` and `_build_owned_state` the way R12's
+`LammpsDataWriter.write()` and R09's `assemble_bicrystal`/`build_bicrystal` were
+decomposed, per this file's own established "budget one more decomposition pass"
+lesson -- not attempted here due to time.
+
+## R29 found and fixed a real GBOpt.snapshot <-> GBOpt.optimization.genetic import cycle mid-step, not left for a later step
+
+Wiring `GeneticAlgorithmMinimizer`'s checkpoint save/resume onto typed snapshots
+required a module-scope `from GBOpt.snapshot import (...)` in `genetic.py` -- the first
+time anything in `GBOpt.optimization` has imported `GBOpt.snapshot` back. This closed a
+cycle with `GBOpt.snapshot.types`/`migration`'s own pre-existing module-scope
+`from GBOpt.optimization.types import _candidate_mapping_*` imports (present since
+R27, harmless until now because nothing imported `GBOpt.snapshot` from inside
+`GBOpt.optimization` yet): `import GBOpt.snapshot` directly failed with
+`ImportError: cannot import name 'SNAPSHOT_SCHEMA_VERSION' from partially initialized
+module`, while `import GBOpt.optimization.genetic` (a different entry order) did not
+trip it -- Python always runs a package's own `__init__.py` before any submodule
+import, and `GBOpt/optimization/__init__.py` eagerly imports `.genetic`, so *any*
+import of *any* `GBOpt.optimization` submodule (including the leaf `types.py`) drags
+`.genetic` in fully; entering from the `GBOpt.optimization` side happens to finish
+initializing `GBOpt.snapshot` before `GBOpt.snapshot` needs its own name back, while
+entering from the `GBOpt.snapshot` side does not. Fixed by deferring every
+`GBOpt.optimization.types` import inside `GBOpt/snapshot/types.py`/`migration.py` to
+call time (5 local-import sites), matching this file's own established "local import
+mechanism... breaks the cycle" precedent (see the R14/`FileGrainOwnership` entries
+above) -- applied here to a cross-*subpackage* boundary rather than an
+intra-subpackage one, since `GBOpt.snapshot` and `GBOpt.optimization` have no clean
+single-direction layering between them (each needs a small piece of the other).
+Caught only by directly testing `import GBOpt.snapshot` after wiring `genetic.py`, not
+by the existing test suite, since every existing test imports `GBOpt.optimization`
+(or a submodule of it) first, which happens to succeed. Added
+`test_importing_snapshot_directly_does_not_deadlock_on_optimization_genetic`
+(`tests/test_snapshot_types.py`), a subprocess-based regression test per this file's
+own established import-boundary-test discipline, since a fresh interpreter is required
+to observe the ordering-dependent failure.
+
+**Resolve at**: no action needed; the fix is complete and tested. Any future step that
+adds a new module-scope import between `GBOpt.snapshot` and `GBOpt.optimization` (in
+either direction) should re-check both import orders (`import GBOpt.snapshot` and
+`import GBOpt.optimization.<anything>`) before assuming the existing test suite would
+catch a regression.
+
+## R27's `GeneticAlgorithmSnapshot` was missing two things R29's real wiring needed: deterministic GA configuration, and owned-mode's per-candidate reload mapping
+
+Issue #89's own acceptance criteria list "deterministic GA configuration" among what
+schema-v2 must store/restore, and re-reading `GeneticAlgorithmMinimizer._run_owned_GA`'s
+existing resume logic (not just the issue's prose) found it validates a checkpoint's
+`population_size`/`keep_top_pct`/`intermediate_pct`/`slice_and_merge_pct`/
+`reuse_carryover_evaluations`/`allow_variable_cell`/`choices`/`crossover_surface`/
+`crossover_max_tilt_degrees`/`crossover_attempts`/`failure_diagnostic_count`/
+`composition_policy` against the resuming run's own constructor arguments on every
+resume -- state `GeneticAlgorithmSnapshot` (R27) had no field for at all. This is the
+same "speculative/earlier-step type turns out to be missing a whole field the real
+wiring needs" pattern R28 hit for `min_steps`/`cooldown_rate` on `MonteCarloSnapshot`,
+just discovered independently for GA rather than inherited from R28 (this branch does
+not merge R28). Fixed by adding a new `GeneticAlgorithmConfigurationSnapshot` type
+(`GBOpt/snapshot/types.py`) plus a required `configuration` field on
+`GeneticAlgorithmSnapshot`, and updating both schema-v1 migrators
+(`_ga_snapshot_from_v1_legacy`/`_ga_snapshot_from_v1_owned`) to populate it from
+`run_params` -- the same "extend the type, thread it through the v1 migrator in the
+same commit" recipe R28 used for its own two new fields.
+
+Separately, and unrelated to configuration: `CandidateEvaluationSnapshot` (the type
+`GeneticAlgorithmSnapshot.best`/`population_cache` use) has no `mapping` field --
+correctly, since it is also used by contexts (a legacy-mode GA candidate, a future MC
+candidate) that never have one. But owned-mode's real `best_evaluation`/
+`population_cached_evaluations` schema-v1 state *always* carried a
+`CandidateFileMapping`, required to actually reload the candidate
+(`_owned_evaluation_from_state`'s `_reload_mapping` call) independent of whether
+artifact retention is configured. Losing it silently would have been a real behavior
+regression (a resumed owned-mode run's best/cached candidates would fail to reload).
+Considered and rejected: broadening `retention_archive_mappings`' existing scope to
+also carry these non-archived mappings -- rejected because that field's *serialized
+state* also feeds `self._retention_archive_mappings`, which in turn feeds
+provenance-manifest `ownership_metadata` writes and archive-eviction bookkeeping;
+polluting it with non-archived entries risked a real, hard-to-spot behavior change in
+already-tested provenance/eviction code, for a benefit (avoiding two new fields) not
+worth that risk under this step's time budget. Instead added two new,
+narrowly-scoped fields, `GeneticAlgorithmSnapshot.best_mapping` and
+`population_cache_mappings` (population-aligned, like `population_cache` itself),
+carrying exactly this data alongside the fields that need it without touching
+`retention_archive_mappings`' existing meaning at all.
+
+**Resolve at**: no action needed; disclosed as a deliberate design choice, not a
+"maybe later" gap like the entries below.
+
+## R29 confirmed R27's three deferred gaps: two remain fully open, one (checkpoint-write wiring) is now partially addressed but `from_evaluation_result` still has no live caller
+
+Rechecked each of R27's own entries against #89's real acceptance criteria before
+starting, per this file's own top-of-file discipline:
+
+- **`CandidateCheckpoint`'s per-candidate `.iterN` sidecar file remains untyped.**
+  Re-read every `CandidateCheckpoint.record`/`.get_result`/`.get_metadata`/`.is_done`
+  call site in `genetic.py` (both `run_GA` and `_run_owned_GA`) before deciding this,
+  per the concrete instruction to ground the decision in real call sites rather than
+  guess from the issue's prose. Every sidecar file is created fresh per-generation via
+  `CandidateCheckpoint.new_or_resume(checkpoint_file, checkpoint_format, gen,
+  all_uids)`, keyed to *that* generation's own candidate uids, and is unconditionally
+  deleted (`gen_checkpoint.delete()`) the moment the generation's own run-level
+  checkpoint commits -- so a sidecar only ever holds state for the *current*,
+  in-progress generation of a *live, in-memory* run; it is never read back by anything
+  except that same run's own `is_done`/`get_result` calls a few lines later in the same
+  loop iteration, and is never present when a run-level checkpoint is loaded from disk
+  (the resume path always deletes any stale sidecar for the just-completed generation
+  before the main loop even starts). Issue #89's own acceptance criteria never name
+  `CandidateCheckpoint`'s file format, only "the existing explicit fine-grained
+  per-job recovery protocol... remain[s] supported" (a behavior requirement, which this
+  step's crash-safety tests confirm continues to hold unchanged) -- not "is typed."
+  Typing this file's shape would add a second schema surface with no migration
+  consumer and no test able to observe it from outside the same process, for zero
+  acceptance-criteria benefit. Left untyped, matching R27's own scoping call.
+- **`retention_state`/`claimed_paths` remain carried opaquely/reused directly.**
+  Unchanged from R27 -- #89 does not ask for `ArtifactStore`'s own state to be
+  re-typed, and `claimed_paths` (owned-mode's flat `list[str]`) still needs no
+  wrapper.
+- **`from_evaluation_result()` still has no live caller.** R29 wires GA's checkpoint
+  *save* path through typed snapshots, but neither `run_GA` nor `_run_owned_GA`
+  constructs a live `GBOpt.evaluation.EvaluationResult` anywhere in their own
+  bookkeeping -- `_build_ga_state`/`_build_owned_state` build `CandidateEvaluationSnapshot`
+  instances directly from the minimizer's own already-computed scalars (energy,
+  structure path, success/failure), the same way R27's schema-v1 migrator does, not by
+  adapting a live `EvaluationResult`. This is consistent with R23's own "no action
+  needed unless a later step wires GA's owned-mode bookkeeping onto `EvaluationResult`"
+  resolution -- GA's own `CandidateEvaluation`/`CandidateEvaluationSummary` types
+  remain the types actually flowing through its live bookkeeping; `#89`'s acceptance
+  criteria never asked for that migration either.
+
+**Resolve at**: no action needed for `retention_state`/`claimed_paths`/the sidecar file
+unless a later step's acceptance criteria explicitly require a typed sidecar shape or
+re-typed `ArtifactStore` state. `from_evaluation_result()`'s first live caller remains
+open for whichever step actually migrates GA's owned-mode bookkeeping onto
+`EvaluationResult`/`GBOpt.evaluation` types generally -- still nobody's explicit scope
+as of R29.
+
+## R29's `_run_owned_GA` resume gained 5 new mypy findings, disclosed rather than cast away
+
+`mypy GBOpt/optimization/genetic.py` went from 51 to 56 findings after this step (the
+snapshot module itself, `types.py`/`migration.py`, ended at 0 new-file findings -- two
+real issues found there were fixed outright, see the tooling-delta entry above). All 5
+new findings in `genetic.py` are real, not appeased:
+
+- Two `[assignment]` findings at `unique_id = snapshot.run.run_id`/
+  `unique_id = early_snapshot.run.run_id` (legacy and owned resume): `unique_id`'s own
+  parameter annotation is `int | uuid.UUID | None`, which never actually included
+  `str` -- schema-v1's raw dict read (`state["run_params"]["unique_id"]`, untyped
+  `Any`) silently hid this pre-existing looseness; `RunIdentitySnapshot.run_id`'s own
+  honest `str` type surfaces it for the first time. Not fixed here (widening
+  `unique_id`'s own public parameter type is a larger, separate decision outside this
+  step's scope) -- disclosed rather than papered over with a cast.
+  - Two `[union-attr]`/`[arg-type]` findings on `cache.artifact.path`/
+    `_CachedEvaluation(energy=cache.energy, ...)` in legacy `run_GA`'s resume block:
+    `CandidateEvaluationSnapshot.artifact`/`.energy` are typed `X | None` (correctly,
+    since a failed evaluation has neither), but every legacy carryover-cache entry this
+    code path actually constructs is always a `SUCCESS` with both populated --
+    `GeneticAlgorithmSnapshot`'s own population-alignment validation, not a per-entry
+    runtime check mypy can see, is what guarantees this. A genuine but low-value
+    finding; not guarded with an `if ... is None: raise` here given time, since (per
+    this file's "would I make this change if mypy didn't exist" test) the guard would
+    exist purely for mypy's benefit, not a real defensive need this specific,
+    already-validated call site has.
+  - One `[assignment]` finding narrowing `tuple[Any, ...]` to `tuple[str, ...]` at a
+    `choices` comparison -- a byproduct of `GeneticAlgorithmConfigurationSnapshot.choices`
+    now being honestly typed `tuple[str, ...] | None`, tightening what mypy can infer
+    at the comparison site versus the untyped dict read it replaced.
+
+**Resolve at**: no action needed unless a later step widens `run_GA`/`_run_owned_GA`'s
+own `unique_id` parameter type to include `str` for an unrelated reason, at which point
+the two `[assignment]` findings above would resolve as a side effect.
+
 ## R27 net tooling deltas: ruff +3 (disclosed established-convention debt), mypy net 0, bandit unchanged, pyscn back to baseline after an in-step decomposition (41 quality issues, 47 clone pairs)
 
 Baseline taken at the R27 branch point (`e7354db`, tip of `refactor/r26-checkpoint-

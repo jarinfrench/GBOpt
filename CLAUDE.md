@@ -645,6 +645,30 @@ Established by `GBOpt/crystallography/` and `GBOpt/artifacts/`, and now also
   needs to inspect state at a specific completed-generation boundary; reserve
   the mutator-crash technique for MC, where it already works correctly because
   MC has no equivalent population-seeding phase.
+- **A new module-scope import that finally closes a two-subpackage cycle can pass
+  every existing test while still being broken, if every existing test happens to
+  enter the cycle from the side that doesn't trip it.** R29 gave
+  `GBOpt.optimization.genetic` its first-ever module-scope `from GBOpt.snapshot import
+  (...)`. `GBOpt.snapshot.types`/`migration` already had their own module-scope
+  `from GBOpt.optimization.types import _candidate_mapping_*` (since R27) -- harmless
+  until something in `GBOpt.optimization` imported `GBOpt.snapshot` back. The result:
+  `import GBOpt.optimization.genetic` (what every existing test does, transitively)
+  succeeded, but `import GBOpt.snapshot` directly failed with `ImportError: cannot
+  import name 'SNAPSHOT_SCHEMA_VERSION' from partially initialized module` -- entering
+  the cycle from the `GBOpt.optimization` side happens to finish initializing
+  `GBOpt.snapshot` before `GBOpt.snapshot` needs its own name back; entering from the
+  `GBOpt.snapshot` side does not. The existing test suite gave zero signal since
+  nothing in it imports `GBOpt.snapshot` as the *first* thing in a fresh interpreter.
+  Caught only by manually testing `python -c "import GBOpt.snapshot"` after wiring the
+  new import, not by running pytest. Fixed with this file's own established local-
+  import recipe (defer `GBOpt.optimization.types` imports inside
+  `GBOpt.snapshot.types`/`migration` to call time, 5 sites), and pinned with a
+  subprocess-based regression test importing `GBOpt.snapshot` directly in a fresh
+  interpreter. When a new module-scope import closes a cycle between two subpackages
+  that each already import a little of the other, test *both* import orders
+  explicitly (`import <new-importer>` and `import <the-thing-it-newly-imports>`)
+  rather than trusting the existing suite, which likely only ever enters from one
+  side.
 
 ## Refactor-issue discipline
 
