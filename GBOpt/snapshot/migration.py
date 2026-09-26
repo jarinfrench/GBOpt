@@ -30,8 +30,7 @@ from GBOpt.Checkpoint import (
     validate_checkpoint_envelope,
 )
 from GBOpt.evaluation import EvaluationStatus, FailureStage, StructureArtifact
-from GBOpt.FileGrainOwnership import GrainOwnershipError
-from GBOpt.optimization.types import _candidate_mapping_from_state
+from GBOpt.FileGrainOwnership import CandidateFileMapping, GrainOwnershipError
 from GBOpt.snapshot.types import (
     CandidateEvaluationSnapshot,
     FailureDiagnosticSnapshot,
@@ -588,7 +587,7 @@ def _owned_population_cache_mappings_from_v1(
     )
 
 
-def _owned_evaluation_mapping_from_v1(raw: dict) -> object | None:
+def _owned_evaluation_mapping_from_v1(raw: dict) -> CandidateFileMapping | None:
     """Extract one owned-mode evaluation's own reconstruction mapping, if any.
 
     :param raw: Raw ``_owned_evaluation_to_state``-shaped mapping.
@@ -814,7 +813,7 @@ def _owned_population_candidate_to_snapshot(
         ) from exc
 
 
-def _mapping_from_v1_state(identity: str, mapping_state: object):
+def _mapping_from_v1_state(identity: str, mapping_state: object) -> CandidateFileMapping:
     """Reconstruct and validate one checkpointed candidate/file ownership mapping.
 
     Reuses ``GBOpt.optimization.types``'s existing schema-v1 mapping (de)serialization
@@ -825,6 +824,13 @@ def _mapping_from_v1_state(identity: str, mapping_state: object):
     :return: Validated ``CandidateFileMapping``.
     :raises SnapshotMigrationError: If ``mapping_state`` is malformed.
     """
+    # Local import: GBOpt.optimization.types is only reachable through
+    # GBOpt.optimization's own package __init__, which eagerly imports
+    # GBOpt.optimization.genetic -- and genetic.py imports this subpackage at module
+    # scope. A module-scope import here would form an import cycle; deferring it to
+    # call time (after both packages have finished loading) breaks it.
+    from GBOpt.optimization.types import _candidate_mapping_from_state
+
     try:
         return _candidate_mapping_from_state(mapping_state)
     except GrainOwnershipError as exc:

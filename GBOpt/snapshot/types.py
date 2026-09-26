@@ -36,10 +36,6 @@ from GBOpt.evaluation import (
     StructureArtifact,
 )
 from GBOpt.FileGrainOwnership import CandidateFileMapping, GrainOwnershipError
-from GBOpt.optimization.types import (
-    _candidate_mapping_from_state,
-    _candidate_mapping_to_state,
-)
 
 if TYPE_CHECKING:
     from GBOpt.observability import OptimizationAlgorithm, RunContext
@@ -245,6 +241,13 @@ def _mapping_from_state(value: object, *, name: str) -> CandidateFileMapping:
     :return: Validated candidate/file ownership mapping.
     :raises SnapshotValueError: If ``value`` is not a valid serialized mapping.
     """
+    # Local import: GBOpt.optimization.types is only reachable through
+    # GBOpt.optimization's own package __init__, which eagerly imports
+    # GBOpt.optimization.genetic -- and genetic.py imports this subpackage at module
+    # scope. A module-scope import here would form an import cycle; deferring it to
+    # call time (after both packages have finished loading) breaks it.
+    from GBOpt.optimization.types import _candidate_mapping_from_state
+
     try:
         return _candidate_mapping_from_state(value)
     except GrainOwnershipError as exc:
@@ -1041,6 +1044,10 @@ class PopulationCandidateSnapshot:
 
         :return: JSON-safe mapping, restorable via :meth:`from_state`.
         """
+        # Local import: see _mapping_from_state's own comment on why this cannot be a
+        # module-scope import.
+        from GBOpt.optimization.types import _candidate_mapping_to_state
+
         return {
             "artifact": _artifact_to_state(self.artifact),
             "lineage": self.lineage.to_state(),
@@ -1335,11 +1342,12 @@ class GeneticAlgorithmConfigurationSnapshot:
         slice_and_merge_pct = _normalize_energy(
             slice_and_merge_pct, name="slice_and_merge_pct"
         )
-        reuse_carryover_evaluations = _normalize_optional_bool(
+        normalized_reuse_carryover_evaluations = _normalize_optional_bool(
             reuse_carryover_evaluations, name="reuse_carryover_evaluations"
         )
-        if reuse_carryover_evaluations is None:
+        if normalized_reuse_carryover_evaluations is None:
             raise SnapshotTypeError("reuse_carryover_evaluations must be a bool")
+        reuse_carryover_evaluations = normalized_reuse_carryover_evaluations
         population_size = _normalize_optional_index(
             population_size, name="population_size"
         )
@@ -1666,6 +1674,10 @@ class GeneticAlgorithmSnapshot:
 
         :return: JSON-safe mapping, restorable via :meth:`from_state`.
         """
+        # Local import: see _mapping_from_state's own comment on why this cannot be a
+        # module-scope import.
+        from GBOpt.optimization.types import _candidate_mapping_to_state
+
         return {
             "schema_version": self.schema_version,
             "run": self.run.to_state(),

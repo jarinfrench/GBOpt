@@ -1,5 +1,8 @@
 # Copyright 2025, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
 
+import subprocess
+import sys
+
 import numpy as np
 import pytest
 
@@ -371,3 +374,27 @@ class TestGeneticAlgorithmSnapshot:
     def test_last_generation_evaluations_length_must_match_population(self):
         with pytest.raises(SnapshotValueError):
             self._snapshot(last_generation_evaluations=(_success_eval(),))
+
+
+def test_importing_snapshot_directly_does_not_deadlock_on_optimization_genetic():
+    """``import GBOpt.snapshot`` must not trip the optimization<->snapshot cycle.
+
+    ``GBOpt.snapshot.types``/``migration`` reach into ``GBOpt.optimization.types`` for
+    the candidate/file mapping (de)serialization helper, and
+    ``GBOpt.optimization.genetic`` imports this subpackage back for its own typed
+    checkpoint snapshots. Importing ``GBOpt.optimization`` at all always runs its
+    package ``__init__`` first, which eagerly imports ``.genetic`` -- so entering this
+    cycle from the ``GBOpt.snapshot`` side (rather than ``GBOpt.optimization``'s own,
+    already-covered-by-existing-tests side) previously failed with
+    ``ImportError: cannot import name ... from partially initialized module`` because
+    the mapping-helper imports were at module scope on both sides. A fresh interpreter
+    is required since a prior test in this same process may have already imported
+    ``GBOpt.optimization`` first, which would hide the ordering-dependent failure.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", "import GBOpt.snapshot"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
