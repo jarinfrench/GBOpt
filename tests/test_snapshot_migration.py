@@ -125,6 +125,76 @@ def _run_ga_then_crash_after_first_save(minimizer, checkpoint, fmt, unique_id):
     assert checkpoint.exists()
 
 
+def _lineage_entry_from_snapshot_state(lineage: dict) -> list:
+    """Rebuild one raw v1 lineage entry list from its schema-v2 serialized form."""
+    if lineage["diagnostic_note"] is None:
+        return [lineage["operation_name"], *lineage["parent_references"]]
+    return [
+        lineage["operation_name"],
+        *lineage["parent_references"],
+        lineage["diagnostic_note"],
+    ]
+
+
+def _v1_state_from_v2_legacy_envelope(v2_state: dict) -> dict:
+    """Translate one real schema-v2 legacy-mode GA envelope into an equivalent v1 one.
+
+    ``GeneticAlgorithmMinimizer.run_GA`` itself only ever writes schema-v2 checkpoints
+    (R29), so a real, pre-migration schema-v1 fixture can no longer come directly from
+    a live run -- this maps a real run's own v2 output back onto the v1 field layout
+    ``GBOpt.snapshot.migration._ga_snapshot_from_v1_legacy`` expects, matching R28's
+    own ``_v1_state_from_v2_envelope`` precedent for MC.
+    """
+    snap = v2_state["snapshot"]
+    configuration = snap["configuration"]
+    return {
+        "schema_version": 1,
+        "minimizer": "GeneticAlgorithmMinimizer",
+        "progress_unit": "generation",
+        "progress_index": snap["completed_generation"],
+        "best_energy": snap["best"]["selection_energy"],
+        "best_dump": snap["best"]["artifact"]["path"],
+        "rng_state": snap["rng"]["state"],
+        "run_params": {
+            "unique_id": snap["run"]["run_id"],
+            "slice_and_merge_pct": configuration["slice_and_merge_pct"],
+            "reuse_carryover_evaluations": configuration[
+                "reuse_carryover_evaluations"
+            ],
+            "seed": snap["run"]["seed"],
+        },
+        "state": {
+            "GBE_vals": snap["energy_history"],
+            "history": [
+                [
+                    [
+                        _lineage_entry_from_snapshot_state(entry["lineage"]),
+                        entry["energy"],
+                    ]
+                    for entry in gen
+                ]
+                for gen in snap["generation_history"]
+            ],
+            "population_lineages": [
+                _lineage_entry_from_snapshot_state(candidate["lineage"])
+                for candidate in snap["population"]
+            ],
+            "population_checkpoint_paths": [
+                candidate["artifact"]["path"] for candidate in snap["population"]
+            ],
+            "population_cached_evaluations": [
+                None
+                if cache is None
+                else {
+                    "energy": cache["energy"],
+                    "structure_path": cache["artifact"]["path"],
+                }
+                for cache in snap["population_cache"]
+            ],
+        },
+    }
+
+
 def _legacy_ga_checkpoint(gb, tmp_path, *, fmt="json"):
     def fake_energy(GB, manipulator, atom_positions, unique_id):
         dump_file = tmp_path / f"{unique_id}.data"
@@ -136,8 +206,23 @@ def _legacy_ga_checkpoint(gb, tmp_path, *, fmt="json"):
         seed=0, population_size=4, generations=3, keep_top_pct=25, intermediate_pct=75,
     )
     ext = "json" if fmt == "json" else "pkl"
+    v2_checkpoint = tmp_path / f"ga_legacy_v2.{ext}"
+    _run_ga_then_crash_after_first_save(
+        minimizer, v2_checkpoint, fmt, "ga-legacy-run"
+    )
+    if fmt == "json":
+        with open(v2_checkpoint, encoding="utf-8") as fh:
+            v2_state = json.load(fh)
+    else:
+        with open(v2_checkpoint, "rb") as fh:
+            v2_state = pickle.load(fh)
+    v1_state = _v1_state_from_v2_legacy_envelope(v2_state)
     checkpoint = tmp_path / f"ga_legacy.{ext}"
-    _run_ga_then_crash_after_first_save(minimizer, checkpoint, fmt, "ga-legacy-run")
+    if fmt == "json":
+        checkpoint.write_text(json.dumps(v1_state), encoding="utf-8")
+    else:
+        with open(checkpoint, "wb") as fh:
+            pickle.dump(v1_state, fh)
     return checkpoint
 
 
@@ -187,6 +272,120 @@ def owned_ga(tmp_path):
     return gb, seed_path, ownership
 
 
+def _v1_state_from_v2_owned_envelope(v2_state: dict) -> dict:
+    """Translate one real schema-v2 owned-mode GA envelope into an equivalent v1 one.
+
+    Mirrors :func:`_v1_state_from_v2_legacy_envelope` for the explicit-ownership shape
+    ``GBOpt.snapshot.migration._ga_snapshot_from_v1_owned`` expects. ``best_mapping``/
+    ``population_cache_mappings`` (schema-v2-only fields -- ``CandidateEvaluationSnapshot``
+    itself carries no ``mapping`` field) are threaded back into the v1
+    ``best_evaluation``/``population_cached_evaluations`` entries, exactly where schema-v1
+    always carried them.
+    """
+    snap = v2_state["snapshot"]
+    configuration = snap["configuration"]
+    best = snap["best"]
+    cache_mappings = snap.get("population_cache_mappings") or [
+        None for _ in snap["population_cache"]
+    ]
+    return {
+        "schema_version": 1,
+        "minimizer": "GeneticAlgorithmMinimizer",
+        "progress_unit": "generation",
+        "progress_index": snap["completed_generation"],
+        "best_energy": best["selection_energy"],
+        "best_dump": None if best["artifact"] is None else best["artifact"]["path"],
+        "rng_state": snap["rng"]["state"],
+        "run_params": {
+            "unique_id": snap["run"]["run_id"],
+            "population_size": configuration["population_size"],
+            "keep_top_pct": configuration["keep_top_pct"],
+            "intermediate_pct": configuration["intermediate_pct"],
+            "slice_and_merge_pct": configuration["slice_and_merge_pct"],
+            "reuse_carryover_evaluations": configuration[
+                "reuse_carryover_evaluations"
+            ],
+            "allow_variable_cell": configuration["allow_variable_cell"],
+            "choices": configuration["choices"],
+            "crossover_surface": configuration["crossover_surface"],
+            "crossover_max_tilt_degrees": configuration["crossover_max_tilt_degrees"],
+            "crossover_attempts": configuration["crossover_attempts"],
+            "failure_diagnostic_count": configuration["failure_diagnostic_count"],
+            "composition_policy": configuration["composition_policy"],
+            "seed": snap["run"]["seed"],
+        },
+        "state": {
+            "ga_mode": "explicit_ownership",
+            "GBE_vals": snap["energy_history"],
+            "history": [
+                [
+                    [
+                        _lineage_entry_from_snapshot_state(entry["lineage"]),
+                        entry["energy"],
+                    ]
+                    for entry in gen
+                ]
+                for gen in snap["generation_history"]
+            ],
+            "population_lineages": [
+                _lineage_entry_from_snapshot_state(candidate["lineage"])
+                for candidate in snap["population"]
+            ],
+            "population_retention_lineages": snap["retention_lineages"],
+            "population_candidates": [
+                {
+                    "structure_path": candidate["artifact"]["path"],
+                    "mapping": candidate["mapping"],
+                }
+                for candidate in snap["population"]
+            ],
+            "population_cached_evaluations": [
+                None
+                if cache is None
+                else {
+                    "candidate_id": cache["candidate_id"],
+                    "input_index": cache["input_index"],
+                    "energy": cache["selection_energy"],
+                    "structure_path": (
+                        None if cache["artifact"] is None else cache["artifact"]["path"]
+                    ),
+                    "mapping": mapping,
+                    "success": cache["status"] == "success",
+                    "failure_reason": cache["failure_message"],
+                }
+                for cache, mapping in zip(
+                    snap["population_cache"], cache_mappings, strict=True
+                )
+            ],
+            "best_evaluation": {
+                "candidate_id": best["candidate_id"],
+                "input_index": best["input_index"],
+                "energy": best["selection_energy"],
+                "structure_path": (
+                    None if best["artifact"] is None else best["artifact"]["path"]
+                ),
+                "mapping": snap.get("best_mapping"),
+                "success": best["status"] == "success",
+                "failure_reason": best["failure_message"],
+            },
+            "last_generation_evaluations": [
+                {
+                    "candidate_id": entry["candidate_id"],
+                    "input_index": entry["input_index"],
+                    "objective": entry["selection_energy"],
+                    "success": entry["status"] == "success",
+                    "failure_reason": entry["failure_message"],
+                }
+                for entry in snap["last_generation_evaluations"]
+            ],
+            "failure_diagnostics": snap["failure_diagnostics"],
+            "artifact_store": snap["retention_state"],
+            "retention_archive_mappings": snap["retention_archive_mappings"],
+            "claimed_paths": snap["claimed_paths"],
+        },
+    }
+
+
 def _owned_ga_checkpoint(owned_ga, tmp_path, *, fmt="json"):
     gb, seed_path, ownership = owned_ga
 
@@ -204,8 +403,21 @@ def _owned_ga_checkpoint(owned_ga, tmp_path, *, fmt="json"):
         population_size=3, generations=3, keep_top_pct=25, intermediate_pct=100,
     )
     ext = "json" if fmt == "json" else "pkl"
+    v2_checkpoint = tmp_path / f"ga_owned_v2.{ext}"
+    _run_ga_then_crash_after_first_save(minimizer, v2_checkpoint, fmt, "ga-owned-run")
+    if fmt == "json":
+        with open(v2_checkpoint, encoding="utf-8") as fh:
+            v2_state = json.load(fh)
+    else:
+        with open(v2_checkpoint, "rb") as fh:
+            v2_state = pickle.load(fh)
+    v1_state = _v1_state_from_v2_owned_envelope(v2_state)
     checkpoint = tmp_path / f"ga_owned.{ext}"
-    _run_ga_then_crash_after_first_save(minimizer, checkpoint, fmt, "ga-owned-run")
+    if fmt == "json":
+        checkpoint.write_text(json.dumps(v1_state), encoding="utf-8")
+    else:
+        with open(checkpoint, "wb") as fh:
+            pickle.dump(v1_state, fh)
     return checkpoint
 
 
