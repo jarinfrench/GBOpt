@@ -81,18 +81,85 @@ def _install_mutate_crash(minimizer, crash_after):
     minimizer.mutator.mutate = crashing_mutate
 
 
-def _mc_checkpoint(gb, tmp_path, *, fmt="json"):
+def _v1_state_from_v2_envelope(v2_state: dict) -> dict:
+    """Translate one real schema-v2 MC checkpoint envelope into an equivalent schema-v1
+    envelope, for exercising the migrator against the on-disk shape it exists to read.
+
+    ``MonteCarloMinimizer.run_MC`` itself only ever writes schema-v2 checkpoints (R28),
+    so a real, pre-migration schema-v1 fixture can no longer come directly from a live
+    run -- this maps a real run's own v2 output back onto the v1 field layout
+    ``GBOpt.snapshot.migration._monte_carlo_snapshot_from_v1`` expects, keeping the
+    fixture grounded in real RNG state, energies, and structure paths.
+    """
+    snap = v2_state["snapshot"]
+    best_artifact = snap["best_artifact"]
+    return {
+        "schema_version": 1,
+        "minimizer": "MonteCarloMinimizer",
+        "progress_unit": "step",
+        "progress_index": snap["completed_step"],
+        "best_energy": snap["best_energy"],
+        "best_dump": None if best_artifact is None else best_artifact["path"],
+        "rng_state": snap["rng"]["state"],
+        "run_params": {
+            "E_accept": 0.1,
+            "min_steps": snap["min_steps"],
+            "max_steps": 10,
+            "E_tol": 1e-4,
+            "max_rejections": 20,
+            "cooldown_rate": snap["cooldown_rate"],
+            "unique_id": snap["run"]["run_id"],
+            "seed": snap["run"]["seed"],
+        },
+        "state": {
+            "T": snap["temperature"],
+            "rejection_count": snap["rejection_count"],
+            "prev_gbe": snap["previous_energy"],
+            "current_structure_dump": snap["current_artifact"]["path"],
+            "GBE_vals": snap["energy_history"],
+            "accepted_idx": snap["accepted_steps"],
+            "operation_list": [
+                [entry["operation_name"], entry["accepted"]]
+                for entry in snap["step_history"]
+            ],
+            "artifact_store": snap["retention_state"],
+        },
+    }
+
+
+def _mc_v1_checkpoint(gb, tmp_path, *, fmt="json", name="mc", **run_kwargs):
+    """Run a real MC crash-and-checkpoint, then rewrite its output as schema-v1."""
     mc = MonteCarloMinimizer(gb, _make_energy_func(), ["translate_right_grain"], seed=0)
     _install_mutate_crash(mc, crash_after=2)
     ext = "json" if fmt == "json" else "pkl"
-    checkpoint = tmp_path / f"mc.{ext}"
+    v2_checkpoint = tmp_path / f"{name}_v2.{ext}"
+    run_kwargs.setdefault("unique_id", "mc-run")
     with pytest.raises(RuntimeError):
         mc.run_MC(
-            max_steps=10, unique_id="mc-run", checkpoint_file=checkpoint,
+            max_steps=10,
+            checkpoint_file=v2_checkpoint,
             checkpoint_format=fmt,
+            **run_kwargs,
         )
-    assert checkpoint.exists()
+    assert v2_checkpoint.exists()
+    if fmt == "json":
+        with open(v2_checkpoint, encoding="utf-8") as fh:
+            v2_state = json.load(fh)
+    else:
+        with open(v2_checkpoint, "rb") as fh:
+            v2_state = pickle.load(fh)
+    v1_state = _v1_state_from_v2_envelope(v2_state)
+    checkpoint = tmp_path / f"{name}.{ext}"
+    if fmt == "json":
+        checkpoint.write_text(json.dumps(v1_state), encoding="utf-8")
+    else:
+        with open(checkpoint, "wb") as fh:
+            pickle.dump(v1_state, fh)
     return checkpoint
+
+
+def _mc_checkpoint(gb, tmp_path, *, fmt="json"):
+    return _mc_v1_checkpoint(gb, tmp_path, fmt=fmt)
 
 
 def _run_ga_then_crash_after_first_save(minimizer, checkpoint, fmt, unique_id):
@@ -230,19 +297,14 @@ class TestMigrateMonteCarloCheckpoint:
         assert dict(snapshot.rng.state) == raw["rng_state"]
 
     def test_restores_min_steps_and_cooldown_rate(self, gb, tmp_path):
-        mc = MonteCarloMinimizer(
-            gb, _make_energy_func(), ["translate_right_grain"], seed=0
+        checkpoint = _mc_v1_checkpoint(
+            gb,
+            tmp_path,
+            name="mc_ctrl",
+            unique_id="mc-run-2",
+            min_steps=5,
+            cooldown_rate=0.8,
         )
-        _install_mutate_crash(mc, crash_after=2)
-        checkpoint = tmp_path / "mc.json"
-        with pytest.raises(RuntimeError):
-            mc.run_MC(
-                max_steps=10,
-                min_steps=5,
-                cooldown_rate=0.8,
-                unique_id="mc-run-2",
-                checkpoint_file=checkpoint,
-            )
 
         snapshot = migrate_monte_carlo_checkpoint(checkpoint)
         assert snapshot.min_steps == 5
