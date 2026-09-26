@@ -181,8 +181,8 @@ def test_mc_retention_prunes_superseded_accepted_source_after_commit(gb, tmp_pat
         )
     )
     assert manifest["calculation_context"] == _TEST_CALCULATION_CONTEXT
-    assert state["best_dump"] == str(archive)
-    records = state["state"]["artifact_store"]["records"]
+    assert state["snapshot"]["best_artifact"]["path"] == str(archive)
+    records = state["snapshot"]["retention_state"]["records"]
     by_id = {record["candidate"]["candidate_id"]: record for record in records}
     assert by_id["MC_41_s1"]["pins"] == ["best_result", "run_checkpoint"]
     assert by_id["MC_41_s1"]["retention_reasons"] == ["rule:objective_best"]
@@ -223,7 +223,7 @@ def test_mc_retains_rejected_scientific_result_and_prunes_its_source(gb, tmp_pat
     assert rejected_archive.is_file()
 
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    records = state["state"]["artifact_store"]["records"]
+    records = state["snapshot"]["retention_state"]["records"]
     rejected = next(
         record
         for record in records
@@ -355,7 +355,7 @@ def test_mc_cleanup_failure_leaks_source_but_checkpoint_resumes(gb, tmp_path):
     resumed.run_MC(max_steps=2, checkpoint_file=checkpoint)
 
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert state["progress_index"] == 2
+    assert state["snapshot"]["completed_step"] == 2
 
 
 def test_mc_prune_fresh_resume_matches_continuous_run(gb, tmp_path):
@@ -402,7 +402,7 @@ def test_mc_prune_fresh_resume_matches_continuous_run(gb, tmp_path):
     partial.run_MC(max_steps=1, unique_id=46, checkpoint_file=resumed_checkpoint)
 
     partial_state = json.loads(resumed_checkpoint.read_text(encoding="utf-8"))
-    for record in partial_state["state"]["artifact_store"]["records"]:
+    for record in partial_state["snapshot"]["retention_state"]["records"]:
         if "run_checkpoint" in record["pins"]:
             assert Path(record["source_path"]).is_file()
         elif record["source_path"] is not None:
@@ -429,8 +429,10 @@ def test_mc_prune_fresh_resume_matches_continuous_run(gb, tmp_path):
 
     continuous_state = json.loads(
         continuous_checkpoint.read_text(encoding="utf-8")
-    )["state"]
-    resumed_state = json.loads(resumed_checkpoint.read_text(encoding="utf-8"))["state"]
+    )["snapshot"]
+    resumed_state = json.loads(resumed_checkpoint.read_text(encoding="utf-8"))[
+        "snapshot"
+    ]
 
     def normalized_records(state):
         return [
@@ -440,7 +442,7 @@ def test_mc_prune_fresh_resume_matches_continuous_run(gb, tmp_path):
                 "retention_reasons": record["retention_reasons"],
                 "has_archive": record["archive_path"] is not None,
             }
-            for record in state["artifact_store"]["records"]
+            for record in state["retention_state"]["records"]
         ]
 
     assert normalized_records(resumed_state) == normalized_records(continuous_state)
@@ -465,25 +467,20 @@ def test_run_mc_checkpoint_file_is_valid_json(gb, tmp_path):
 
     assert checkpoint.exists()
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert {"schema_version", "minimizer", "progress_unit", "snapshot"} <= state.keys()
     assert {
-        "schema_version",
-        "minimizer",
-        "progress_unit",
-        "progress_index",
-        "best_energy",
-        "rng_state",
-        "run_params",
-        "state",
-    } <= state.keys()
-    assert {
-        "T",
+        "run",
+        "rng",
+        "completed_step",
+        "temperature",
         "rejection_count",
-        "prev_gbe",
-        "GBE_vals",
-        "accepted_idx",
-        "operation_list",
-        "current_structure_dump",
-    } <= state["state"].keys()
+        "previous_energy",
+        "best_energy",
+        "current_artifact",
+        "energy_history",
+        "accepted_steps",
+        "step_history",
+    } <= state["snapshot"].keys()
     assert state["minimizer"] == "MonteCarloMinimizer"
     assert state["progress_unit"] == "step"
 
@@ -504,8 +501,8 @@ def test_run_mc_checkpoint_format_pickle(gb, tmp_path):
     assert checkpoint.exists()
     with checkpoint.open("rb") as stream:
         state = pickle.load(stream)
-    assert "progress_index" in state
-    assert "GBE_vals" in state["state"]
+    assert "snapshot" in state
+    assert "energy_history" in state["snapshot"]
 
 
 def test_run_mc_resume_from_json(gb, tmp_path):
@@ -517,7 +514,7 @@ def test_run_mc_resume_from_json(gb, tmp_path):
         mc.run_MC(max_steps=10, unique_id=5, checkpoint_file=checkpoint)
 
     saved = json.loads(checkpoint.read_text(encoding="utf-8"))
-    resumed_from_step = saved["progress_index"]
+    resumed_from_step = saved["snapshot"]["completed_step"]
     gbe_count_before_resume = len(mc.GBE_vals)
     assert resumed_from_step > 0
 
@@ -590,7 +587,7 @@ def test_run_mc_checkpoint_interval_respected(gb, tmp_path):
         )
 
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert state["progress_index"] == 3
+    assert state["snapshot"]["completed_step"] == 3
 
 
 def test_proposal_evaluator_exception_rejects_step_without_crashing(gb, tmp_path):
@@ -637,7 +634,7 @@ def test_resume_without_unique_id_restores_original_label(gb, tmp_path):
     )
 
     saved = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert saved["run_params"]["unique_id"] == "7777"
+    assert saved["snapshot"]["run"]["run_id"] == "7777"
 
 
 def test_two_fresh_runs_without_unique_id_use_different_labels(gb, tmp_path):
@@ -653,11 +650,11 @@ def test_two_fresh_runs_without_unique_id_use_different_labels(gb, tmp_path):
         checkpoint_file=checkpoint_2,
     )
 
-    uid_1 = json.loads(checkpoint_1.read_text(encoding="utf-8"))["run_params"][
-        "unique_id"
+    uid_1 = json.loads(checkpoint_1.read_text(encoding="utf-8"))["snapshot"]["run"][
+        "run_id"
     ]
-    uid_2 = json.loads(checkpoint_2.read_text(encoding="utf-8"))["run_params"][
-        "unique_id"
+    uid_2 = json.loads(checkpoint_2.read_text(encoding="utf-8"))["snapshot"]["run"][
+        "run_id"
     ]
     assert uid_1 != uid_2
 
@@ -677,7 +674,7 @@ def test_resume_restores_cooldown_rate_from_checkpoint(gb, tmp_path):
     )
 
     saved = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert saved["run_params"]["cooldown_rate"] == pytest.approx(0.8)
+    assert saved["snapshot"]["cooldown_rate"] == pytest.approx(0.8)
 
 
 def test_resume_restores_min_steps_from_checkpoint(gb, tmp_path):
@@ -695,7 +692,7 @@ def test_resume_restores_min_steps_from_checkpoint(gb, tmp_path):
     )
 
     saved = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert saved["run_params"]["min_steps"] == 5
+    assert saved["snapshot"]["min_steps"] == 5
 
 
 def test_resolved_seed_is_retained_on_the_minimizer(gb):
@@ -766,7 +763,7 @@ def test_resume_restores_seed_from_checkpoint(gb, tmp_path):
     resumed.run_MC(max_steps=10, checkpoint_file=checkpoint)
 
     saved = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert saved["run_params"]["seed"] == 0
+    assert saved["snapshot"]["run"]["seed"] == 0
     assert resumed.seed == 0
 
 
@@ -793,9 +790,9 @@ def _rewrite_checkpoint(checkpoint, mutate):
 
 def test_resume_rejects_checkpoint_missing_a_required_field(gb, tmp_path):
     checkpoint = _make_mc_checkpoint(gb, tmp_path)
-    _rewrite_checkpoint(checkpoint, lambda saved: saved.pop("state"))
+    _rewrite_checkpoint(checkpoint, lambda saved: saved["snapshot"].pop("current_artifact"))
 
-    with pytest.raises(GBMinimizerError, match="Invalid MonteCarloMinimizer"):
+    with pytest.raises(GBMinimizerError, match="missing required field"):
         _make_minimizer(gb, _make_energy_func(gb)).run_MC(
             max_steps=4, checkpoint_file=checkpoint
         )
@@ -809,7 +806,7 @@ def test_resume_rejects_checkpoint_from_a_different_minimizer(gb, tmp_path):
         )
     )
 
-    with pytest.raises(GBMinimizerError, match="Invalid MonteCarloMinimizer"):
+    with pytest.raises(GBMinimizerError, match="written by"):
         _make_minimizer(gb, _make_energy_func(gb)).run_MC(
             max_steps=4, checkpoint_file=checkpoint
         )
@@ -818,10 +815,10 @@ def test_resume_rejects_checkpoint_from_a_different_minimizer(gb, tmp_path):
 def test_resume_rejects_unsupported_schema_version(gb, tmp_path):
     checkpoint = _make_mc_checkpoint(gb, tmp_path)
     _rewrite_checkpoint(
-        checkpoint, lambda saved: saved.__setitem__("schema_version", 2)
+        checkpoint, lambda saved: saved.__setitem__("schema_version", 99)
     )
 
-    with pytest.raises(GBMinimizerError, match="Invalid MonteCarloMinimizer"):
+    with pytest.raises(GBMinimizerError, match="unsupported .* schema version"):
         _make_minimizer(gb, _make_energy_func(gb)).run_MC(
             max_steps=4, checkpoint_file=checkpoint
         )
@@ -831,10 +828,11 @@ def test_resume_rejects_unsupported_schema_version(gb, tmp_path):
 def test_resume_rejects_malformed_progress_index(gb, tmp_path, bad_index):
     checkpoint = _make_mc_checkpoint(gb, tmp_path)
     _rewrite_checkpoint(
-        checkpoint, lambda saved: saved.__setitem__("progress_index", bad_index)
+        checkpoint,
+        lambda saved: saved["snapshot"].__setitem__("completed_step", bad_index),
     )
 
-    with pytest.raises(GBMinimizerError, match="Invalid MonteCarloMinimizer"):
+    with pytest.raises(GBMinimizerError):
         _make_minimizer(gb, _make_energy_func(gb)).run_MC(
             max_steps=4, checkpoint_file=checkpoint
         )
@@ -844,7 +842,7 @@ def test_resume_rejects_a_corrupted_non_dict_envelope(gb, tmp_path):
     checkpoint = _make_mc_checkpoint(gb, tmp_path)
     checkpoint.write_text(json.dumps(["not", "an", "envelope"]), encoding="utf-8")
 
-    with pytest.raises(GBMinimizerError, match="Invalid MonteCarloMinimizer"):
+    with pytest.raises(GBMinimizerError, match="must be a dictionary"):
         _make_minimizer(gb, _make_energy_func(gb)).run_MC(
             max_steps=4, checkpoint_file=checkpoint
         )

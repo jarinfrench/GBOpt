@@ -41,6 +41,7 @@ from GBOpt.evaluation import (
     EvaluationResult,
     EvaluationStatus,
     FailureStage,
+    StructureArtifact,
     from_scalar_tuple,
 )
 from GBOpt.GBManipulator import (
@@ -75,10 +76,89 @@ from GBOpt.optimization.types import (
     GBMinimizerTypeError,
     GBMinimizerValueError,
 )
+from GBOpt.snapshot import (
+    SNAPSHOT_SCHEMA_VERSION,
+    MonteCarloSnapshot,
+    MonteCarloStepRecordSnapshot,
+    RngStateSnapshot,
+    RunIdentitySnapshot,
+    SnapshotError,
+)
+from GBOpt.snapshot.migration import _monte_carlo_snapshot_from_v1
 
 logger = logging.getLogger(__name__)
 
 MC_ENERGY_PENALTY: float = 1.0e30
+
+_MC_MINIMIZER_NAME = "MonteCarloMinimizer"
+_MC_PROGRESS_UNIT = "step"
+
+
+def _tuples_to_lists(value: object) -> object:
+    """Recursively convert every tuple in ``value`` back into a plain list.
+
+    ``MonteCarloSnapshot.retention_state`` normalizes every nested sequence into a
+    tuple (this module's own JSON-safety discipline), but
+    ``GBOpt.artifacts.store.ArtifactStore.from_state`` -- an already-reviewed,
+    pre-existing contract this schema deliberately passes ``retention_state``
+    through opaquely rather than re-typing -- enforces that its own nested sequence
+    fields (e.g. ``records``) are literally ``list``, not any ``Sequence``. This
+    restores the mutable-list shape ``ArtifactStore.from_state`` expects without
+    weakening the snapshot's own tuple-based immutability discipline.
+
+    :param value: Value to convert.
+    :return: Equivalent value with every tuple replaced by a list.
+    """
+    if isinstance(value, Mapping):
+        return {key: _tuples_to_lists(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_tuples_to_lists(item) for item in value]
+    return value
+
+
+def _mc_snapshot_from_checkpoint_state(state: object) -> MonteCarloSnapshot:
+    """Build a validated Monte Carlo snapshot from one loaded checkpoint envelope.
+
+    Dispatches on the envelope's own ``schema_version``: a schema-v2 envelope's typed
+    snapshot payload is restored directly via :meth:`MonteCarloSnapshot.from_state`; a
+    schema-v1 envelope is migrated through the established
+    :func:`GBOpt.snapshot.migration._monte_carlo_snapshot_from_v1` reader. No other
+    schema version is accepted.
+
+    :param state: Deserialized checkpoint envelope, as returned by
+        :meth:`~GBOpt.Checkpoint.CheckpointStore.load`.
+    :return: Validated Monte Carlo restart snapshot.
+    :raises GBMinimizerError: If ``state`` is not a dictionary or declares an
+        unsupported schema version.
+    :raises CheckpointCompatibilityError: If a schema-v1 envelope fails structural
+        validation.
+    :raises SnapshotError: If the envelope's typed or migrated snapshot payload is
+        semantically invalid.
+    """
+    if not isinstance(state, dict):
+        raise GBMinimizerError("checkpoint envelope must be a dictionary")
+    schema_version = state.get("schema_version")
+    if schema_version == SNAPSHOT_SCHEMA_VERSION:
+        if state.get("minimizer") != _MC_MINIMIZER_NAME:
+            raise GBMinimizerError(
+                f"checkpoint was written by {state.get('minimizer')!r}, expected "
+                f"{_MC_MINIMIZER_NAME!r}"
+            )
+        if state.get("progress_unit") != _MC_PROGRESS_UNIT:
+            raise GBMinimizerError(
+                f"checkpoint progress_unit {state.get('progress_unit')!r} does not "
+                f"match expected {_MC_PROGRESS_UNIT!r}"
+            )
+        return MonteCarloSnapshot.from_state(state.get("snapshot"))
+    if schema_version == CHECKPOINT_SCHEMA_VERSION:
+        validate_checkpoint_envelope(
+            state, minimizer=_MC_MINIMIZER_NAME, progress_unit=_MC_PROGRESS_UNIT
+        )
+        return _monte_carlo_snapshot_from_v1(state)
+    raise GBMinimizerError(
+        f"unsupported MonteCarloMinimizer checkpoint schema version "
+        f"{schema_version!r}"
+    )
 
 
 class MonteCarloMinimizer:
@@ -501,9 +581,15 @@ class MonteCarloMinimizer:
             a UUID is generated when omitted and checkpoint resume restores the saved
             label.
         :param checkpoint_file: Keyword argument, optional, defaults to ``None``. Run
-            checkpoint path. Resume restores current structure, RNG state, temperature,
-            accepted history, stable run identity, retention state, ``min_steps``, and
-            ``cooldown_rate``. ``max_steps`` may be increased on resume.
+            checkpoint path, written as a typed schema-v2 restart snapshot (an existing
+            schema-v1 checkpoint from an earlier run is transparently migrated on
+            load). Resume restores current/best structure and energy, RNG state,
+            temperature, rejection count, accepted history, stable run identity, and
+            retention state; ``min_steps`` and ``cooldown_rate`` are always restored
+            from the checkpoint, overriding this call's own arguments. ``E_accept``,
+            ``max_steps``, ``E_tol``, and ``max_rejections`` are never restored from
+            the checkpoint -- this call's own arguments always apply, so
+            ``max_steps`` may be increased on resume.
         :param checkpoint_format: Keyword argument, optional, defaults to ``"json"``.
             Checkpoint serialization format, ``"json"`` or ``"pickle"``.
         :param checkpoint_interval: Keyword argument, optional, defaults to ``1``. Save
@@ -562,30 +648,38 @@ class MonteCarloMinimizer:
         best_candidate_id: str | None = None
         if state is not None:
             try:
-                validate_checkpoint_envelope(
-                    state, minimizer="MonteCarloMinimizer", progress_unit="step"
+                snapshot = _mc_snapshot_from_checkpoint_state(state)
+                self.GBE_vals = list(snapshot.energy_history)
+                self.accepted_idx = list(snapshot.accepted_steps)
+                self.operation_list = [
+                    [entry.operation_name, entry.accepted]
+                    for entry in snapshot.step_history
+                ]
+                self.local_random = snapshot.rng.to_generator()
+                unique_id = snapshot.run.run_id
+                # min_steps/cooldown_rate always come from the checkpoint on resume,
+                # overriding this call's own arguments -- matching this run's
+                # pre-typed-snapshot restore behavior. E_accept/max_steps/E_tol/
+                # max_rejections are never restored; this call's arguments always
+                # apply, since they were never part of the restart-critical schema.
+                min_steps = snapshot.min_steps
+                cooldown_rate = snapshot.cooldown_rate
+                self.seed = snapshot.run.seed
+                _resume_step = snapshot.completed_step + 1
+                T = snapshot.temperature
+                rejection_count = snapshot.rejection_count
+                min_gbe = snapshot.best_energy
+                prev_gbe = snapshot.previous_energy
+                best_dump = (
+                    None if snapshot.best_artifact is None else snapshot.best_artifact.path
                 )
-                self.GBE_vals = state["state"]["GBE_vals"]
-                self.accepted_idx = state["state"]["accepted_idx"]
-                self.operation_list = state["state"]["operation_list"]
-                self.local_random.bit_generator.state = state["rng_state"]
-                unique_id = str(state["run_params"]["unique_id"])
-                min_steps = state["run_params"]["min_steps"]
-                cooldown_rate = state["run_params"]["cooldown_rate"]
-                self.seed = state["run_params"].get("seed", self.seed)
-                _resume_step = state["progress_index"] + 1
-                T = state["state"]["T"]
-                rejection_count = state["state"]["rejection_count"]
-                min_gbe = state["best_energy"]
-                prev_gbe = state["state"]["prev_gbe"]
-                best_dump = state["best_dump"]
-                _current_dump = state["state"]["current_structure_dump"]
+                _current_dump = snapshot.current_artifact.path
                 self.manipulator = self._load_mc_relaxed_manipulator(
                     _current_dump,
                     type_dict=type_dict,
                 )
 
-                retention_state = state["state"].get("artifact_store")
+                retention_state = snapshot.retention_state
                 if retention_state is None:
                     if self.retention_policy is not None:
                         raise GBMinimizerError(
@@ -596,7 +690,7 @@ class MonteCarloMinimizer:
                 else:
                     try:
                         self.artifact_store = ArtifactStore.from_state(
-                            retention_state,
+                            _tuples_to_lists(dict(retention_state)),
                             policy=self.retention_policy,
                         )
                     except ArtifactStoreError as exc:
@@ -630,7 +724,13 @@ class MonteCarloMinimizer:
                 )
             except GBMinimizerError:
                 raise
-            except (CheckpointCompatibilityError, KeyError, TypeError, ValueError) as exc:
+            except (
+                CheckpointCompatibilityError,
+                SnapshotError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
                 raise GBMinimizerError(
                     f"Invalid MonteCarloMinimizer checkpoint envelope: {exc}"
                 ) from exc
@@ -755,14 +855,17 @@ class MonteCarloMinimizer:
         _write_artifact_manifest(self.artifact_store, self._artifact_provenance)
 
         def _build_state(step):
-            """Return one callback-free checkpoint payload for ``step``.
+            """Return one callback-free, typed-snapshot checkpoint payload for ``step``.
 
             :param step: Completed MC step represented by the checkpoint.
             :return: Serializable checkpoint payload.
             :raises GBMinimizerError: If artifact-store state cannot be serialized.
             """
-            # Note that E_tol, max_rejections, and E_accept can be changed on resume;
-            # run_params reflects the latest resume call for adjustable controls.
+            # Note that E_tol, max_rejections, and E_accept are never restored on
+            # resume -- this call's own arguments always apply. min_steps/
+            # cooldown_rate are always restored from the checkpoint (see
+            # ``MonteCarloSnapshot``'s own fields), overriding whatever this call
+            # passed.
             try:
                 artifact_state = (
                     None
@@ -771,34 +874,44 @@ class MonteCarloMinimizer:
                 )
             except ArtifactStoreError as exc:
                 raise GBMinimizerError(str(exc)) from exc
+            snapshot = MonteCarloSnapshot(
+                run=RunIdentitySnapshot(
+                    run_id=str(unique_id),
+                    seed=self.seed,
+                    case_id=self.case_id,
+                    campaign_id=self.campaign_id,
+                ),
+                rng=RngStateSnapshot.from_generator(self.local_random),
+                completed_step=step,
+                temperature=T,
+                rejection_count=rejection_count,
+                previous_energy=prev_gbe,
+                best_energy=min_gbe,
+                current_artifact=StructureArtifact(
+                    path=str(_current_dump), format="lammps"
+                ),
+                best_artifact=(
+                    None
+                    if not best_dump
+                    else StructureArtifact(path=str(best_dump), format="lammps")
+                ),
+                energy_history=self.GBE_vals,
+                accepted_steps=self.accepted_idx,
+                step_history=[
+                    MonteCarloStepRecordSnapshot(
+                        operation_name=operation_name, accepted=bool(accepted)
+                    )
+                    for operation_name, accepted in self.operation_list
+                ],
+                retention_state=artifact_state,
+                min_steps=min_steps,
+                cooldown_rate=cooldown_rate,
+            )
             return {
-                "schema_version": CHECKPOINT_SCHEMA_VERSION,
-                "minimizer": "MonteCarloMinimizer",
-                "progress_unit": "step",
-                "progress_index": step,
-                "best_energy": min_gbe,
-                "best_dump": str(best_dump) if best_dump else None,
-                "rng_state": self.local_random.bit_generator.state,
-                "run_params": {
-                    "E_accept": E_accept,
-                    "min_steps": min_steps,
-                    "max_steps": max_steps,
-                    "E_tol": E_tol,
-                    "max_rejections": max_rejections,
-                    "cooldown_rate": cooldown_rate,
-                    "unique_id": str(unique_id),
-                    "seed": self.seed,
-                },
-                "state": {
-                    "T": T,
-                    "rejection_count": rejection_count,
-                    "prev_gbe": prev_gbe,
-                    "current_structure_dump": str(_current_dump),
-                    "GBE_vals": self.GBE_vals,
-                    "accepted_idx": self.accepted_idx,
-                    "operation_list": self.operation_list,
-                    "artifact_store": artifact_state,
-                },
+                "schema_version": SNAPSHOT_SCHEMA_VERSION,
+                "minimizer": _MC_MINIMIZER_NAME,
+                "progress_unit": _MC_PROGRESS_UNIT,
+                "snapshot": snapshot.to_state(),
             }
 
         def _commit_step(step: int, *, final: bool) -> None:
@@ -860,7 +973,7 @@ class MonteCarloMinimizer:
                     )
             _write_artifact_manifest(self.artifact_store, self._artifact_provenance)
 
-        _last_completed_step = state["progress_index"] if state is not None else -1
+        _last_completed_step = _resume_step - 1 if state is not None else -1
         _early_exit = False
         for i in range(_resume_step, max_steps + 1):
             lineage = (
