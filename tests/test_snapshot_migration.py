@@ -229,6 +229,25 @@ class TestMigrateMonteCarloCheckpoint:
         snapshot = migrate_monte_carlo_checkpoint(checkpoint)
         assert dict(snapshot.rng.state) == raw["rng_state"]
 
+    def test_restores_min_steps_and_cooldown_rate(self, gb, tmp_path):
+        mc = MonteCarloMinimizer(
+            gb, _make_energy_func(), ["translate_right_grain"], seed=0
+        )
+        _install_mutate_crash(mc, crash_after=2)
+        checkpoint = tmp_path / "mc.json"
+        with pytest.raises(RuntimeError):
+            mc.run_MC(
+                max_steps=10,
+                min_steps=5,
+                cooldown_rate=0.8,
+                unique_id="mc-run-2",
+                checkpoint_file=checkpoint,
+            )
+
+        snapshot = migrate_monte_carlo_checkpoint(checkpoint)
+        assert snapshot.min_steps == 5
+        assert snapshot.cooldown_rate == pytest.approx(0.8)
+
     def test_wrong_algorithm_fails_explicitly(self, gb, tmp_path):
         checkpoint = _mc_checkpoint(gb, tmp_path)
         with pytest.raises(SnapshotMigrationError):

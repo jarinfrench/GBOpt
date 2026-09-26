@@ -108,6 +108,20 @@ class TestRngStateSnapshot:
         with pytest.raises(SnapshotValueError):
             snapshot.to_generator()
 
+    def test_to_state_from_state_round_trips(self):
+        snapshot = RngStateSnapshot.from_generator(np.random.default_rng(5))
+        restored = RngStateSnapshot.from_state(snapshot.to_state())
+        assert restored.bit_generator == snapshot.bit_generator
+        assert dict(restored.state) == dict(snapshot.state)
+
+    def test_from_state_rejects_non_mapping(self):
+        with pytest.raises(SnapshotTypeError):
+            RngStateSnapshot.from_state("nope")
+
+    def test_from_state_rejects_missing_field(self):
+        with pytest.raises(SnapshotTypeError):
+            RngStateSnapshot.from_state({"bit_generator": "PCG64"})
+
 
 class TestRunIdentitySnapshot:
     def test_valid_construction(self):
@@ -133,6 +147,22 @@ class TestRunIdentitySnapshot:
         assert context.case_id == "c"
         assert context.campaign_id == "k"
         assert context.algorithm is OptimizationAlgorithm.MONTE_CARLO
+
+    def test_to_state_from_state_round_trips(self):
+        run = RunIdentitySnapshot(run_id="abc", seed=3, case_id="c", campaign_id="k")
+        restored = RunIdentitySnapshot.from_state(run.to_state())
+        assert restored.run_id == "abc"
+        assert restored.seed == 3
+        assert restored.case_id == "c"
+        assert restored.campaign_id == "k"
+
+    def test_from_state_rejects_non_mapping(self):
+        with pytest.raises(SnapshotTypeError):
+            RunIdentitySnapshot.from_state("nope")
+
+    def test_from_state_rejects_missing_field(self):
+        with pytest.raises(SnapshotTypeError):
+            RunIdentitySnapshot.from_state({"run_id": "abc"})
 
 
 class TestCandidateEvaluationSnapshot:
@@ -256,6 +286,24 @@ class TestPopulationCandidateSnapshot:
             )
 
 
+class TestMonteCarloStepRecordSnapshot:
+    def test_to_state_from_state_round_trips(self):
+        record = MonteCarloStepRecordSnapshot(
+            operation_name="translate_right_grain", accepted=True
+        )
+        restored = MonteCarloStepRecordSnapshot.from_state(record.to_state())
+        assert restored.operation_name == "translate_right_grain"
+        assert restored.accepted is True
+
+    def test_from_state_rejects_non_mapping(self):
+        with pytest.raises(SnapshotTypeError):
+            MonteCarloStepRecordSnapshot.from_state("nope")
+
+    def test_from_state_rejects_missing_field(self):
+        with pytest.raises(SnapshotTypeError):
+            MonteCarloStepRecordSnapshot.from_state({"operation_name": "x"})
+
+
 class TestMonteCarloSnapshot:
     def _snapshot(self, **overrides):
         kwargs = {
@@ -298,6 +346,56 @@ class TestMonteCarloSnapshot:
     def test_retention_state_accepts_json_safe_mapping(self):
         snapshot = self._snapshot(retention_state={"records": [1, 2, 3]})
         assert snapshot.retention_state["records"] == (1, 2, 3)
+
+    def test_default_min_steps_and_cooldown_rate(self):
+        snapshot = self._snapshot()
+        assert snapshot.min_steps is None
+        assert snapshot.cooldown_rate == 1.0
+
+    def test_invalid_cooldown_rate_rejected(self):
+        with pytest.raises(SnapshotValueError):
+            self._snapshot(cooldown_rate=1.5)
+
+    def test_to_state_from_state_round_trips(self):
+        snapshot = self._snapshot(min_steps=5, cooldown_rate=0.8)
+        restored = MonteCarloSnapshot.from_state(snapshot.to_state())
+        assert restored.run.run_id == snapshot.run.run_id
+        assert restored.completed_step == snapshot.completed_step
+        assert restored.temperature == snapshot.temperature
+        assert restored.best_energy == snapshot.best_energy
+        assert restored.current_artifact == snapshot.current_artifact
+        assert restored.best_artifact == snapshot.best_artifact
+        assert restored.energy_history == snapshot.energy_history
+        assert restored.accepted_steps == snapshot.accepted_steps
+        assert restored.step_history == snapshot.step_history
+        assert restored.min_steps == 5
+        assert restored.cooldown_rate == pytest.approx(0.8)
+        assert np.array_equal(
+            snapshot.rng.to_generator().random(5),
+            restored.rng.to_generator().random(5),
+        )
+
+    def test_to_state_round_trips_none_best_artifact_and_retention_state(self):
+        snapshot = self._snapshot(best_artifact=None, retention_state=None)
+        restored = MonteCarloSnapshot.from_state(snapshot.to_state())
+        assert restored.best_artifact is None
+        assert restored.retention_state is None
+
+    def test_from_state_rejects_non_mapping(self):
+        with pytest.raises(SnapshotTypeError):
+            MonteCarloSnapshot.from_state("not a mapping")
+
+    def test_from_state_rejects_wrong_schema_version(self):
+        state = self._snapshot().to_state()
+        state["schema_version"] = 1
+        with pytest.raises(SnapshotValueError):
+            MonteCarloSnapshot.from_state(state)
+
+    def test_from_state_rejects_missing_field(self):
+        state = self._snapshot().to_state()
+        del state["temperature"]
+        with pytest.raises(SnapshotTypeError):
+            MonteCarloSnapshot.from_state(state)
 
 
 class TestGeneticAlgorithmSnapshot:

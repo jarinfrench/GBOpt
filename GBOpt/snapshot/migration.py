@@ -226,6 +226,8 @@ def _monte_carlo_snapshot_from_v1(state: dict) -> MonteCarloSnapshot:
             accepted_steps=mc_state["accepted_idx"],
             step_history=step_history,
             retention_state=mc_state.get("artifact_store"),
+            min_steps=run_params.get("min_steps"),
+            cooldown_rate=run_params["cooldown_rate"],
         )
     except KeyError as exc:
         raise SnapshotMigrationError(
