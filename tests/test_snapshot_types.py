@@ -15,6 +15,7 @@ from GBOpt.snapshot import (
     CandidateEvaluationSnapshot,
     FailureDiagnosticSnapshot,
     GenerationHistoryEntrySnapshot,
+    GeneticAlgorithmConfigurationSnapshot,
     GeneticAlgorithmSnapshot,
     LineageStepSnapshot,
     MonteCarloSnapshot,
@@ -312,6 +313,9 @@ class TestGeneticAlgorithmSnapshot:
             "completed_generation": 1,
             "best": _success_eval(),
             "population": population,
+            "configuration": GeneticAlgorithmConfigurationSnapshot(
+                slice_and_merge_pct=50.0, reuse_carryover_evaluations=False
+            ),
             "population_cache": (None, _success_eval("cache-1")),
             "energy_history": ((2.0, 1.5), (1.8, 1.4)),
             "generation_history": (

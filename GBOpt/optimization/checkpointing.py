@@ -512,3 +512,28 @@ def _write_artifact_manifest(
         ),
     )
 
+
+def _tuples_to_lists(value: object) -> object:
+    """Recursively convert every tuple in ``value`` back into a plain list.
+
+    A typed restart snapshot's own JSON-safety validation
+    (``GBOpt.snapshot.types._reject_live_objects``) normalizes every nested sequence
+    into a tuple, matching this package's own immutable-value-type discipline. But
+    ``GBOpt.artifacts.store.ArtifactStore.from_state`` -- an already-reviewed,
+    pre-existing contract a snapshot's ``retention_state`` field deliberately passes
+    through opaquely rather than re-typing -- enforces that its own nested sequence
+    fields (e.g. ``records``) are literally ``list``, not any ``Sequence``. This
+    restores the mutable-list shape ``ArtifactStore.from_state`` expects without
+    weakening the snapshot's own tuple-based immutability discipline. Shared by
+    ``MonteCarloMinimizer``/``GeneticAlgorithmMinimizer``, both of which resume
+    ``ArtifactStore`` state from a typed snapshot's ``retention_state``.
+
+    :param value: Value to convert.
+    :return: Equivalent value with every tuple replaced by a list.
+    """
+    if isinstance(value, Mapping):
+        return {key: _tuples_to_lists(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_tuples_to_lists(item) for item in value]
+    return value
+

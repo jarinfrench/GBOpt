@@ -114,12 +114,15 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
         self.assertTrue(cp.exists())
         with open(cp) as f:
             state = json.load(f)
-        for key in ("schema_version", "minimizer", "progress_unit", "progress_index",
-                    "best_energy", "best_dump", "rng_state", "run_params", "state"):
+        for key in ("schema_version", "minimizer", "progress_unit", "snapshot"):
             self.assertIn(key, state)
-        for key in ("GBE_vals", "history", "population_lineages"):
-            self.assertIn(key, state["state"])
-        self.assertEqual(state["progress_index"], 0)
+        snapshot = state["snapshot"]
+        for key in (
+            "run", "rng", "completed_generation", "best", "population",
+            "energy_history", "generation_history", "configuration",
+        ):
+            self.assertIn(key, snapshot)
+        self.assertEqual(snapshot["completed_generation"], 0)
         self.assertEqual(state["minimizer"], "GeneticAlgorithmMinimizer")
 
     def test_run_ga_checkpoint_format_pickle(self):
@@ -143,7 +146,8 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
         self.assertTrue(cp.exists())
         with open(cp, "rb") as f:
             state = pickle.load(f)
-        self.assertIn("progress_index", state)
+        self.assertIn("snapshot", state)
+        self.assertIn("completed_generation", state["snapshot"])
 
     def test_run_ga_resume_gbe_vals_not_duplicated(self):
         """Resuming from a gen-0 checkpoint adds gens 1+ without re-running gen 0."""
@@ -191,7 +195,7 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
         minimizer2.run_GA(unique_id=17, checkpoint_file=cp)
         with open(cp) as f:
             state = json.load(f)
-        self.assertEqual(state["run_params"]["seed"], 0)
+        self.assertEqual(state["snapshot"]["run"]["seed"], 0)
         self.assertEqual(minimizer2.seed, 0)
 
     def test_run_ga_corrupted_checkpoint_raises(self):
@@ -218,7 +222,7 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
     def test_run_ga_checkpoint_missing_required_field_raises(self):
         cp = Path(self.tmpdir.name) / "ga_missing_field.json"
         self._make_minimizer(generations=1).run_GA(unique_id=18, checkpoint_file=cp)
-        self._rewrite_checkpoint(cp, lambda state: state.pop("state"))
+        self._rewrite_checkpoint(cp, lambda state: state.pop("snapshot"))
 
         with self.assertRaisesRegex(
             GBMinimizerError, "Invalid GeneticAlgorithmMinimizer"
@@ -235,7 +239,7 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(
-            GBMinimizerError, "Invalid GeneticAlgorithmMinimizer"
+            GBMinimizerError, "checkpoint was written by"
         ):
             self._make_minimizer(generations=2).run_GA(
                 unique_id=19, checkpoint_file=cp
@@ -249,7 +253,8 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(
-            GBMinimizerError, "Invalid GeneticAlgorithmMinimizer"
+            GBMinimizerError, "unsupported GeneticAlgorithmMinimizer checkpoint "
+            "schema version"
         ):
             self._make_minimizer(generations=2).run_GA(
                 unique_id=20, checkpoint_file=cp
@@ -259,7 +264,10 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
         cp = Path(self.tmpdir.name) / "ga_bad_progress.json"
         self._make_minimizer(generations=1).run_GA(unique_id=21, checkpoint_file=cp)
         self._rewrite_checkpoint(
-            cp, lambda state: state.__setitem__("progress_index", -1)
+            cp,
+            lambda state: state["snapshot"].__setitem__(
+                "completed_generation", -1
+            ),
         )
 
         with self.assertRaisesRegex(
@@ -572,9 +580,10 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
         with open(cp) as f:
             saved = json.load(f)
 
-        cp_paths = saved["state"]["population_checkpoint_paths"]
-        self.assertEqual(len(cp_paths), minimizer.population_size)
-        for path in cp_paths:
+        population = saved["snapshot"]["population"]
+        self.assertEqual(len(population), minimizer.population_size)
+        for candidate in population:
+            path = candidate["artifact"]["path"]
             self.assertTrue(
                 str(path).endswith(".pending"),
                 f"Expected .pending path in checkpoint, got {path!r}",
@@ -583,17 +592,15 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
                 Path(path).exists(),
                 f".pending file referenced by checkpoint is missing: {path!r}",
             )
-        lineages = saved["state"]["population_lineages"]
-        self.assertEqual(len(lineages), minimizer.population_size)
-        for lineage in lineages:
-            path = lineage[1]
+            parent_path = candidate["lineage"]["parent_references"][0]
             self.assertFalse(
-                str(path).endswith(".pending"),
-                f"Provenance path must not be .pending, got {path!r}",
+                str(parent_path).endswith(".pending"),
+                f"Provenance path must not be .pending, got {parent_path!r}",
             )
             self.assertTrue(
-                Path(path).exists(),
-                f".pending file referenced by checkpoint is missing: {path!r}",
+                Path(parent_path).exists(),
+                f"Parent file referenced by checkpoint lineage is missing: "
+                f"{parent_path!r}",
             )
 
     def test_candidate_reconstruction_matches_continuous_run(self):
@@ -698,7 +705,7 @@ class TestGAIntraGenerationCheckpointing(unittest.TestCase):
 
         with open(cp) as f:
             saved = json.load(f)
-        Path(saved["state"]["population_checkpoint_paths"][0]).unlink()
+        Path(saved["snapshot"]["population"][0]["artifact"]["path"]).unlink()
 
         m2 = self._make_minimizer(generations=2)
         with self.assertRaises(GBMinimizerError):

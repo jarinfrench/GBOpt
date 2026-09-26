@@ -36,6 +36,7 @@ from GBOpt.snapshot.types import (
     CandidateEvaluationSnapshot,
     FailureDiagnosticSnapshot,
     GenerationHistoryEntrySnapshot,
+    GeneticAlgorithmConfigurationSnapshot,
     GeneticAlgorithmSnapshot,
     LineageStepSnapshot,
     MonteCarloSnapshot,
@@ -255,6 +256,12 @@ def _ga_snapshot_from_v1_legacy(state: dict) -> GeneticAlgorithmSnapshot:
         run = RunIdentitySnapshot(
             run_id=str(run_params["unique_id"]), seed=run_params["seed"]
         )
+        configuration = GeneticAlgorithmConfigurationSnapshot(
+            slice_and_merge_pct=run_params.get("slice_and_merge_pct", 50.0),
+            reuse_carryover_evaluations=run_params.get(
+                "reuse_carryover_evaluations", False
+            ),
+        )
     except KeyError as exc:
         raise SnapshotMigrationError(
             "checkpoint is missing required run_params field (a legacy checkpoint "
@@ -312,6 +319,7 @@ def _ga_snapshot_from_v1_legacy(state: dict) -> GeneticAlgorithmSnapshot:
             completed_generation=state["progress_index"],
             best=best,
             population=population,
+            configuration=configuration,
             population_cache=population_cache,
             energy_history=energy_history,
             generation_history=generation_history,
@@ -552,6 +560,47 @@ def _owned_population_cache_from_v1(
     )
 
 
+def _owned_population_cache_mappings_from_v1(
+    ga_state: dict, *, population_size: int
+) -> tuple:
+    """Build the owned-mode carryover cache's own reconstruction mappings.
+
+    ``CandidateEvaluationSnapshot`` (built by :func:`_owned_population_cache_from_v1`
+    above) carries no ``mapping`` field of its own -- it is also used by contexts (a
+    legacy-mode candidate, an MC candidate) that never have one -- so a cache entry's
+    persistent explicit-ownership reconstruction mapping is carried alongside it here
+    instead, in :attr:`~GBOpt.snapshot.types.GeneticAlgorithmSnapshot.
+    population_cache_mappings`.
+
+    :param ga_state: Schema-v1 GA checkpoint envelope's ``state`` field.
+    :param population_size: Keyword argument, required. Population size to align
+        against.
+    :return: Validated, population-aligned mapping tuple.
+    """
+    cached_states = ga_state.get(
+        "population_cached_evaluations", [None] * population_size
+    )
+    return tuple(
+        None
+        if cached is None or not isinstance(cached, dict)
+        else _owned_evaluation_mapping_from_v1(cached)
+        for cached in cached_states
+    )
+
+
+def _owned_evaluation_mapping_from_v1(raw: dict) -> object | None:
+    """Extract one owned-mode evaluation's own reconstruction mapping, if any.
+
+    :param raw: Raw ``_owned_evaluation_to_state``-shaped mapping.
+    :return: Validated ``CandidateFileMapping``, or ``None``.
+    :raises SnapshotMigrationError: If a present mapping is malformed.
+    """
+    mapping_state = raw.get("mapping")
+    if mapping_state is None:
+        return None
+    return _mapping_from_v1_state(raw.get("candidate_id", "<unknown>"), mapping_state)
+
+
 def _owned_retention_lineages_from_v1(ga_state: dict) -> list[tuple[str, ...]] | None:
     """Build the owned-mode retention lineages from one GA checkpoint's ``state`` field.
 
@@ -636,6 +685,22 @@ def _ga_snapshot_from_v1_owned(state: dict) -> GeneticAlgorithmSnapshot:
         run = RunIdentitySnapshot(
             run_id=str(run_params["unique_id"]), seed=run_params["seed"]
         )
+        configuration = GeneticAlgorithmConfigurationSnapshot(
+            slice_and_merge_pct=run_params.get("slice_and_merge_pct", 50.0),
+            reuse_carryover_evaluations=run_params.get(
+                "reuse_carryover_evaluations", False
+            ),
+            population_size=run_params.get("population_size"),
+            keep_top_pct=run_params.get("keep_top_pct"),
+            intermediate_pct=run_params.get("intermediate_pct"),
+            allow_variable_cell=run_params.get("allow_variable_cell"),
+            choices=run_params.get("choices"),
+            crossover_surface=run_params.get("crossover_surface"),
+            crossover_max_tilt_degrees=run_params.get("crossover_max_tilt_degrees"),
+            crossover_attempts=run_params.get("crossover_attempts"),
+            failure_diagnostic_count=run_params.get("failure_diagnostic_count"),
+            composition_policy=run_params.get("composition_policy"),
+        )
     except KeyError as exc:
         raise SnapshotMigrationError(
             f"checkpoint is missing required run_params field: {exc}"
@@ -647,9 +712,18 @@ def _ga_snapshot_from_v1_owned(state: dict) -> GeneticAlgorithmSnapshot:
 
     try:
         ga_state = state["state"]
-        best = _owned_evaluation_to_snapshot(ga_state["best_evaluation"])
+        best_raw = ga_state["best_evaluation"]
+        best = _owned_evaluation_to_snapshot(best_raw)
+        best_mapping = (
+            _owned_evaluation_mapping_from_v1(best_raw)
+            if isinstance(best_raw, dict)
+            else None
+        )
         population = _owned_population_from_v1(ga_state)
         population_cache = _owned_population_cache_from_v1(
+            ga_state, population_size=len(population)
+        )
+        population_cache_mappings = _owned_population_cache_mappings_from_v1(
             ga_state, population_size=len(population)
         )
         retention_lineages = _owned_retention_lineages_from_v1(ga_state)
@@ -671,6 +745,7 @@ def _ga_snapshot_from_v1_owned(state: dict) -> GeneticAlgorithmSnapshot:
             completed_generation=state["progress_index"],
             best=best,
             population=population,
+            configuration=configuration,
             population_cache=population_cache,
             energy_history=energy_history,
             generation_history=generation_history,
@@ -680,6 +755,8 @@ def _ga_snapshot_from_v1_owned(state: dict) -> GeneticAlgorithmSnapshot:
             claimed_paths=claimed_paths,
             retention_state=ga_state.get("artifact_store"),
             retention_archive_mappings=retention_archive_mappings,
+            best_mapping=best_mapping,
+            population_cache_mappings=population_cache_mappings,
         )
     except KeyError as exc:
         raise SnapshotMigrationError(

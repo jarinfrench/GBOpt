@@ -19,6 +19,7 @@ from .types import (
     CandidateEvaluationSnapshot,
     FailureDiagnosticSnapshot,
     GenerationHistoryEntrySnapshot,
+    GeneticAlgorithmConfigurationSnapshot,
     GeneticAlgorithmSnapshot,
     LineageStepSnapshot,
     MonteCarloSnapshot,
@@ -49,6 +50,7 @@ __all__ = [
     "CandidateEvaluationSnapshot",
     "PopulationCandidateSnapshot",
     "MonteCarloSnapshot",
+    "GeneticAlgorithmConfigurationSnapshot",
     "GeneticAlgorithmSnapshot",
     # Migrator
     "migrate_monte_carlo_checkpoint",

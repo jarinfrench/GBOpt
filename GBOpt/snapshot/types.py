@@ -29,8 +29,17 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from GBOpt.evaluation import EvaluationStatus, FailureStage, StructureArtifact
-from GBOpt.FileGrainOwnership import CandidateFileMapping
+from GBOpt.evaluation import (
+    EvaluationError,
+    EvaluationStatus,
+    FailureStage,
+    StructureArtifact,
+)
+from GBOpt.FileGrainOwnership import CandidateFileMapping, GrainOwnershipError
+from GBOpt.optimization.types import (
+    _candidate_mapping_from_state,
+    _candidate_mapping_to_state,
+)
 
 if TYPE_CHECKING:
     from GBOpt.observability import OptimizationAlgorithm, RunContext
@@ -163,6 +172,85 @@ def _normalize_optional_energy(value: object, *, name: str) -> float | None:
     return _normalize_energy(value, name=name)
 
 
+def _artifact_to_state(artifact: StructureArtifact) -> dict[str, object]:
+    """Serialize one structure artifact reference into a JSON-safe mapping.
+
+    :param artifact: Artifact reference to serialize.
+    :return: JSON-safe mapping, restorable via :func:`_artifact_from_state`.
+    """
+    return {
+        "path": artifact.path,
+        "format": artifact.format,
+        "digest": artifact.digest,
+    }
+
+
+def _artifact_from_state(value: object, *, name: str) -> StructureArtifact:
+    """Restore one structure artifact reference from :func:`_artifact_to_state`'s output.
+
+    :param value: Serialized mapping to restore.
+    :param name: Keyword argument, required. Field name used in diagnostics.
+    :return: Validated artifact reference.
+    :raises SnapshotTypeError: If ``value`` is not a mapping or is missing a required
+        field.
+    :raises SnapshotValueError: If the restored artifact reference is invalid.
+    """
+    if not isinstance(value, Mapping):
+        raise SnapshotTypeError(f"{name} must be a mapping")
+    try:
+        return StructureArtifact(
+            path=value["path"], format=value["format"], digest=value.get("digest")
+        )
+    except KeyError as exc:
+        raise SnapshotTypeError(f"{name} is missing required field: {exc}") from exc
+    except EvaluationError as exc:
+        raise SnapshotValueError(f"{name} is invalid: {exc}") from exc
+
+
+def _status_from_state(value: object) -> EvaluationStatus:
+    """Restore one ``EvaluationStatus`` from its serialized ``.value`` string.
+
+    :param value: Serialized status value.
+    :return: Validated status member.
+    :raises SnapshotValueError: If ``value`` is not a known ``EvaluationStatus`` value.
+    """
+    try:
+        return EvaluationStatus(value)
+    except ValueError as exc:
+        raise SnapshotValueError(f"invalid EvaluationStatus value: {value!r}") from exc
+
+
+def _failure_stage_from_state(value: object) -> FailureStage:
+    """Restore one ``FailureStage`` from its serialized ``.value`` string.
+
+    :param value: Serialized failure-stage value.
+    :return: Validated failure-stage member.
+    :raises SnapshotValueError: If ``value`` is not a known ``FailureStage`` value.
+    """
+    try:
+        return FailureStage(value)
+    except ValueError as exc:
+        raise SnapshotValueError(f"invalid FailureStage value: {value!r}") from exc
+
+
+def _mapping_from_state(value: object, *, name: str) -> CandidateFileMapping:
+    """Restore one candidate/file ownership mapping, translating its own error type.
+
+    Reuses ``GBOpt.optimization.types``'s existing schema-v1 mapping
+    (de)serialization helper rather than duplicating its field-by-field
+    reconstruction.
+
+    :param value: Serialized mapping state.
+    :param name: Keyword argument, required. Field name used in diagnostics.
+    :return: Validated candidate/file ownership mapping.
+    :raises SnapshotValueError: If ``value`` is not a valid serialized mapping.
+    """
+    try:
+        return _candidate_mapping_from_state(value)
+    except GrainOwnershipError as exc:
+        raise SnapshotValueError(f"{name} is invalid: {exc}") from exc
+
+
 def _reject_live_objects(value: object, *, path: str) -> object:
     """Recursively validate that *value* holds only JSON-safe scalars/mappings/sequences.
 
@@ -283,6 +371,32 @@ class RngStateSnapshot:
         raw_state = rng.bit_generator.state
         return cls(bit_generator=raw_state["bit_generator"], state=raw_state)
 
+    def to_state(self) -> dict[str, object]:
+        """Serialize this snapshot into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {"bit_generator": self.bit_generator, "state": dict(self.state)}
+
+    @classmethod
+    def from_state(cls, state: object) -> RngStateSnapshot:
+        """Restore a validated RNG state snapshot from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable RNG state snapshot.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If ``state`` is internally inconsistent.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError("RngStateSnapshot state must be a mapping")
+        try:
+            return cls(bit_generator=state["bit_generator"], state=state["state"])
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"RngStateSnapshot state is missing required field: {exc}"
+            ) from exc
+
     def to_generator(self) -> np.random.Generator:
         """Reconstruct a ``Generator`` whose future draws match the captured source's.
 
@@ -352,6 +466,42 @@ class RunIdentitySnapshot:
         object.__setattr__(self, "seed", seed)
         object.__setattr__(self, "case_id", case_id)
         object.__setattr__(self, "campaign_id", campaign_id)
+
+    def to_state(self) -> dict[str, object]:
+        """Serialize this identity into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {
+            "run_id": self.run_id,
+            "seed": self.seed,
+            "case_id": self.case_id,
+            "campaign_id": self.campaign_id,
+        }
+
+    @classmethod
+    def from_state(cls, state: object) -> RunIdentitySnapshot:
+        """Restore a validated run identity from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable run identity snapshot.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If a restored identity field is invalid.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError("RunIdentitySnapshot state must be a mapping")
+        try:
+            return cls(
+                run_id=state["run_id"],
+                seed=state["seed"],
+                case_id=state.get("case_id"),
+                campaign_id=state.get("campaign_id"),
+            )
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"RunIdentitySnapshot state is missing required field: {exc}"
+            ) from exc
 
     def to_run_context(self, *, algorithm: OptimizationAlgorithm) -> RunContext:
         """Build a ``RunContext`` sharing this identity, for event correlation only.
@@ -425,6 +575,40 @@ class LineageStepSnapshot:
         object.__setattr__(self, "parent_references", parent_references_tuple)
         object.__setattr__(self, "diagnostic_note", diagnostic_note)
 
+    def to_state(self) -> dict[str, object]:
+        """Serialize this lineage step into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {
+            "operation_name": self.operation_name,
+            "parent_references": list(self.parent_references),
+            "diagnostic_note": self.diagnostic_note,
+        }
+
+    @classmethod
+    def from_state(cls, state: object) -> LineageStepSnapshot:
+        """Restore a validated lineage step from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable lineage step.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If ``state`` is internally inconsistent.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError("LineageStepSnapshot state must be a mapping")
+        try:
+            return cls(
+                operation_name=state["operation_name"],
+                parent_references=state["parent_references"],
+                diagnostic_note=state.get("diagnostic_note"),
+            )
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"LineageStepSnapshot state is missing required field: {exc}"
+            ) from exc
+
 
 @dataclass(frozen=True, slots=True)
 class GenerationHistoryEntrySnapshot:
@@ -452,6 +636,37 @@ class GenerationHistoryEntrySnapshot:
         object.__setattr__(
             self, "energy", _normalize_energy(self.energy, name="energy")
         )
+
+    def to_state(self) -> dict[str, object]:
+        """Serialize this history entry into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {"lineage": self.lineage.to_state(), "energy": self.energy}
+
+    @classmethod
+    def from_state(cls, state: object) -> GenerationHistoryEntrySnapshot:
+        """Restore a validated history entry from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable generation history entry.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If ``state`` is internally inconsistent.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError(
+                "GenerationHistoryEntrySnapshot state must be a mapping"
+            )
+        try:
+            return cls(
+                lineage=LineageStepSnapshot.from_state(state["lineage"]),
+                energy=state["energy"],
+            )
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"GenerationHistoryEntrySnapshot state is missing required field: {exc}"
+            ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +719,44 @@ class FailureDiagnosticSnapshot:
             "source_path",
             _normalize_optional_identity(self.source_path, name="source_path"),
         )
+
+    def to_state(self) -> dict[str, object]:
+        """Serialize this failure diagnostic into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {
+            "candidate_id": self.candidate_id,
+            "generation": self.generation,
+            "input_index": self.input_index,
+            "failure_reason": self.failure_reason,
+            "source_path": self.source_path,
+        }
+
+    @classmethod
+    def from_state(cls, state: object) -> FailureDiagnosticSnapshot:
+        """Restore a validated failure diagnostic from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable failure diagnostic.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If ``state`` is internally inconsistent.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError("FailureDiagnosticSnapshot state must be a mapping")
+        try:
+            return cls(
+                candidate_id=state["candidate_id"],
+                generation=state["generation"],
+                input_index=state["input_index"],
+                failure_reason=state["failure_reason"],
+                source_path=state.get("source_path"),
+            )
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"FailureDiagnosticSnapshot state is missing required field: {exc}"
+            ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -641,6 +894,68 @@ class CandidateEvaluationSnapshot:
         object.__setattr__(self, "failure_code", failure_code)
         object.__setattr__(self, "failure_message", failure_message)
 
+    def to_state(self) -> dict[str, object]:
+        """Serialize this candidate evaluation into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {
+            "candidate_id": self.candidate_id,
+            "input_index": self.input_index,
+            "status": self.status.value,
+            "selection_energy": self.selection_energy,
+            "energy": self.energy,
+            "artifact": (
+                None if self.artifact is None else _artifact_to_state(self.artifact)
+            ),
+            "failure_stage": (
+                None if self.failure_stage is None else self.failure_stage.value
+            ),
+            "failure_code": self.failure_code,
+            "failure_message": self.failure_message,
+        }
+
+    @classmethod
+    def from_state(cls, state: object) -> CandidateEvaluationSnapshot:
+        """Restore a validated candidate evaluation from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable candidate evaluation snapshot.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If ``state`` is internally inconsistent.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError(
+                "CandidateEvaluationSnapshot state must be a mapping"
+            )
+        try:
+            artifact_state = state.get("artifact")
+            failure_stage_state = state.get("failure_stage")
+            return cls(
+                candidate_id=state["candidate_id"],
+                input_index=state["input_index"],
+                status=_status_from_state(state["status"]),
+                selection_energy=state["selection_energy"],
+                energy=state.get("energy"),
+                artifact=(
+                    None
+                    if artifact_state is None
+                    else _artifact_from_state(artifact_state, name="artifact")
+                ),
+                failure_stage=(
+                    None
+                    if failure_stage_state is None
+                    else _failure_stage_from_state(failure_stage_state)
+                ),
+                failure_code=state.get("failure_code"),
+                failure_message=state.get("failure_message"),
+            )
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"CandidateEvaluationSnapshot state is missing required field: {exc}"
+            ) from exc
+
     @classmethod
     def from_evaluation_result(cls, result) -> CandidateEvaluationSnapshot:
         """Build a snapshot from one authoritative evaluation result.
@@ -720,6 +1035,53 @@ class PopulationCandidateSnapshot:
         object.__setattr__(self, "lineage", lineage)
         object.__setattr__(self, "mapping", mapping)
         object.__setattr__(self, "candidate_id", candidate_id)
+
+    def to_state(self) -> dict[str, object]:
+        """Serialize this population candidate into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {
+            "artifact": _artifact_to_state(self.artifact),
+            "lineage": self.lineage.to_state(),
+            "mapping": (
+                None
+                if self.mapping is None
+                else _candidate_mapping_to_state(self.mapping)
+            ),
+            "candidate_id": self.candidate_id,
+        }
+
+    @classmethod
+    def from_state(cls, state: object) -> PopulationCandidateSnapshot:
+        """Restore a validated population candidate from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable population candidate snapshot.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If ``state`` is internally inconsistent.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError(
+                "PopulationCandidateSnapshot state must be a mapping"
+            )
+        try:
+            mapping_state = state.get("mapping")
+            return cls(
+                artifact=_artifact_from_state(state["artifact"], name="artifact"),
+                lineage=LineageStepSnapshot.from_state(state["lineage"]),
+                mapping=(
+                    None
+                    if mapping_state is None
+                    else _mapping_from_state(mapping_state, name="mapping")
+                ),
+                candidate_id=state.get("candidate_id"),
+            )
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"PopulationCandidateSnapshot state is missing required field: {exc}"
+            ) from exc
 
 
 def _validate_optional_retention_state(value: object) -> Mapping[str, object] | None:
@@ -853,6 +1215,252 @@ class MonteCarloSnapshot:
         object.__setattr__(self, "retention_state", retention_state)
 
 
+def _normalize_optional_index(value: object, *, name: str) -> int | None:
+    """Validate one optional non-negative integer.
+
+    :param value: Value to validate.
+    :param name: Keyword argument, required. Field name used in diagnostics.
+    :return: Python non-negative integer, or ``None``.
+    :raises SnapshotTypeError: If ``value`` is neither ``None`` nor a non-Boolean
+        integer.
+    :raises SnapshotValueError: If ``value`` is negative.
+    """
+    if value is None:
+        return None
+    return _normalize_index(value, name=name)
+
+
+def _normalize_optional_bool(value: object, *, name: str) -> bool | None:
+    """Validate one optional exact Python ``bool``.
+
+    :param value: Value to validate.
+    :param name: Keyword argument, required. Field name used in diagnostics.
+    :return: The Boolean, unchanged, or ``None``.
+    :raises SnapshotTypeError: If ``value`` is neither ``None`` nor exactly a ``bool``.
+    """
+    if value is None:
+        return None
+    if type(value) is not bool:
+        raise SnapshotTypeError(f"{name} must be a bool or None")
+    return value
+
+
+def _normalize_optional_energy_bare(value: object, *, name: str) -> float | None:
+    """Validate one optional finite real scalar with no domain-specific naming.
+
+    Alias for :func:`_normalize_optional_energy` used for non-energy real-valued
+    configuration fields (e.g. a tilt angle), kept distinct for readability at call
+    sites.
+
+    :param value: Value to validate.
+    :param name: Keyword argument, required. Field name used in diagnostics.
+    :return: Finite Python float, or ``None``.
+    """
+    return _normalize_optional_energy(value, name=name)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class GeneticAlgorithmConfigurationSnapshot:
+    """Immutable deterministic GA configuration, checked against a resuming run.
+
+    Schema-v1 stored a different subset of this configuration depending on GA mode:
+    the legacy (non-owned) path only ever validated :attr:`slice_and_merge_pct`/
+    :attr:`reuse_carryover_evaluations` on resume, while the explicit-ownership path
+    validated every field here. Every field beyond those two is therefore optional,
+    ``None`` when the checkpoint that produced this snapshot never tracked it (always
+    true for a legacy-mode snapshot; never true for an explicit-ownership one).
+
+    :param slice_and_merge_pct: Percentage of non-carryover offspring generated by
+        slice-and-merge crossover.
+    :param reuse_carryover_evaluations: Whether unchanged carryover candidates reuse
+        their prior evaluation instead of being re-evaluated.
+    :param population_size: Keyword argument, optional, defaults to ``None``. Number of
+        candidates per generation.
+    :param keep_top_pct: Keyword argument, optional, defaults to ``None``. Percentage of
+        lowest-energy structures carried over unchanged.
+    :param intermediate_pct: Keyword argument, optional, defaults to ``None``.
+        Percentage of structures eligible for crossover/mutation selection.
+    :param allow_variable_cell: Keyword argument, optional, defaults to ``None``.
+        Whether orthogonal box dimensions may evolve between generations.
+    :param choices: Keyword argument, optional, defaults to ``None``. Configured
+        mutation operation names.
+    :param crossover_surface: Keyword argument, optional, defaults to ``None``.
+        Formula-preserving crossover surface mode.
+    :param crossover_max_tilt_degrees: Keyword argument, optional, defaults to ``None``.
+        Maximum combined local periodic-wave tilt in degrees.
+    :param crossover_attempts: Keyword argument, optional, defaults to ``None``.
+        Maximum parent-pair attempts before one crossover slot falls back to mutation.
+    :param failure_diagnostic_count: Keyword argument, optional, defaults to ``None``.
+        Maximum number of most-recent failed evaluator sources preserved for
+        diagnostics.
+    :param composition_policy: Keyword argument, optional, defaults to ``None``.
+        Fixed formula ratio the run enforces for every candidate.
+    :raises SnapshotTypeError: If any field has an invalid type.
+    :raises SnapshotValueError: If a numeric field is non-finite/out of range.
+    """
+
+    slice_and_merge_pct: float
+    reuse_carryover_evaluations: bool
+    population_size: int | None
+    keep_top_pct: int | None
+    intermediate_pct: int | None
+    allow_variable_cell: bool | None
+    choices: tuple[str, ...] | None
+    crossover_surface: str | None
+    crossover_max_tilt_degrees: float | None
+    crossover_attempts: int | None
+    failure_diagnostic_count: int | None
+    composition_policy: tuple[tuple[str, int], ...] | None
+
+    def __init__(
+        self,
+        *,
+        slice_and_merge_pct: float,
+        reuse_carryover_evaluations: bool,
+        population_size: int | None = None,
+        keep_top_pct: int | None = None,
+        intermediate_pct: int | None = None,
+        allow_variable_cell: bool | None = None,
+        choices: Sequence[str] | None = None,
+        crossover_surface: str | None = None,
+        crossover_max_tilt_degrees: float | None = None,
+        crossover_attempts: int | None = None,
+        failure_diagnostic_count: int | None = None,
+        composition_policy: Sequence[Sequence[object]] | None = None,
+    ) -> None:
+        """Construct a validated, immutable GA configuration snapshot.
+
+        See the class docstring for parameter semantics and raised exceptions.
+        """
+        slice_and_merge_pct = _normalize_energy(
+            slice_and_merge_pct, name="slice_and_merge_pct"
+        )
+        reuse_carryover_evaluations = _normalize_optional_bool(
+            reuse_carryover_evaluations, name="reuse_carryover_evaluations"
+        )
+        if reuse_carryover_evaluations is None:
+            raise SnapshotTypeError("reuse_carryover_evaluations must be a bool")
+        population_size = _normalize_optional_index(
+            population_size, name="population_size"
+        )
+        keep_top_pct = _normalize_optional_index(keep_top_pct, name="keep_top_pct")
+        intermediate_pct = _normalize_optional_index(
+            intermediate_pct, name="intermediate_pct"
+        )
+        allow_variable_cell = _normalize_optional_bool(
+            allow_variable_cell, name="allow_variable_cell"
+        )
+        choices_tuple = (
+            None
+            if choices is None
+            else tuple(
+                _normalize_identity(value, name="choices entry") for value in choices
+            )
+        )
+        if crossover_surface is not None:
+            crossover_surface = _normalize_identity(
+                crossover_surface, name="crossover_surface"
+            )
+        crossover_max_tilt_degrees = _normalize_optional_energy_bare(
+            crossover_max_tilt_degrees, name="crossover_max_tilt_degrees"
+        )
+        crossover_attempts = _normalize_optional_index(
+            crossover_attempts, name="crossover_attempts"
+        )
+        failure_diagnostic_count = _normalize_optional_index(
+            failure_diagnostic_count, name="failure_diagnostic_count"
+        )
+        composition_policy_tuple = (
+            None
+            if composition_policy is None
+            else tuple(
+                (
+                    _normalize_identity(species, name="composition_policy species"),
+                    _normalize_index(coefficient, name="composition_policy coefficient"),
+                )
+                for species, coefficient in composition_policy
+            )
+        )
+
+        object.__setattr__(self, "slice_and_merge_pct", slice_and_merge_pct)
+        object.__setattr__(
+            self, "reuse_carryover_evaluations", reuse_carryover_evaluations
+        )
+        object.__setattr__(self, "population_size", population_size)
+        object.__setattr__(self, "keep_top_pct", keep_top_pct)
+        object.__setattr__(self, "intermediate_pct", intermediate_pct)
+        object.__setattr__(self, "allow_variable_cell", allow_variable_cell)
+        object.__setattr__(self, "choices", choices_tuple)
+        object.__setattr__(self, "crossover_surface", crossover_surface)
+        object.__setattr__(
+            self, "crossover_max_tilt_degrees", crossover_max_tilt_degrees
+        )
+        object.__setattr__(self, "crossover_attempts", crossover_attempts)
+        object.__setattr__(
+            self, "failure_diagnostic_count", failure_diagnostic_count
+        )
+        object.__setattr__(self, "composition_policy", composition_policy_tuple)
+
+    def to_state(self) -> dict[str, object]:
+        """Serialize this configuration into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {
+            "slice_and_merge_pct": self.slice_and_merge_pct,
+            "reuse_carryover_evaluations": self.reuse_carryover_evaluations,
+            "population_size": self.population_size,
+            "keep_top_pct": self.keep_top_pct,
+            "intermediate_pct": self.intermediate_pct,
+            "allow_variable_cell": self.allow_variable_cell,
+            "choices": None if self.choices is None else list(self.choices),
+            "crossover_surface": self.crossover_surface,
+            "crossover_max_tilt_degrees": self.crossover_max_tilt_degrees,
+            "crossover_attempts": self.crossover_attempts,
+            "failure_diagnostic_count": self.failure_diagnostic_count,
+            "composition_policy": (
+                None
+                if self.composition_policy is None
+                else [list(entry) for entry in self.composition_policy]
+            ),
+        }
+
+    @classmethod
+    def from_state(cls, state: object) -> GeneticAlgorithmConfigurationSnapshot:
+        """Restore a validated GA configuration from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable GA configuration snapshot.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If ``state`` is internally inconsistent.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError(
+                "GeneticAlgorithmConfigurationSnapshot state must be a mapping"
+            )
+        try:
+            return cls(
+                slice_and_merge_pct=state["slice_and_merge_pct"],
+                reuse_carryover_evaluations=state["reuse_carryover_evaluations"],
+                population_size=state.get("population_size"),
+                keep_top_pct=state.get("keep_top_pct"),
+                intermediate_pct=state.get("intermediate_pct"),
+                allow_variable_cell=state.get("allow_variable_cell"),
+                choices=state.get("choices"),
+                crossover_surface=state.get("crossover_surface"),
+                crossover_max_tilt_degrees=state.get("crossover_max_tilt_degrees"),
+                crossover_attempts=state.get("crossover_attempts"),
+                failure_diagnostic_count=state.get("failure_diagnostic_count"),
+                composition_policy=state.get("composition_policy"),
+            )
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                "GeneticAlgorithmConfigurationSnapshot state is missing required "
+                f"field: {exc}"
+            ) from exc
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class GeneticAlgorithmSnapshot:
     """Immutable restart-critical state for a GA run, after a completed generation.
@@ -887,6 +1495,17 @@ class GeneticAlgorithmSnapshot:
     :param retention_archive_mappings: Keyword argument, optional, defaults to ``()``.
         Persistent ownership mapping per archived candidate identity, when retention
         tracks explicit ownership.
+    :param configuration: Keyword argument, required. Deterministic GA configuration
+        checked against a resuming run's own construction arguments.
+    :param best_mapping: Keyword argument, optional, defaults to ``None``. Persistent
+        explicit-ownership reconstruction mapping for :attr:`best`, when the run tracks
+        explicit ownership -- ``CandidateEvaluationSnapshot`` itself carries no mapping
+        field, since it is also used by contexts (a legacy-mode candidate, an MC
+        candidate) that never have one.
+    :param population_cache_mappings: Keyword argument, optional, defaults to ``()``.
+        Persistent explicit-ownership reconstruction mapping per :attr:`population_cache`
+        entry, aligned by position; empty when the run tracks no carryover cache or no
+        cache entry needs one.
     :raises SnapshotTypeError: If any field has an invalid type.
     :raises SnapshotValueError: If ``population`` is empty, ``best`` is not a successful
         evaluation, or an aligned sequence's length does not match ``population``.
@@ -907,6 +1526,9 @@ class GeneticAlgorithmSnapshot:
     claimed_paths: tuple[str, ...]
     retention_state: Mapping[str, object] | None
     retention_archive_mappings: Mapping[str, CandidateFileMapping]
+    configuration: GeneticAlgorithmConfigurationSnapshot
+    best_mapping: CandidateFileMapping | None
+    population_cache_mappings: tuple[CandidateFileMapping | None, ...]
 
     def __init__(
         self,
@@ -916,6 +1538,7 @@ class GeneticAlgorithmSnapshot:
         completed_generation: int,
         best: CandidateEvaluationSnapshot,
         population: Sequence[PopulationCandidateSnapshot],
+        configuration: GeneticAlgorithmConfigurationSnapshot,
         population_cache: Sequence[CandidateEvaluationSnapshot | None] = (),
         energy_history: Sequence[Sequence[float]] = (),
         generation_history: Sequence[
@@ -931,6 +1554,8 @@ class GeneticAlgorithmSnapshot:
         retention_archive_mappings: Mapping[str, CandidateFileMapping] = MappingProxyType(
             {}
         ),
+        best_mapping: CandidateFileMapping | None = None,
+        population_cache_mappings: Sequence[CandidateFileMapping | None] = (),
     ) -> None:
         """Construct a validated, immutable genetic-algorithm restart snapshot.
 
@@ -947,6 +1572,10 @@ class GeneticAlgorithmSnapshot:
             raise SnapshotTypeError("best must be a CandidateEvaluationSnapshot")
         if best.status is not EvaluationStatus.SUCCESS:
             raise SnapshotValueError("best must be a successful evaluation")
+        if not isinstance(configuration, GeneticAlgorithmConfigurationSnapshot):
+            raise SnapshotTypeError(
+                "configuration must be a GeneticAlgorithmConfigurationSnapshot"
+            )
 
         population_tuple = _validate_ga_population(population)
         population_size = len(population_tuple)
@@ -982,6 +1611,24 @@ class GeneticAlgorithmSnapshot:
         retention_archive_mappings_dict = _validate_ga_retention_archive_mappings(
             retention_archive_mappings
         )
+        if best_mapping is not None and not isinstance(
+            best_mapping, CandidateFileMapping
+        ):
+            raise SnapshotTypeError("best_mapping must be a CandidateFileMapping or None")
+        population_cache_mappings_tuple = tuple(population_cache_mappings)
+        if population_cache_mappings_tuple and (
+            len(population_cache_mappings_tuple) != population_size
+        ):
+            raise SnapshotValueError(
+                "population_cache_mappings must be empty or aligned with population"
+            )
+        if not all(
+            entry is None or isinstance(entry, CandidateFileMapping)
+            for entry in population_cache_mappings_tuple
+        ):
+            raise SnapshotTypeError(
+                "population_cache_mappings entries must be CandidateFileMapping or None"
+            )
 
         object.__setattr__(self, "schema_version", SNAPSHOT_SCHEMA_VERSION)
         object.__setattr__(self, "run", run)
@@ -1008,6 +1655,166 @@ class GeneticAlgorithmSnapshot:
             "retention_archive_mappings",
             MappingProxyType(retention_archive_mappings_dict),
         )
+        object.__setattr__(self, "configuration", configuration)
+        object.__setattr__(self, "best_mapping", best_mapping)
+        object.__setattr__(
+            self, "population_cache_mappings", population_cache_mappings_tuple
+        )
+
+    def to_state(self) -> dict[str, object]:
+        """Serialize this snapshot into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {
+            "schema_version": self.schema_version,
+            "run": self.run.to_state(),
+            "rng": self.rng.to_state(),
+            "completed_generation": self.completed_generation,
+            "best": self.best.to_state(),
+            "population": [entry.to_state() for entry in self.population],
+            "population_cache": [
+                None if entry is None else entry.to_state()
+                for entry in self.population_cache
+            ],
+            "energy_history": [list(generation) for generation in self.energy_history],
+            "generation_history": [
+                [entry.to_state() for entry in generation]
+                for generation in self.generation_history
+            ],
+            "retention_lineages": (
+                None
+                if self.retention_lineages is None
+                else [list(lineage) for lineage in self.retention_lineages]
+            ),
+            "last_generation_evaluations": (
+                None
+                if self.last_generation_evaluations is None
+                else [entry.to_state() for entry in self.last_generation_evaluations]
+            ),
+            "failure_diagnostics": [
+                entry.to_state() for entry in self.failure_diagnostics
+            ],
+            "claimed_paths": list(self.claimed_paths),
+            "retention_state": (
+                None if self.retention_state is None else dict(self.retention_state)
+            ),
+            "retention_archive_mappings": {
+                candidate_id: _candidate_mapping_to_state(mapping)
+                for candidate_id, mapping in self.retention_archive_mappings.items()
+            },
+            "configuration": self.configuration.to_state(),
+            "best_mapping": (
+                None
+                if self.best_mapping is None
+                else _candidate_mapping_to_state(self.best_mapping)
+            ),
+            "population_cache_mappings": [
+                None if mapping is None else _candidate_mapping_to_state(mapping)
+                for mapping in self.population_cache_mappings
+            ],
+        }
+
+    @classmethod
+    def from_state(cls, state: object) -> GeneticAlgorithmSnapshot:
+        """Restore a validated GA snapshot from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable genetic-algorithm restart snapshot.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If ``state`` declares an unsupported schema
+            version, or a restored value is semantically invalid.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError("GeneticAlgorithmSnapshot state must be a mapping")
+        if state.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+            raise SnapshotValueError(
+                "unsupported GeneticAlgorithmSnapshot schema version "
+                f"{state.get('schema_version')!r}; expected "
+                f"{SNAPSHOT_SCHEMA_VERSION!r}"
+            )
+        try:
+            retention_lineages_state = state.get("retention_lineages")
+            last_generation_evaluations_state = state.get(
+                "last_generation_evaluations"
+            )
+            raw_archive_mappings = state.get("retention_archive_mappings", {})
+            if not isinstance(raw_archive_mappings, Mapping):
+                raise SnapshotTypeError(
+                    "retention_archive_mappings state must be a mapping"
+                )
+            return cls(
+                run=RunIdentitySnapshot.from_state(state["run"]),
+                rng=RngStateSnapshot.from_state(state["rng"]),
+                completed_generation=state["completed_generation"],
+                best=CandidateEvaluationSnapshot.from_state(state["best"]),
+                population=[
+                    PopulationCandidateSnapshot.from_state(entry)
+                    for entry in state["population"]
+                ],
+                configuration=GeneticAlgorithmConfigurationSnapshot.from_state(
+                    state["configuration"]
+                ),
+                population_cache=[
+                    None if entry is None else CandidateEvaluationSnapshot.from_state(
+                        entry
+                    )
+                    for entry in state.get("population_cache", ())
+                ],
+                energy_history=state.get("energy_history", ()),
+                generation_history=[
+                    [
+                        GenerationHistoryEntrySnapshot.from_state(entry)
+                        for entry in generation
+                    ]
+                    for generation in state.get("generation_history", ())
+                ],
+                retention_lineages=(
+                    None
+                    if retention_lineages_state is None
+                    else [list(lineage) for lineage in retention_lineages_state]
+                ),
+                last_generation_evaluations=(
+                    None
+                    if last_generation_evaluations_state is None
+                    else [
+                        CandidateEvaluationSnapshot.from_state(entry)
+                        for entry in last_generation_evaluations_state
+                    ]
+                ),
+                failure_diagnostics=[
+                    FailureDiagnosticSnapshot.from_state(entry)
+                    for entry in state.get("failure_diagnostics", ())
+                ],
+                claimed_paths=state.get("claimed_paths", ()),
+                retention_state=state.get("retention_state"),
+                retention_archive_mappings={
+                    candidate_id: _mapping_from_state(
+                        mapping_state, name="retention_archive_mappings entry"
+                    )
+                    for candidate_id, mapping_state in raw_archive_mappings.items()
+                },
+                best_mapping=(
+                    None
+                    if state.get("best_mapping") is None
+                    else _mapping_from_state(
+                        state["best_mapping"], name="best_mapping"
+                    )
+                ),
+                population_cache_mappings=[
+                    None
+                    if entry is None
+                    else _mapping_from_state(
+                        entry, name="population_cache_mappings entry"
+                    )
+                    for entry in state.get("population_cache_mappings", ())
+                ],
+            )
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"GeneticAlgorithmSnapshot state is missing required field: {exc}"
+            ) from exc
 
 
 def _validate_ga_population(
@@ -1173,5 +1980,6 @@ __all__ = [
     "CandidateEvaluationSnapshot",
     "PopulationCandidateSnapshot",
     "MonteCarloSnapshot",
+    "GeneticAlgorithmConfigurationSnapshot",
     "GeneticAlgorithmSnapshot",
 ]

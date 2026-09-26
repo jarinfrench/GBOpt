@@ -54,6 +54,7 @@ from GBOpt.evaluation import (
     EvaluationResult,
     EvaluationStatus,
     FailureStage,
+    StructureArtifact,
     from_batch_dict,
     from_candidate_evaluation,
     from_scalar_tuple,
@@ -97,6 +98,7 @@ from GBOpt.optimization.checkpointing import (
     _prepare_archive_state,
     _register_retention_candidate,
     _run_artifact_provenance,
+    _tuples_to_lists,
     _write_artifact_manifest,
 )
 from GBOpt.optimization.dispatch import run_legacy_compat_binary_operation
@@ -111,13 +113,115 @@ from GBOpt.optimization.types import (
     _candidate_mapping_to_state,
     _FailureDiagnostic,
 )
+from GBOpt.snapshot import (
+    SNAPSHOT_SCHEMA_VERSION,
+    CandidateEvaluationSnapshot,
+    GenerationHistoryEntrySnapshot,
+    GeneticAlgorithmConfigurationSnapshot,
+    GeneticAlgorithmSnapshot,
+    PopulationCandidateSnapshot,
+    RngStateSnapshot,
+    RunIdentitySnapshot,
+    SnapshotError,
+)
+from GBOpt.snapshot.migration import (
+    _ga_snapshot_from_v1_legacy,
+    _ga_snapshot_from_v1_owned,
+    _lineage_step_from_v1,
+    _owned_evaluation_to_snapshot,
+)
 
 ENERGY_PENALTY: float = 1.0e30
 """Optimizer policy for ranking failed candidate evaluations."""
 
 _OWNED_GA_CHECKPOINT_VERSION = 4
 
+_GA_MINIMIZER_NAME = "GeneticAlgorithmMinimizer"
+_GA_PROGRESS_UNIT = "generation"
+_STRUCTURE_FORMAT = "lammps"
+
 logger = logging.getLogger(__name__)
+
+
+def _lineage_entry_from_snapshot(step) -> list:
+    """Rebuild one raw GA lineage entry list from its typed snapshot form.
+
+    Exact inverse of ``GBOpt.snapshot.migration._lineage_step_from_v1``: a one-parent
+    step (mutation, carryover, the fixed ``"START"`` marker) becomes a 2-element list;
+    a step carrying a diagnostic note becomes a 3- or 4-element list with the note
+    trailing, matching whichever of GA's own established lineage-entry shapes produced
+    it.
+
+    :param step: Structured lineage step to rebuild.
+    :return: Raw ``[operation_name, *parent_references, diagnostic_note?]`` list, in
+        the exact shape GA's own runtime population/history bookkeeping expects.
+    """
+    if step.diagnostic_note is None:
+        return [step.operation_name, *step.parent_references]
+    return [step.operation_name, *step.parent_references, step.diagnostic_note]
+
+
+def _ga_snapshot_from_checkpoint_state(state: object, *, owned: bool) -> GeneticAlgorithmSnapshot:
+    """Build a validated GA snapshot from one loaded checkpoint envelope.
+
+    Dispatches on the envelope's own ``schema_version``: a schema-v2 envelope's typed
+    snapshot payload is restored directly via
+    :meth:`~GBOpt.snapshot.GeneticAlgorithmSnapshot.from_state`; a schema-v1 envelope is
+    migrated through the established, mode-appropriate
+    :func:`GBOpt.snapshot.migration._ga_snapshot_from_v1_owned`/
+    :func:`GBOpt.snapshot.migration._ga_snapshot_from_v1_legacy` reader. No other schema
+    version is accepted.
+
+    :param state: Deserialized checkpoint envelope, as returned by
+        :meth:`~GBOpt.Checkpoint.CheckpointStore.load`.
+    :param owned: Keyword argument, required. Whether this run is executing in
+        explicit-ownership mode.
+    :return: Validated genetic-algorithm restart snapshot.
+    :raises GBMinimizerError: If ``state`` is not a dictionary, declares an unsupported
+        schema version, or its recorded mode does not match ``owned``.
+    :raises CheckpointCompatibilityError: If a schema-v1 envelope fails structural
+        validation.
+    :raises SnapshotError: If the envelope's typed or migrated snapshot payload is
+        semantically invalid.
+    """
+    if not isinstance(state, dict):
+        raise GBMinimizerError("checkpoint envelope must be a dictionary")
+    schema_version = state.get("schema_version")
+    if schema_version == SNAPSHOT_SCHEMA_VERSION:
+        if state.get("minimizer") != _GA_MINIMIZER_NAME:
+            raise GBMinimizerError(
+                f"checkpoint was written by {state.get('minimizer')!r}, expected "
+                f"{_GA_MINIMIZER_NAME!r}"
+            )
+        if state.get("progress_unit") != _GA_PROGRESS_UNIT:
+            raise GBMinimizerError(
+                f"checkpoint progress_unit {state.get('progress_unit')!r} does not "
+                f"match expected {_GA_PROGRESS_UNIT!r}"
+            )
+        return GeneticAlgorithmSnapshot.from_state(state.get("snapshot"))
+    if schema_version == CHECKPOINT_SCHEMA_VERSION:
+        validate_checkpoint_envelope(
+            state, minimizer=_GA_MINIMIZER_NAME, progress_unit=_GA_PROGRESS_UNIT
+        )
+        v1_state = state.get("state")
+        is_owned_v1 = (
+            isinstance(v1_state, dict)
+            and v1_state.get("ga_mode") == "explicit_ownership"
+        )
+        if is_owned_v1 != owned:
+            raise GBMinimizerError(
+                "checkpoint explicit-ownership mode does not match how this "
+                "minimizer is being run"
+            )
+        return (
+            _ga_snapshot_from_v1_owned(state)
+            if is_owned_v1
+            else _ga_snapshot_from_v1_legacy(state)
+        )
+    raise GBMinimizerError(
+        f"unsupported GeneticAlgorithmMinimizer checkpoint schema version "
+        f"{schema_version!r}"
+    )
 
 
 class GeneticAlgorithmMinimizer:
@@ -1952,27 +2056,7 @@ class GeneticAlgorithmMinimizer:
                     state = checkpoint.load()
                 except CheckpointError as e:
                     raise GBMinimizerError(str(e)) from e
-                if state is not None:
-                    unique_id = state["run_params"]["unique_id"]
-                    saved_slice_pct = state["run_params"].get(
-                        "slice_and_merge_pct",
-                        50.0,
-                    )
-                    if saved_slice_pct != self.slice_and_merge_pct:
-                        raise GBMinimizerError(
-                            "checkpoint slice_and_merge_pct does not match the "
-                            "minimizer configuration"
-                        )
-                    saved_reuse = state["run_params"].get(
-                        "reuse_carryover_evaluations",
-                        False,
-                    )
-                    if saved_reuse != self.reuse_carryover_evaluations:
-                        raise GBMinimizerError(
-                            "checkpoint reuse_carryover_evaluations does not match "
-                            "the minimizer configuration"
-                        )
-                else:
+                if state is None:
                     unique_id = str(unique_id) if unique_id is not None else str(
                         uuid.uuid4())
             else:
@@ -1985,41 +2069,55 @@ class GeneticAlgorithmMinimizer:
 
         if state is not None:
             try:
-                validate_checkpoint_envelope(
-                    state, minimizer="GeneticAlgorithmMinimizer",
-                    progress_unit="generation",
-                )
-                self.GBE_vals = state["state"]["GBE_vals"]
-                self.history = state["state"]["history"]
-                self.local_random.bit_generator.state = state["rng_state"]
-                self.seed = state["run_params"].get("seed", self.seed)
-                _start_gen = state["progress_index"] + 1
-                best_energy = state["best_energy"]
-                best_dump = state["best_dump"]
-                # Drop any stale iter checkpoint for the just-completed generation
-                stale = CandidateCheckpoint._derive_path(
-                    checkpoint_file, state["progress_index"])
-                if stale.exists():
-                    stale.unlink()
-                population_lineages = state["state"]["population_lineages"]
-                cached_states = state["state"].get(
-                    "population_cached_evaluations",
-                    [None] * self.population_size,
-                )
-                if not isinstance(cached_states, list) or len(cached_states) != len(
-                    population_lineages
+                snapshot = _ga_snapshot_from_checkpoint_state(state, owned=False)
+                configuration = snapshot.configuration
+                if configuration.slice_and_merge_pct != self.slice_and_merge_pct:
+                    raise GBMinimizerError(
+                        "checkpoint slice_and_merge_pct does not match the "
+                        "minimizer configuration"
+                    )
+                if (
+                    configuration.reuse_carryover_evaluations
+                    != self.reuse_carryover_evaluations
                 ):
                     raise GBMinimizerError(
-                        "checkpoint cached evaluations are not population-aligned"
+                        "checkpoint reuse_carryover_evaluations does not match "
+                        "the minimizer configuration"
                     )
-                population_cached_evaluations = [
-                    self._cached_evaluation_from_state(cached_state)
-                    for cached_state in cached_states
+                unique_id = snapshot.run.run_id
+                self.GBE_vals = [list(gen) for gen in snapshot.energy_history]
+                self.history = [
+                    [
+                        [_lineage_entry_from_snapshot(entry.lineage), entry.energy]
+                        for entry in gen
+                    ]
+                    for gen in snapshot.generation_history
                 ]
-                population_checkpoint_paths = state["state"].get(
-                    "population_checkpoint_paths",
-                    [lin[1] for lin in state["state"]["population_lineages"]]
-                )
+                self.local_random = snapshot.rng.to_generator()
+                self.seed = snapshot.run.seed
+                _start_gen = snapshot.completed_generation + 1
+                best_energy = snapshot.best.selection_energy
+                best_dump = snapshot.best.artifact.path
+                # Drop any stale iter checkpoint for the just-completed generation
+                stale = CandidateCheckpoint._derive_path(
+                    checkpoint_file, snapshot.completed_generation)
+                if stale.exists():
+                    stale.unlink()
+                population_lineages = [
+                    _lineage_entry_from_snapshot(candidate.lineage)
+                    for candidate in snapshot.population
+                ]
+                population_cached_evaluations = [
+                    None
+                    if cache is None
+                    else _CachedEvaluation(
+                        energy=cache.energy, structure_path=cache.artifact.path
+                    )
+                    for cache in snapshot.population_cache
+                ]
+                population_checkpoint_paths = [
+                    candidate.artifact.path for candidate in snapshot.population
+                ]
                 population_manipulators = []
                 population_structures = []
                 for cp_path in population_checkpoint_paths:
@@ -2048,7 +2146,13 @@ class GeneticAlgorithmMinimizer:
                 )
             except GBMinimizerError:
                 raise
-            except (CheckpointCompatibilityError, KeyError, TypeError, ValueError) as exc:
+            except (
+                CheckpointCompatibilityError,
+                SnapshotError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
                 raise GBMinimizerError(
                     f"Invalid GeneticAlgorithmMinimizer checkpoint envelope: {exc}"
                 ) from exc
@@ -2132,32 +2236,79 @@ class GeneticAlgorithmMinimizer:
             _start_gen = 0
 
         def _build_ga_state(gen):
-            return {
-                "schema_version": CHECKPOINT_SCHEMA_VERSION,
-                "minimizer": "GeneticAlgorithmMinimizer",
-                "progress_unit": "generation",
-                "progress_index": gen,
-                "best_energy": best_energy,
-                "best_dump": best_dump,
-                "rng_state": self.local_random.bit_generator.state,
-                "run_params": {
-                    "unique_id": str(unique_id),
-                    "slice_and_merge_pct": self.slice_and_merge_pct,
-                    "reuse_carryover_evaluations": (
-                        self.reuse_carryover_evaluations
+            """Return one callback-free, typed-snapshot checkpoint payload for ``gen``.
+
+            :param gen: Completed GA generation represented by the checkpoint.
+            :return: Serializable checkpoint payload.
+            """
+            population_snapshot = [
+                PopulationCandidateSnapshot(
+                    artifact=StructureArtifact(
+                        path=str(path), format=_STRUCTURE_FORMAT
                     ),
-                    "seed": self.seed,
-                },
-                "state": {
-                    "GBE_vals": self.GBE_vals,
-                    "history": self.history,
-                    "population_lineages": population_lineages,
-                    "population_checkpoint_paths": population_checkpoint_paths,
-                    "population_cached_evaluations": [
-                        self._cached_evaluation_to_state(record)
-                        for record in population_cached_evaluations
-                    ],
-                },
+                    lineage=_lineage_step_from_v1(lineage),
+                )
+                for lineage, path in zip(
+                    population_lineages, population_checkpoint_paths, strict=True
+                )
+            ]
+            population_cache_snapshot = [
+                None
+                if cache is None
+                else CandidateEvaluationSnapshot(
+                    candidate_id=f"legacy-carryover-{index}",
+                    input_index=index,
+                    status=EvaluationStatus.SUCCESS,
+                    selection_energy=cache.energy,
+                    energy=cache.energy,
+                    artifact=StructureArtifact(
+                        path=cache.structure_path, format=_STRUCTURE_FORMAT
+                    ),
+                )
+                for index, cache in enumerate(population_cached_evaluations)
+            ]
+            generation_history_snapshot = [
+                [
+                    GenerationHistoryEntrySnapshot(
+                        lineage=_lineage_step_from_v1(lineage), energy=energy
+                    )
+                    for lineage, energy in gen_history
+                ]
+                for gen_history in self.history
+            ]
+            snapshot = GeneticAlgorithmSnapshot(
+                run=RunIdentitySnapshot(
+                    run_id=str(unique_id),
+                    seed=self.seed,
+                    case_id=self.case_id,
+                    campaign_id=self.campaign_id,
+                ),
+                rng=RngStateSnapshot.from_generator(self.local_random),
+                completed_generation=gen,
+                best=CandidateEvaluationSnapshot(
+                    candidate_id=f"{unique_id}-best",
+                    input_index=-1,
+                    status=EvaluationStatus.SUCCESS,
+                    selection_energy=best_energy,
+                    energy=best_energy,
+                    artifact=StructureArtifact(
+                        path=str(best_dump), format=_STRUCTURE_FORMAT
+                    ),
+                ),
+                population=population_snapshot,
+                configuration=GeneticAlgorithmConfigurationSnapshot(
+                    slice_and_merge_pct=self.slice_and_merge_pct,
+                    reuse_carryover_evaluations=self.reuse_carryover_evaluations,
+                ),
+                population_cache=population_cache_snapshot,
+                energy_history=[list(gen_vals) for gen_vals in self.GBE_vals],
+                generation_history=generation_history_snapshot,
+            )
+            return {
+                "schema_version": SNAPSHOT_SCHEMA_VERSION,
+                "minimizer": _GA_MINIMIZER_NAME,
+                "progress_unit": _GA_PROGRESS_UNIT,
+                "snapshot": snapshot.to_state(),
             }
 
         _current_pending = []
