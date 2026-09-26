@@ -29,7 +29,12 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from GBOpt.evaluation import EvaluationStatus, FailureStage, StructureArtifact
+from GBOpt.evaluation import (
+    EvaluationError,
+    EvaluationStatus,
+    FailureStage,
+    StructureArtifact,
+)
 from GBOpt.FileGrainOwnership import CandidateFileMapping
 
 if TYPE_CHECKING:
@@ -163,6 +168,83 @@ def _normalize_optional_energy(value: object, *, name: str) -> float | None:
     return _normalize_energy(value, name=name)
 
 
+def _normalize_cooldown_rate(value: object) -> float:
+    """Validate one Monte Carlo temperature cooldown factor.
+
+    Matches ``MonteCarloMinimizer.run_MC``'s own upstream ``cooldown_rate`` check, so
+    this validation never rejects a value that could have reached construction through
+    a live run.
+
+    :param value: Cooldown rate to validate.
+    :return: Finite Python float in ``(0, 1]``.
+    :raises SnapshotTypeError: If ``value`` is Boolean or non-real.
+    :raises SnapshotValueError: If ``value`` is non-finite or outside ``(0, 1]``.
+    """
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise SnapshotTypeError("cooldown_rate must be a non-Boolean real scalar")
+    normalized = float(value)
+    if not np.isfinite(normalized) or not 0.0 < normalized <= 1.0:
+        raise SnapshotValueError(
+            "cooldown_rate must be finite and satisfy 0 < value <= 1"
+        )
+    return normalized
+
+
+def _normalize_optional_min_steps(value: object) -> int | None:
+    """Validate one optional Monte Carlo minimum-step control.
+
+    Deliberately does not enforce non-negativity: unlike this module's other integer
+    fields, ``MonteCarloMinimizer.run_MC`` itself never validates ``min_steps`` before
+    checkpointing it, so adding a stricter check here would reject values the existing
+    run loop has always silently tolerated.
+
+    :param value: Minimum-step value to validate.
+    :return: Python integer, or ``None``.
+    :raises SnapshotTypeError: If ``value`` is neither ``None`` nor a non-Boolean
+        integer.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+        raise SnapshotTypeError("min_steps must be a non-Boolean integer or None")
+    return int(value)
+
+
+def _artifact_to_state(artifact: StructureArtifact) -> dict[str, object]:
+    """Serialize one structure artifact reference into a JSON-safe mapping.
+
+    :param artifact: Artifact reference to serialize.
+    :return: JSON-safe mapping, restorable via :func:`_artifact_from_state`.
+    """
+    return {
+        "path": artifact.path,
+        "format": artifact.format,
+        "digest": artifact.digest,
+    }
+
+
+def _artifact_from_state(value: object, *, name: str) -> StructureArtifact:
+    """Restore one structure artifact reference from :func:`_artifact_to_state`'s output.
+
+    :param value: Serialized mapping to restore.
+    :param name: Keyword argument, required. Field name used in diagnostics.
+    :return: Validated artifact reference.
+    :raises SnapshotTypeError: If ``value`` is not a mapping or is missing a required
+        field.
+    :raises SnapshotValueError: If the restored artifact reference is invalid.
+    """
+    if not isinstance(value, Mapping):
+        raise SnapshotTypeError(f"{name} must be a mapping")
+    try:
+        return StructureArtifact(
+            path=value["path"], format=value["format"], digest=value.get("digest")
+        )
+    except KeyError as exc:
+        raise SnapshotTypeError(f"{name} is missing required field: {exc}") from exc
+    except EvaluationError as exc:
+        raise SnapshotValueError(f"{name} is invalid: {exc}") from exc
+
+
 def _reject_live_objects(value: object, *, path: str) -> object:
     """Recursively validate that *value* holds only JSON-safe scalars/mappings/sequences.
 
@@ -283,6 +365,32 @@ class RngStateSnapshot:
         raw_state = rng.bit_generator.state
         return cls(bit_generator=raw_state["bit_generator"], state=raw_state)
 
+    def to_state(self) -> dict[str, object]:
+        """Serialize this snapshot into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {"bit_generator": self.bit_generator, "state": dict(self.state)}
+
+    @classmethod
+    def from_state(cls, state: object) -> RngStateSnapshot:
+        """Restore a validated RNG state snapshot from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable RNG state snapshot.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If ``state`` is internally inconsistent.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError("RngStateSnapshot state must be a mapping")
+        try:
+            return cls(bit_generator=state["bit_generator"], state=state["state"])
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"RngStateSnapshot state is missing required field: {exc}"
+            ) from exc
+
     def to_generator(self) -> np.random.Generator:
         """Reconstruct a ``Generator`` whose future draws match the captured source's.
 
@@ -352,6 +460,42 @@ class RunIdentitySnapshot:
         object.__setattr__(self, "seed", seed)
         object.__setattr__(self, "case_id", case_id)
         object.__setattr__(self, "campaign_id", campaign_id)
+
+    def to_state(self) -> dict[str, object]:
+        """Serialize this identity into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {
+            "run_id": self.run_id,
+            "seed": self.seed,
+            "case_id": self.case_id,
+            "campaign_id": self.campaign_id,
+        }
+
+    @classmethod
+    def from_state(cls, state: object) -> RunIdentitySnapshot:
+        """Restore a validated run identity from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable run identity snapshot.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If a restored identity field is invalid.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError("RunIdentitySnapshot state must be a mapping")
+        try:
+            return cls(
+                run_id=state["run_id"],
+                seed=state["seed"],
+                case_id=state.get("case_id"),
+                campaign_id=state.get("campaign_id"),
+            )
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"RunIdentitySnapshot state is missing required field: {exc}"
+            ) from exc
 
     def to_run_context(self, *, algorithm: OptimizationAlgorithm) -> RunContext:
         """Build a ``RunContext`` sharing this identity, for event correlation only.
@@ -532,6 +676,35 @@ class MonteCarloStepRecordSnapshot:
         )
         if type(self.accepted) is not bool:
             raise SnapshotTypeError("accepted must be a bool")
+
+    def to_state(self) -> dict[str, object]:
+        """Serialize this step record into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {"operation_name": self.operation_name, "accepted": self.accepted}
+
+    @classmethod
+    def from_state(cls, state: object) -> MonteCarloStepRecordSnapshot:
+        """Restore a validated step record from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable step record.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError(
+                "MonteCarloStepRecordSnapshot state must be a mapping"
+            )
+        try:
+            return cls(
+                operation_name=state["operation_name"], accepted=state["accepted"]
+            )
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"MonteCarloStepRecordSnapshot state is missing required field: {exc}"
+            ) from exc
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -766,6 +939,11 @@ class MonteCarloSnapshot:
         per-step operation/acceptance record, in order.
     :param retention_state: Keyword argument, optional, defaults to ``None``. Opaque,
         already-typed ``ArtifactStore`` state, when artifact retention is configured.
+    :param min_steps: Keyword argument, optional, defaults to ``None``. Minimum MC
+        iteration count before energy-tolerance termination may stop the run, when the
+        run tracks one.
+    :param cooldown_rate: Keyword argument, optional, defaults to ``1.0``. Factor
+        applied to the MC temperature after each completed iteration.
     :raises SnapshotTypeError: If any field has an invalid type.
     :raises SnapshotValueError: If a numeric field is non-finite/negative.
     """
@@ -784,6 +962,8 @@ class MonteCarloSnapshot:
     accepted_steps: tuple[int, ...]
     step_history: tuple[MonteCarloStepRecordSnapshot, ...]
     retention_state: Mapping[str, object] | None
+    min_steps: int | None
+    cooldown_rate: float
 
     def __init__(
         self,
@@ -801,6 +981,8 @@ class MonteCarloSnapshot:
         accepted_steps: Sequence[int] = (),
         step_history: Sequence[MonteCarloStepRecordSnapshot] = (),
         retention_state: Mapping[str, object] | None = None,
+        min_steps: int | None = None,
+        cooldown_rate: float = 1.0,
     ) -> None:
         """Construct a validated, immutable Monte Carlo restart snapshot.
 
@@ -836,6 +1018,8 @@ class MonteCarloSnapshot:
                 "step_history entries must be MonteCarloStepRecordSnapshot"
             )
         retention_state = _validate_optional_retention_state(retention_state)
+        min_steps = _normalize_optional_min_steps(min_steps)
+        cooldown_rate = _normalize_cooldown_rate(cooldown_rate)
 
         object.__setattr__(self, "schema_version", SNAPSHOT_SCHEMA_VERSION)
         object.__setattr__(self, "run", run)
@@ -851,6 +1035,92 @@ class MonteCarloSnapshot:
         object.__setattr__(self, "accepted_steps", accepted_steps_tuple)
         object.__setattr__(self, "step_history", tuple(step_history))
         object.__setattr__(self, "retention_state", retention_state)
+        object.__setattr__(self, "min_steps", min_steps)
+        object.__setattr__(self, "cooldown_rate", cooldown_rate)
+
+    def to_state(self) -> dict[str, object]:
+        """Serialize this snapshot into a JSON-safe mapping.
+
+        :return: JSON-safe mapping, restorable via :meth:`from_state`.
+        """
+        return {
+            "schema_version": self.schema_version,
+            "run": self.run.to_state(),
+            "rng": self.rng.to_state(),
+            "completed_step": self.completed_step,
+            "temperature": self.temperature,
+            "rejection_count": self.rejection_count,
+            "previous_energy": self.previous_energy,
+            "best_energy": self.best_energy,
+            "current_artifact": _artifact_to_state(self.current_artifact),
+            "best_artifact": (
+                None
+                if self.best_artifact is None
+                else _artifact_to_state(self.best_artifact)
+            ),
+            "energy_history": list(self.energy_history),
+            "accepted_steps": list(self.accepted_steps),
+            "step_history": [entry.to_state() for entry in self.step_history],
+            "retention_state": (
+                None if self.retention_state is None else dict(self.retention_state)
+            ),
+            "min_steps": self.min_steps,
+            "cooldown_rate": self.cooldown_rate,
+        }
+
+    @classmethod
+    def from_state(cls, state: object) -> MonteCarloSnapshot:
+        """Restore a validated Monte Carlo snapshot from :meth:`to_state`'s own output.
+
+        :param state: Serialized mapping, as returned by :meth:`to_state`.
+        :return: Validated, immutable Monte Carlo restart snapshot.
+        :raises SnapshotTypeError: If ``state`` is not a mapping or is missing a
+            required field.
+        :raises SnapshotValueError: If ``state`` declares an unsupported schema
+            version, or a restored value is semantically invalid.
+        """
+        if not isinstance(state, Mapping):
+            raise SnapshotTypeError("MonteCarloSnapshot state must be a mapping")
+        if state.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+            raise SnapshotValueError(
+                "unsupported MonteCarloSnapshot schema version "
+                f"{state.get('schema_version')!r}; expected "
+                f"{SNAPSHOT_SCHEMA_VERSION!r}"
+            )
+        try:
+            best_artifact_state = state.get("best_artifact")
+            return cls(
+                run=RunIdentitySnapshot.from_state(state["run"]),
+                rng=RngStateSnapshot.from_state(state["rng"]),
+                completed_step=state["completed_step"],
+                temperature=state["temperature"],
+                rejection_count=state["rejection_count"],
+                previous_energy=state["previous_energy"],
+                best_energy=state["best_energy"],
+                current_artifact=_artifact_from_state(
+                    state["current_artifact"], name="current_artifact"
+                ),
+                best_artifact=(
+                    None
+                    if best_artifact_state is None
+                    else _artifact_from_state(
+                        best_artifact_state, name="best_artifact"
+                    )
+                ),
+                energy_history=state.get("energy_history", ()),
+                accepted_steps=state.get("accepted_steps", ()),
+                step_history=[
+                    MonteCarloStepRecordSnapshot.from_state(entry)
+                    for entry in state.get("step_history", ())
+                ],
+                retention_state=state.get("retention_state"),
+                min_steps=state.get("min_steps"),
+                cooldown_rate=state["cooldown_rate"],
+            )
+        except KeyError as exc:
+            raise SnapshotTypeError(
+                f"MonteCarloSnapshot state is missing required field: {exc}"
+            ) from exc
 
 
 @dataclass(frozen=True, slots=True, init=False)
