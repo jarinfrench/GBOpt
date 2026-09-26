@@ -1,5 +1,139 @@
 # Refactor cleanup backlog
 
+## R27 net tooling deltas: ruff +3 (disclosed established-convention debt), mypy net 0, bandit unchanged, pyscn back to baseline after an in-step decomposition (41 quality issues, 47 clone pairs)
+
+Baseline taken at the R27 branch point (`e7354db`, tip of `refactor/r26-checkpoint-
+hardening`): ruff (`GBOpt`/`tests`) 241 errors; mypy `GBOpt/optimization` 288 errors in
+31 files, `GBOpt/observability` 202 errors in 23 files; bandit 7 Low + 1 Medium; pyscn 41
+quality issues / 47 clone pairs. Current (after all four R27 commits): ruff 244 (+3),
+mypy unchanged in both existing scopes (`GBOpt/snapshot` itself: 0 findings), bandit
+unchanged, pyscn back to exactly 41/47 -- it had temporarily grown to 43 quality issues
+and 51 clone pairs after the first three commits, brought back down by an in-step
+decomposition pass rather than left as new debt (see the dedicated entry below).
+
+ruff +3 is `GBOpt/snapshot/__init__.py`/`migration.py`/`types.py`'s own `__all__` lists
+tripping `RUF022` (not alphabetized), the same established, deliberate
+grouped-not-alphabetized convention already reproduced by every other subpackage's
+`__init__.py` in this codebase (see R20's/R22's/R24's/R25's own entries for the
+precedent) -- not new-shape debt. Every other finding a bare tool run initially
+surfaced in the new files (an unused import, an unsorted import block, two
+`dict()`-as-literal findings, one nested-`with`, several `object`-typed indexing
+findings, a `NoReturn`-shaped narrowing gap, a wrong `Mapping`-typed default, and a
+`MappingProxyType` argument-type mismatch) was a genuine new-code defect, not a
+reproduced pattern, and was fixed on the spot rather than disclosed as debt.
+
+**Resolve at**: no action needed.
+
+## R27's schema-v1 lineage entries are not uniformly `[operation_label, parent]` pairs
+
+`LineageStepSnapshot` (`GBOpt/snapshot/types.py`) was first designed with a single
+`parent_reference: str` field, modeled on the two-element shape every
+`population_lineages.append([mutation, parent])` call site in `genetic.py` that was read
+before starting this step seemed to establish. Writing the real-checkpoint round-trip
+test against an owned-mode GA run that actually exercised crossover (not just mutation)
+found a third shape neither read pass had surfaced: `_make_next_owned_generation`'s
+slice-and-merge branch (`GBOpt/optimization/genetic.py` around line 1101) appends a
+**four**-element list (`[label, parent1_path, parent2_path, repr(provenance)]`), and its
+own inadmissible-crossover fallback branch appends a **three**-element list (`[label,
+parent_path, "N inadmissible crossover attempts"]`) -- neither a single-parent pair nor
+a JSON-safe-only tail. `LineageStepSnapshot` was revised (still before this step's first
+commit landed, so the fix shipped in the same commit as the migrator, not as a
+follow-up) to hold `parent_references: tuple[str, ...]` (one or two parents) plus an
+explicit `diagnostic_note: str | None` field for the trailing free-text schema-v1 itself
+already recorded alongside some entries -- disclosed on the type's own docstring as
+non-authoritative diagnostic context, never a substitute for the structured
+operation/parent identity. `GBOpt.snapshot.migration._lineage_step_from_v1` dispatches
+on the entry's own length (2/3/4) to recover this shape, matching the same three
+call-site shapes read directly out of `genetic.py`, rather than trusting either the
+roadmap issue's prose or a first pass over only the mutation-only call sites. This is
+the same "re-grep every call site, don't trust the description" discipline `CLAUDE.md`
+already documents at the top of this file, applied to the roadmap issue's own field
+description rather than to a `REFACTOR_CLEANUP.md` entry's.
+
+**Resolve at**: no action needed; noted for the record.
+
+## R27 partially resolves R22's/R23's/R26's deferred "`EvaluationResult` checkpoint-serialization form" gap -- the typed form now exists, but nothing writes it yet
+
+R22's own entry (and R23's, R25's, R26's re-confirmations of it) left open the question
+of what a checkpoint-serializable form of `EvaluationResult`/`CandidateEvaluation` should
+look like, naming "R23 or R26+" and later "R27-R29" as the likely step. `Candidate
+EvaluationSnapshot` (`GBOpt/snapshot/types.py`) is that form: a frozen, validated type
+with the same field contract as `EvaluationResult` minus its live `manipulator`
+reference, plus a `from_evaluation_result()` adapter that drops the manipulator rather
+than ever reading it. This resolves the *shape* question. It does not resolve the
+*wiring* question -- per this issue's own explicit "no optimizer loop is migrated"
+non-goal, nothing in `MonteCarloMinimizer`/`GeneticAlgorithmMinimizer` constructs an
+`EvaluationResult` and adapts it through `from_evaluation_result()` at any point; the
+adapter is exercised today only by this step's own tests and, indirectly, by the schema-
+v1 migrator (which builds `CandidateEvaluationSnapshot` instances directly from already-
+serialized v1 dict state, never from a live `EvaluationResult`). One deliberate deviation
+from `EvaluationResult`'s own stricter invariant, disclosed on the class docstring: a
+successful `CandidateEvaluationSnapshot` does **not** require an `artifact`, unlike a
+successful `EvaluationResult`, because this type also has to represent owned-mode GA's
+artifact-independent `CandidateEvaluationSummary` (R22) -- a historical
+"this candidate succeeded with this objective" record that never carried a structure
+path to begin with. `GBOpt.optimization.genetic`'s own `CandidateEvaluation`/
+`CandidateEvaluationSummary` types are themselves untouched by this step, per R23's own
+"no action needed unless a later step needs `EvaluationResult` to be the type actually
+flowing through GA's owned-mode bookkeeping" -- still true here, since the migrator reads
+already-persisted dict state, not GA's live bookkeeping objects.
+
+**Resolve at**: no action needed unless a later step wires `CandidateEvaluationSnapshot`
+into a live MC/GA checkpoint *write* path (at which point `from_evaluation_result()`
+would actually run against a real `EvaluationResult` for the first time) or wants GA's
+owned-mode bookkeeping itself migrated onto `EvaluationResult`/this schema.
+
+## R27's typed snapshots cover the run-level MC/GA checkpoint file only, not `CandidateCheckpoint`'s own per-candidate sidecar file
+
+Issue #87's "Completed safe boundaries are explicit: ... candidate cache after a
+completed candidate result is durable" was read as being satisfied by construction --
+every `CandidateEvaluationSnapshot` instance is, by its own validated invariants,
+necessarily a *completed* result (a definite `SUCCESS`/`FAILED` status, never a
+pending/in-progress one), so the type itself cannot represent anything but a durable,
+completed candidate outcome. This is distinct from, and does not migrate,
+`GBOpt.Checkpoint.CandidateCheckpoint`'s own separate on-disk sidecar file (the
+`{stem}.iter{N}{ext}` file recording each individual candidate's result as it completes,
+*within* a still-in-progress generation, for intra-generation crash recovery) -- no
+`CandidateCacheSnapshot`-shaped type or migrator exists for that file's own
+`{iteration_index, unique_ids, results: {uid: {energy, dump, metadata}}}` shape. This
+was a deliberate scoping choice, not an oversight: the migrator (`GBOpt.snapshot.
+migration`) is a reader over an already-**completed**, at-rest run-level checkpoint --
+per `GeneticAlgorithmMinimizer.run_GA`'s own resume logic, any stale `.iterN` sidecar for
+the just-completed generation is deleted on resume, so a durable run-level checkpoint
+never has a live sidecar to migrate at the boundary this step's migrator reads. A future
+step wiring live checkpoint *writing* through this schema, where mid-generation
+per-candidate durability genuinely matters for crash recovery, would need to decide
+`CandidateCheckpoint`'s own typed shape at that point, informed by whichever write path
+it is servicing -- not guessed here.
+
+**Resolve at**: no action needed unless a later step's acceptance criteria require a
+typed, migratable form of `CandidateCheckpoint`'s own per-candidate sidecar file
+specifically.
+
+## R27's `retention_state`/`retention_archive_mappings`/`claimed_paths` are carried opaquely or reused directly, not re-typed as new snapshot value types
+
+Issue #87 names `MonteCarloSnapshot`/`GeneticAlgorithmSnapshot`/`PopulationCandidateSnapshot`/
+`CandidateEvaluationSnapshot` plus "artifact/candidate references as needed" -- it does
+not ask for `GBOpt.artifacts.store.ArtifactStore`'s own checkpoint state (the
+`artifact_store` field in both MC's and GA's schema-v1 `state`) to be re-typed.
+`ArtifactStore` already owns a reviewed `to_state()`/`from_state()` contract of its own
+(pre-dating this step); `MonteCarloSnapshot.retention_state`/`GeneticAlgorithmSnapshot.
+retention_state` carry that already-typed subsystem's serialized form through as an
+opaque, JSON-safety-validated (never live-object-bearing) passthrough mapping rather than
+duplicating its shape as a second, competing typed representation -- matching this
+schema's own "validated artifacts plus persistent interface/ownership state **or another
+explicitly reviewed typed representation**" contract, where `ArtifactStore`'s own
+contract is that alternative. `retention_archive_mappings`, by contrast, *is* re-typed
+(`Mapping[str, CandidateFileMapping]`, reusing `GBOpt.FileGrainOwnership.
+CandidateFileMapping` directly) since it is exactly the persistent-ownership-state case
+the schema's own contract calls out by name. `claimed_paths` (owned-mode's already-flat
+`list[str]` of canonical evaluator paths) needed no typed wrapper at all -- a tuple of
+validated non-empty path strings already is its own honest shape.
+
+**Resolve at**: no action needed unless a later step wants `ArtifactStore`'s own
+checkpoint state expressed as a schema-v2-native value type rather than an opaque,
+already-typed-elsewhere passthrough.
+
 ## R26 net tooling deltas: ruff net 0, mypy net 0, bandit unchanged, pyscn unchanged (41 quality issues, 47 clone pairs)
 
 Baseline taken at the R26 branch point (`a33cddd`, tip of `refactor/r25-event-journal`):

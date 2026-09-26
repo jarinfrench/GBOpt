@@ -412,6 +412,43 @@ the issue or step that produced it.
   amending the commit that introduced it. Any future change to a function with a
   documented `:raises:` contract should check that every code path claimed to be
   translated is actually inside the block doing the translating.
+- **R27's harness-assigned branch was also identical to `main`'s tip, and its own
+  prerequisite issue text explicitly names the later steps most likely to be the
+  checkpoint-serialization migration -- both worth checking before assuming either
+  one.** Starting R27, `claude/peaceful-noether-116cjh` matched `origin/main` exactly --
+  same failure mode as R23-R26's own entries above, now confirmed for a sixth
+  consecutive step. Same fix: `git checkout -B claude/peaceful-noether-116cjh
+  origin/refactor/r26-checkpoint-hardening`, verified with `git rev-parse`/`git log`
+  before building anything on top of it -- confirmed as the right base by checking
+  issue #87's "Dependencies and related issues" section (R26/#86, R02/#63, R14/#75,
+  R23/#83, R20/#80) against `git merge-base --is-ancestor` for each, all five already
+  present on `refactor/r26-checkpoint-hardening`'s tip. Separately, R23's own
+  `REFACTOR_CLEANUP.md` entry ("no action needed unless a later step (R27-R29's
+  checkpoint serialization migration, most likely) needs `EvaluationResult` to be the
+  type actually flowing through GA's owned-mode bookkeeping") had already named this
+  exact step by number as a candidate -- read and checked against #87's actual
+  acceptance criteria before assuming it settled the question, rather than either
+  ignored or trusted blindly. The answer for R27 specifically: the typed
+  serialization *form* (`CandidateEvaluationSnapshot`) is introduced, but GA's live
+  owned-mode bookkeeping is not migrated onto it -- see `REFACTOR_CLEANUP.md`'s
+  dedicated entry for the precise scope split.
+- **A roadmap issue's own field-shape description, read from only the most obvious call
+  sites, can still miss a real shape a less-obvious call site produces -- write the
+  round-trip test against the code path that's most likely to differ, not just the
+  simplest one, before trusting a type design.** R27's issue prose and every
+  single-parent `population_lineages.append([mutation, parent])` call site in
+  `genetic.py` suggested lineage entries are uniformly two-element `[operation, parent]`
+  pairs; `GBOpt.snapshot.types.LineageStepSnapshot` was first designed around exactly
+  that shape. Writing the real-checkpoint migration test against an owned-mode GA run
+  that actually exercised crossover (not just mutation, which every simpler fixture
+  reaches by default) surfaced two more shapes neither the issue text nor a partial
+  code read had flagged: a two-parent crossover's four-element list and its
+  inadmissible-attempt fallback's three-element list, both carrying a trailing
+  diagnostic note that isn't a parent reference at all. Fixed by widening
+  `LineageStepSnapshot` to `parent_references: tuple[str, ...]` plus an explicit
+  `diagnostic_note` field, in the same commit as the migrator rather than a follow-up,
+  since the narrower design had not yet been separately committed. See
+  `REFACTOR_CLEANUP.md`'s dedicated entry for the full shape breakdown.
 - Before opening a PR, run `ruff`, `mypy`, `bandit`, and `pyscn` (see
   "Tooling" below) and report the results.
 - **Never open a PR without being explicitly told to.** The user reviews
