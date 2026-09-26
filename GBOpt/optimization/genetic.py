@@ -116,6 +116,7 @@ from GBOpt.optimization.types import (
 from GBOpt.snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
     CandidateEvaluationSnapshot,
+    FailureDiagnosticSnapshot,
     GenerationHistoryEntrySnapshot,
     GeneticAlgorithmConfigurationSnapshot,
     GeneticAlgorithmSnapshot,
@@ -1853,6 +1854,47 @@ class GeneticAlgorithmMinimizer:
             success=True,
         )
 
+    def _owned_record_from_snapshot(
+        self,
+        snapshot: CandidateEvaluationSnapshot,
+        mapping: CandidateFileMapping | None,
+    ) -> CandidateEvaluation:
+        """Reconstruct one typed owned evaluation from its algorithm-neutral snapshot.
+
+        ``CandidateEvaluationSnapshot`` carries no ``mapping`` field of its own -- it is
+        also used by contexts (a legacy-mode candidate, an MC candidate) that never have
+        one -- so the persistent explicit-ownership reconstruction mapping is supplied
+        separately here, exactly as
+        :attr:`~GBOpt.snapshot.GeneticAlgorithmSnapshot.best_mapping`/
+        :attr:`~GBOpt.snapshot.GeneticAlgorithmSnapshot.population_cache_mappings`
+        carry it alongside :attr:`~GBOpt.snapshot.GeneticAlgorithmSnapshot.best`/
+        :attr:`~GBOpt.snapshot.GeneticAlgorithmSnapshot.population_cache`. Delegates to
+        the established :meth:`_owned_evaluation_from_state` by rebuilding its exact
+        expected raw-dictionary shape, rather than duplicating its reload/validation
+        logic.
+
+        :param snapshot: Canonical, algorithm-neutral candidate evaluation record.
+        :param mapping: Persistent explicit-ownership reconstruction mapping, or
+            ``None``.
+        :return: Validated typed evaluation.
+        :raises GBMinimizerError: If the snapshot or a required successful artifact is
+            invalid.
+        """
+        v1_shape = {
+            "candidate_id": snapshot.candidate_id,
+            "input_index": snapshot.input_index,
+            "energy": snapshot.selection_energy,
+            "structure_path": (
+                None if snapshot.artifact is None else snapshot.artifact.path
+            ),
+            "mapping": (
+                None if mapping is None else _candidate_mapping_to_state(mapping)
+            ),
+            "success": snapshot.status is EvaluationStatus.SUCCESS,
+            "failure_reason": snapshot.failure_message,
+        }
+        return self._owned_evaluation_from_state(v1_shape)
+
     def _write_owned_population_checkpoint(
         self,
         checkpoint_file: Path,
@@ -2545,6 +2587,7 @@ class GeneticAlgorithmMinimizer:
                 "explicit-ownership execution requires an evaluator adapter"
             )
 
+        early_snapshot: GeneticAlgorithmSnapshot | None = None
         try:
             if checkpoint_file is None:
                 checkpoint = CheckpointStore.disabled()
@@ -2564,10 +2607,26 @@ class GeneticAlgorithmMinimizer:
                         str(unique_id) if unique_id is not None else str(uuid.uuid4())
                     )
                 else:
-                    unique_id = state["run_params"]["unique_id"]
+                    if state.get("schema_version") == CHECKPOINT_SCHEMA_VERSION:
+                        v1_owned_state = state.get("state")
+                        if not isinstance(v1_owned_state, dict) or (
+                            v1_owned_state.get("ga_mode") != "explicit_ownership"
+                            or v1_owned_state.get("owned_checkpoint_version")
+                            != _OWNED_GA_CHECKPOINT_VERSION
+                        ):
+                            raise GBMinimizerError(
+                                "checkpoint does not contain supported "
+                                "explicit-ownership state"
+                            )
+                    early_snapshot = _ga_snapshot_from_checkpoint_state(
+                        state, owned=True
+                    )
+                    unique_id = early_snapshot.run.run_id
         except CheckpointError as exc:
             raise GBMinimizerValueError(str(exc)) from exc
-        except (KeyError, TypeError) as exc:
+        except GBMinimizerError:
+            raise
+        except (CheckpointCompatibilityError, SnapshotError, KeyError, TypeError) as exc:
             raise GBMinimizerError(
                 "Invalid explicit-ownership GA checkpoint envelope."
             ) from exc
@@ -2602,20 +2661,13 @@ class GeneticAlgorithmMinimizer:
         materializable_records: dict[str, CandidateEvaluation] = {}
         if state is not None:
             try:
-                validate_checkpoint_envelope(
-                    state, minimizer="GeneticAlgorithmMinimizer",
-                    progress_unit="generation",
-                )
-                owned_state = state["state"]
-                if (
-                    owned_state.get("ga_mode") != "explicit_ownership"
-                    or owned_state.get("owned_checkpoint_version")
-                    != _OWNED_GA_CHECKPOINT_VERSION
-                ):
+                # early_snapshot is always built above whenever state is not None.
+                if early_snapshot is None:
                     raise GBMinimizerError(
-                        "checkpoint does not contain supported explicit-ownership state"
+                        "Invalid explicit-ownership GA checkpoint envelope."
                     )
-                run_params = state["run_params"]
+                snapshot = early_snapshot
+                configuration = snapshot.configuration
                 expected_params = {
                     "population_size": self.population_size,
                     "keep_top_pct": self.keep_top_pct,
@@ -2625,47 +2677,64 @@ class GeneticAlgorithmMinimizer:
                         self.reuse_carryover_evaluations
                     ),
                     "allow_variable_cell": self.allow_variable_cell,
-                    "choices": self.mutator.choices_keys,
+                    "choices": tuple(self.mutator.choices_keys),
                     "crossover_surface": self.crossover_surface,
                     "crossover_max_tilt_degrees": (
                         self.crossover_max_tilt_degrees
                     ),
                     "crossover_attempts": self.crossover_attempts,
                     "failure_diagnostic_count": self.failure_diagnostic_count,
-                    "composition_policy": [
-                        [species, coefficient]
-                        for species, coefficient in self.composition_policy
-                    ],
+                    "composition_policy": tuple(
+                        tuple(entry) for entry in self.composition_policy
+                    ),
                 }
-                parameter_defaults = {
-                    "slice_and_merge_pct": 50.0,
-                    "reuse_carryover_evaluations": False,
+                actual_params = {
+                    "population_size": configuration.population_size,
+                    "keep_top_pct": configuration.keep_top_pct,
+                    "intermediate_pct": configuration.intermediate_pct,
+                    "slice_and_merge_pct": configuration.slice_and_merge_pct,
+                    "reuse_carryover_evaluations": (
+                        configuration.reuse_carryover_evaluations
+                    ),
+                    "allow_variable_cell": configuration.allow_variable_cell,
+                    "choices": (
+                        None
+                        if configuration.choices is None
+                        else tuple(configuration.choices)
+                    ),
+                    "crossover_surface": configuration.crossover_surface,
+                    "crossover_max_tilt_degrees": (
+                        configuration.crossover_max_tilt_degrees
+                    ),
+                    "crossover_attempts": configuration.crossover_attempts,
+                    "failure_diagnostic_count": configuration.failure_diagnostic_count,
+                    "composition_policy": configuration.composition_policy,
                 }
                 for name, expected in expected_params.items():
-                    default = parameter_defaults.get(name)
-                    if run_params.get(name, default) != expected:
+                    if actual_params[name] != expected:
                         raise GBMinimizerError(
                             f"owned checkpoint run parameter {name!r} does not match "
                             "the minimizer configuration"
                         )
 
-                # progress_index's non-negative-integer shape is already validated by
-                # validate_checkpoint_envelope above.
-                progress_index = state["progress_index"]
-                self.GBE_vals = owned_state["GBE_vals"]
-                self.history = owned_state["history"]
+                self.GBE_vals = [list(gen) for gen in snapshot.energy_history]
+                self.history = [
+                    [
+                        [_lineage_entry_from_snapshot(entry.lineage), entry.energy]
+                        for entry in gen
+                    ]
+                    for gen in snapshot.generation_history
+                ]
                 if (
-                    not isinstance(self.GBE_vals, list)
-                    or len(self.GBE_vals) != progress_index + 2
-                    or not isinstance(self.history, list)
-                    or len(self.history) != progress_index + 1
+                    len(self.GBE_vals) != snapshot.completed_generation + 2
+                    or len(self.history) != snapshot.completed_generation + 1
                 ):
                     raise GBMinimizerError(
                         "owned checkpoint energy/history progress is inconsistent"
                     )
-                self.local_random.bit_generator.state = state["rng_state"]
-                self.seed = state["run_params"].get("seed", self.seed)
-                retention_state = owned_state.get("artifact_store")
+                self.local_random = snapshot.rng.to_generator()
+                self.seed = snapshot.run.seed
+                retention_state = snapshot.retention_state
                 if retention_state is None:
                     if self.retention_policy is not None:
                         raise GBMinimizerError(
@@ -2677,35 +2746,17 @@ class GeneticAlgorithmMinimizer:
                 else:
                     try:
                         self.artifact_store = ArtifactStore.from_state(
-                            retention_state,
+                            _tuples_to_lists(dict(retention_state)),
                             policy=self.retention_policy,
                         )
                     except ArtifactStoreError as exc:
                         raise GBMinimizerError(str(exc)) from exc
-                    raw_archive_mappings = owned_state.get(
-                        "retention_archive_mappings", {}
-                    )
-                    if not isinstance(raw_archive_mappings, dict):
-                        raise GBMinimizerError(
-                            "checkpoint retention archive mappings are invalid"
+                    self._retention_archive_mappings = {
+                        candidate_id: _candidate_mapping_to_state(mapping)
+                        for candidate_id, mapping in sorted(
+                            snapshot.retention_archive_mappings.items()
                         )
-                    self._retention_archive_mappings = {}
-                    for candidate_id, mapping_state in sorted(
-                        raw_archive_mappings.items()
-                    ):
-                        if not isinstance(candidate_id, str):
-                            raise GBMinimizerError(
-                                "checkpoint retention archive candidate identity is "
-                                "invalid"
-                            )
-                        try:
-                            _candidate_mapping_from_state(mapping_state)
-                        except GrainOwnershipError as exc:
-                            raise GBMinimizerError(
-                                f"checkpoint retained ownership for {candidate_id!r} "
-                                "is invalid"
-                            ) from exc
-                        self._retention_archive_mappings[candidate_id] = mapping_state
+                    }
                     for artifact in self.artifact_store.records():
                         if artifact.archive_path is None:
                             continue
@@ -2722,77 +2773,69 @@ class GeneticAlgorithmMinimizer:
                                 f"retained archive path {artifact.archive_path} is "
                                 "missing"
                             )
-                raw_failure_diagnostics = owned_state.get(
-                    "failure_diagnostics", []
-                )
-                if not isinstance(raw_failure_diagnostics, list):
-                    raise GBMinimizerError(
-                        "checkpoint failure diagnostics state is invalid"
-                    )
                 self._failure_diagnostics = [
-                    _FailureDiagnostic.from_state(diagnostic_state)
-                    for diagnostic_state in raw_failure_diagnostics
+                    _FailureDiagnostic(
+                        candidate_id=diagnostic.candidate_id,
+                        generation=diagnostic.generation,
+                        input_index=diagnostic.input_index,
+                        failure_reason=diagnostic.failure_reason,
+                        source_path=diagnostic.source_path,
+                    )
+                    for diagnostic in snapshot.failure_diagnostics
                 ]
                 if len(self._failure_diagnostics) > self.failure_diagnostic_count:
                     raise GBMinimizerError(
                         "checkpoint failure diagnostics exceed the configured bound"
                     )
-                _start_gen = int(progress_index) + 1
-                best_record = self._owned_evaluation_from_state(
-                    owned_state["best_evaluation"]
+                _start_gen = snapshot.completed_generation + 1
+                best_record = self._owned_record_from_snapshot(
+                    snapshot.best, snapshot.best_mapping
                 )
                 if not best_record.success:
                     raise GBMinimizerError(
                         "owned checkpoint best evaluation is not reusable"
                     )
-                if not np.isclose(
-                    best_record.objective,
-                    float(state["best_energy"]),
-                    rtol=0.0,
-                    atol=0.0,
-                ) or best_record.structure_path != state["best_dump"]:
+                if snapshot.retention_lineages is None:
                     raise GBMinimizerError(
-                        "owned checkpoint best-evaluation envelope is inconsistent"
+                        "owned checkpoint retention lineages are invalid"
                     )
-                population_lineages = owned_state["population_lineages"]
-                if (
-                    not isinstance(population_lineages, list)
-                    or len(population_lineages) != self.population_size
-                    or not all(
-                        isinstance(lineage, list) for lineage in population_lineages
-                    )
-                ):
-                    raise GBMinimizerError(
-                        "owned checkpoint population lineages are invalid"
-                    )
-                population_retention_lineages_state = owned_state.get(
-                    "population_retention_lineages"
-                )
-                if (
-                    not isinstance(population_retention_lineages_state, list)
-                    or len(population_retention_lineages_state) != self.population_size
-                    or not all(
-                        isinstance(lineage, list)
-                        and all(isinstance(parent_id, str) for parent_id in lineage)
-                        for lineage in population_retention_lineages_state
-                    )
-                ):
+                if len(snapshot.retention_lineages) != self.population_size:
                     raise GBMinimizerError(
                         "owned checkpoint retention lineages are invalid"
                     )
                 population_retention_lineages = [
-                    tuple(lineage) for lineage in population_retention_lineages_state
+                    tuple(lineage) for lineage in snapshot.retention_lineages
                 ]
-                population_snapshots = owned_state["population_candidates"]
+                population_lineages = [
+                    _lineage_entry_from_snapshot(candidate.lineage)
+                    for candidate in snapshot.population
+                ]
+                if len(population_lineages) != self.population_size:
+                    raise GBMinimizerError(
+                        "owned checkpoint population lineages are invalid"
+                    )
+                population_snapshots = [
+                    {
+                        "structure_path": candidate.artifact.path,
+                        "mapping": (
+                            None
+                            if candidate.mapping is None
+                            else _candidate_mapping_to_state(candidate.mapping)
+                        ),
+                    }
+                    for candidate in snapshot.population
+                ]
                 population_manipulators, population_structures = (
                     self._restore_owned_population(population_snapshots)
                 )
-                cached_states = owned_state.get(
-                    "population_cached_evaluations",
-                    [None] * self.population_size,
+                cache_entries = snapshot.population_cache or (
+                    (None,) * len(population_manipulators)
                 )
-                if not isinstance(cached_states, list) or len(
-                    cached_states
+                cache_mappings = snapshot.population_cache_mappings or (
+                    (None,) * len(population_manipulators)
+                )
+                if len(cache_entries) != len(population_manipulators) or len(
+                    cache_mappings
                 ) != len(population_manipulators):
                     raise GBMinimizerError(
                         "owned checkpoint cached evaluations are not "
@@ -2800,29 +2843,37 @@ class GeneticAlgorithmMinimizer:
                     )
                 population_cached_evaluations = [
                     None
-                    if cached_state is None
-                    else self._owned_evaluation_from_state(cached_state)
-                    for cached_state in cached_states
+                    if cache is None
+                    else self._owned_record_from_snapshot(cache, mapping)
+                    for cache, mapping in zip(
+                        cache_entries, cache_mappings, strict=True
+                    )
                 ]
-                last_states = owned_state["last_generation_evaluations"]
                 if (
-                    not isinstance(last_states, list)
-                    or len(last_states) != self.population_size
+                    snapshot.last_generation_evaluations is None
+                    or len(snapshot.last_generation_evaluations)
+                    != self.population_size
                 ):
                     raise GBMinimizerError(
                         "owned checkpoint generation evaluations are invalid"
                     )
                 self.last_generation_evaluations = [
-                    CandidateEvaluationSummary.from_state(record_state)
-                    for record_state in last_states
+                    CandidateEvaluationSummary(
+                        candidate_id=entry.candidate_id,
+                        input_index=entry.input_index,
+                        objective=entry.selection_energy,
+                        success=entry.status is EvaluationStatus.SUCCESS,
+                        failure_reason=entry.failure_message,
+                    )
+                    for entry in snapshot.last_generation_evaluations
                 ]
                 self._owned_evaluator.restore_claimed_paths(
-                    owned_state["claimed_paths"]
+                    list(snapshot.claimed_paths)
                 )
                 self.best_evaluation = best_record
                 stale = CandidateCheckpoint._derive_path(
                     checkpoint_file,
-                    int(progress_index),
+                    snapshot.completed_generation,
                 )
                 if stale.exists():
                     stale.unlink()
@@ -2836,12 +2887,13 @@ class GeneticAlgorithmMinimizer:
                 self._emit(
                     OptimizationEventType.RUN_STARTED,
                     run_context=run_context,
-                    iteration=int(progress_index),
+                    iteration=snapshot.completed_generation,
                 )
             except GBMinimizerError:
                 raise
             except (
-                CheckpointCompatibilityError, KeyError, TypeError, ValueError,
+                CheckpointCompatibilityError, SnapshotError, KeyError, TypeError,
+                ValueError,
             ) as exc:
                 raise GBMinimizerError(
                     f"Invalid explicit-ownership GA checkpoint state: {exc}"
@@ -2940,75 +2992,137 @@ class GeneticAlgorithmMinimizer:
             _start_gen = 0
 
         def _build_owned_state(gen: int) -> dict:
+            """Return one callback-free, typed-snapshot checkpoint payload for ``gen``.
+
+            :param gen: Completed GA generation represented by the checkpoint.
+            :return: Serializable checkpoint payload.
+            """
+            best_snapshot = _owned_evaluation_to_snapshot(
+                self._owned_evaluation_to_state(best_record)
+            )
+            population_snapshot = [
+                PopulationCandidateSnapshot(
+                    artifact=StructureArtifact(
+                        path=snap["structure_path"], format=_STRUCTURE_FORMAT
+                    ),
+                    lineage=_lineage_step_from_v1(lineage),
+                    mapping=(
+                        None
+                        if snap["mapping"] is None
+                        else _candidate_mapping_from_state(snap["mapping"])
+                    ),
+                )
+                for snap, lineage in zip(
+                    population_snapshots, population_lineages, strict=True
+                )
+            ]
+            population_cache_snapshot = [
+                None
+                if record is None
+                else _owned_evaluation_to_snapshot(
+                    self._owned_evaluation_to_state(record)
+                )
+                for record in population_cached_evaluations
+            ]
+            population_cache_mapping_objects = [
+                None if record is None else record.mapping
+                for record in population_cached_evaluations
+            ]
+            generation_history_snapshot = [
+                [
+                    GenerationHistoryEntrySnapshot(
+                        lineage=_lineage_step_from_v1(lineage), energy=energy
+                    )
+                    for lineage, energy in gen_history
+                ]
+                for gen_history in self.history
+            ]
+            last_generation_snapshot = [
+                CandidateEvaluationSnapshot(
+                    candidate_id=record.candidate_id,
+                    input_index=record.input_index,
+                    status=(
+                        EvaluationStatus.SUCCESS
+                        if record.success
+                        else EvaluationStatus.FAILED
+                    ),
+                    selection_energy=record.objective,
+                    energy=record.objective if record.success else None,
+                    failure_stage=(
+                        None if record.success else FailureStage.EVALUATOR
+                    ),
+                    failure_message=(
+                        None
+                        if record.success
+                        else (record.failure_reason or "unknown evaluation failure")
+                    ),
+                )
+                for record in self.last_generation_evaluations
+            ]
+            failure_diagnostics_snapshot = [
+                FailureDiagnosticSnapshot(
+                    candidate_id=diagnostic.candidate_id,
+                    generation=diagnostic.generation,
+                    input_index=diagnostic.input_index,
+                    failure_reason=diagnostic.failure_reason,
+                    source_path=diagnostic.source_path,
+                )
+                for diagnostic in self._failure_diagnostics
+            ]
+            retention_archive_mapping_objects = {
+                candidate_id: _candidate_mapping_from_state(
+                    self._retention_archive_mappings[candidate_id]
+                )
+                for candidate_id in sorted(self._retention_archive_mappings)
+            }
+            snapshot = GeneticAlgorithmSnapshot(
+                run=RunIdentitySnapshot(
+                    run_id=str(unique_id),
+                    seed=self.seed,
+                    case_id=self.case_id,
+                    campaign_id=self.campaign_id,
+                ),
+                rng=RngStateSnapshot.from_generator(self.local_random),
+                completed_generation=gen,
+                best=best_snapshot,
+                population=population_snapshot,
+                configuration=GeneticAlgorithmConfigurationSnapshot(
+                    slice_and_merge_pct=self.slice_and_merge_pct,
+                    reuse_carryover_evaluations=self.reuse_carryover_evaluations,
+                    population_size=self.population_size,
+                    keep_top_pct=self.keep_top_pct,
+                    intermediate_pct=self.intermediate_pct,
+                    allow_variable_cell=self.allow_variable_cell,
+                    choices=self.mutator.choices_keys,
+                    crossover_surface=self.crossover_surface,
+                    crossover_max_tilt_degrees=self.crossover_max_tilt_degrees,
+                    crossover_attempts=self.crossover_attempts,
+                    failure_diagnostic_count=self.failure_diagnostic_count,
+                    composition_policy=self.composition_policy,
+                ),
+                population_cache=population_cache_snapshot,
+                energy_history=[list(gen_vals) for gen_vals in self.GBE_vals],
+                generation_history=generation_history_snapshot,
+                retention_lineages=[
+                    list(lineage) for lineage in population_retention_lineages
+                ],
+                last_generation_evaluations=last_generation_snapshot,
+                failure_diagnostics=failure_diagnostics_snapshot,
+                claimed_paths=self._owned_evaluator.claimed_paths_state(),
+                retention_state=(
+                    None
+                    if self.artifact_store is None
+                    else self.artifact_store.to_state()
+                ),
+                retention_archive_mappings=retention_archive_mapping_objects,
+                best_mapping=best_record.mapping,
+                population_cache_mappings=population_cache_mapping_objects,
+            )
             return {
-                "schema_version": CHECKPOINT_SCHEMA_VERSION,
-                "minimizer": "GeneticAlgorithmMinimizer",
-                "progress_unit": "generation",
-                "progress_index": gen,
-                "best_energy": best_record.objective,
-                "best_dump": best_record.structure_path,
-                "rng_state": self.local_random.bit_generator.state,
-                "run_params": {
-                    "unique_id": str(unique_id),
-                    "population_size": self.population_size,
-                    "keep_top_pct": self.keep_top_pct,
-                    "intermediate_pct": self.intermediate_pct,
-                    "slice_and_merge_pct": self.slice_and_merge_pct,
-                    "reuse_carryover_evaluations": (
-                        self.reuse_carryover_evaluations
-                    ),
-                    "allow_variable_cell": self.allow_variable_cell,
-                    "choices": self.mutator.choices_keys,
-                    "crossover_surface": self.crossover_surface,
-                    "crossover_max_tilt_degrees": (
-                        self.crossover_max_tilt_degrees
-                    ),
-                    "crossover_attempts": self.crossover_attempts,
-                    "failure_diagnostic_count": self.failure_diagnostic_count,
-                    "composition_policy": [
-                        [species, coefficient]
-                        for species, coefficient in self.composition_policy
-                    ],
-                    "seed": self.seed,
-                },
-                "state": {
-                    "ga_mode": "explicit_ownership",
-                    "owned_checkpoint_version": _OWNED_GA_CHECKPOINT_VERSION,
-                    "GBE_vals": self.GBE_vals,
-                    "history": self.history,
-                    "population_lineages": population_lineages,
-                    "population_retention_lineages": [
-                        list(lineage) for lineage in population_retention_lineages
-                    ],
-                    "population_candidates": population_snapshots,
-                    "population_cached_evaluations": [
-                        None
-                        if record is None
-                        else self._owned_evaluation_to_state(record)
-                        for record in population_cached_evaluations
-                    ],
-                    "best_evaluation": self._owned_evaluation_to_state(best_record),
-                    "last_generation_evaluations": [
-                        CandidateEvaluationSummary.from_evaluation(record).to_state()
-                        if isinstance(record, CandidateEvaluation)
-                        else record.to_state()
-                        for record in self.last_generation_evaluations
-                    ],
-                    "failure_diagnostics": [
-                        diagnostic.to_state()
-                        for diagnostic in self._failure_diagnostics
-                    ],
-                    "artifact_store": (
-                        None
-                        if self.artifact_store is None
-                        else self.artifact_store.to_state()
-                    ),
-                    "retention_archive_mappings": {
-                        candidate_id: self._retention_archive_mappings[candidate_id]
-                        for candidate_id in sorted(self._retention_archive_mappings)
-                    },
-                    "claimed_paths": self._owned_evaluator.claimed_paths_state(),
-                },
+                "schema_version": SNAPSHOT_SCHEMA_VERSION,
+                "minimizer": _GA_MINIMIZER_NAME,
+                "progress_unit": _GA_PROGRESS_UNIT,
+                "snapshot": snapshot.to_state(),
             }
 
         pending_failure_diagnostics: list[_FailureDiagnostic] = []

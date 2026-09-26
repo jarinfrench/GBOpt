@@ -1919,16 +1919,18 @@ def test_owned_ga_checkpoint_json_contains_reconstruction_state(owned_ga, tmp_pa
     minimizer.run_GA(unique_id=201, checkpoint_file=checkpoint)
 
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert state["state"]["ga_mode"] == "explicit_ownership"
-    assert state["state"]["owned_checkpoint_version"] == 4
-    assert state["run_params"]["crossover_surface"] == "periodic_wave"
-    assert state["run_params"]["crossover_max_tilt_degrees"] == pytest.approx(5.0)
-    assert state["run_params"]["crossover_attempts"] == 8
-    assert state["run_params"]["composition_policy"] == [["Ni", 1]]
-    assert state["progress_index"] == 0
-    assert len(state["state"]["population_candidates"]) == 4
-    candidate = state["state"]["population_candidates"][0]
-    assert Path(candidate["structure_path"]).is_file()
+    assert state["schema_version"] == 2
+    assert state["minimizer"] == "GeneticAlgorithmMinimizer"
+    snapshot = state["snapshot"]
+    configuration = snapshot["configuration"]
+    assert configuration["crossover_surface"] == "periodic_wave"
+    assert configuration["crossover_max_tilt_degrees"] == pytest.approx(5.0)
+    assert configuration["crossover_attempts"] == 8
+    assert configuration["composition_policy"] == [["Ni", 1]]
+    assert snapshot["completed_generation"] == 0
+    assert len(snapshot["population"]) == 4
+    candidate = snapshot["population"][0]
+    assert Path(candidate["artifact"]["path"]).is_file()
     mapping = candidate["mapping"]
     assert mapping["labels"]
     assert mapping["atom_ids"] == list(range(1, len(mapping["labels"]) + 1))
@@ -1936,8 +1938,8 @@ def test_owned_ga_checkpoint_json_contains_reconstruction_state(owned_ga, tmp_pa
     assert isinstance(mapping["gb_plane_x"], float)
     assert mapping["left_grain_x_bounds"]
     assert mapping["right_grain_x_bounds"]
-    assert state["state"]["best_evaluation"]["mapping"] is not None
-    assert len(state["state"]["last_generation_evaluations"]) == 4
+    assert snapshot["best_mapping"] is not None
+    assert len(snapshot["last_generation_evaluations"]) == 4
 
 
 def test_owned_ga_checkpoint_json_contains_resolved_seed(owned_ga, tmp_path):
@@ -1954,7 +1956,7 @@ def test_owned_ga_checkpoint_json_contains_resolved_seed(owned_ga, tmp_path):
     minimizer.run_GA(unique_id=205, checkpoint_file=checkpoint)
 
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert state["run_params"]["seed"] == 0
+    assert state["snapshot"]["run"]["seed"] == 0
 
     resumed = _make_owned_checkpoint_minimizer(
         owned_ga,
@@ -2046,9 +2048,9 @@ def test_failed_owned_evaluation_stays_excluded_after_resume(owned_ga, tmp_path)
     )
     partial.run_GA(unique_id=204, checkpoint_file=checkpoint)
     saved = json.loads(checkpoint.read_text(encoding="utf-8"))
-    failed_state = saved["state"]["last_generation_evaluations"][0]
-    assert failed_state["success"] is False
-    assert "changed species" in failed_state["failure_reason"]
+    failed_state = saved["snapshot"]["last_generation_evaluations"][0]
+    assert failed_state["status"] == "failed"
+    assert "changed species" in failed_state["failure_message"]
 
     resumed = _make_owned_checkpoint_minimizer(
         owned_ga,
@@ -2152,7 +2154,7 @@ def test_owned_resume_fails_on_missing_population_artifact(owned_ga, tmp_path):
     )
     partial.run_GA(unique_id=207, checkpoint_file=checkpoint)
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    Path(state["state"]["population_candidates"][0]["structure_path"]).unlink()
+    Path(state["snapshot"]["population"][0]["artifact"]["path"]).unlink()
 
     resumed = _make_owned_checkpoint_minimizer(
         owned_ga,
@@ -2173,7 +2175,10 @@ def test_owned_resume_rejects_invalid_checkpoint_state(owned_ga, tmp_path):
     )
     partial.run_GA(unique_id=208, checkpoint_file=checkpoint)
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    state["state"]["owned_checkpoint_version"] = 999
+    # Schema-v2's population is validated non-empty by GeneticAlgorithmSnapshot
+    # itself; corrupting it to an empty list is this schema's equivalent of the
+    # old, schema-v1-only "owned_checkpoint_version" staleness guard.
+    state["snapshot"]["population"] = []
     checkpoint.write_text(json.dumps(state), encoding="utf-8")
 
     resumed = _make_owned_checkpoint_minimizer(
@@ -2181,7 +2186,7 @@ def test_owned_resume_rejects_invalid_checkpoint_state(owned_ga, tmp_path):
         energy,
         generations=2,
     )
-    with pytest.raises(GBMinimizerError, match="supported explicit-ownership"):
+    with pytest.raises(GBMinimizerError, match="Invalid explicit-ownership GA"):
         resumed.run_GA(unique_id=208, checkpoint_file=checkpoint)
 
 
@@ -2192,7 +2197,7 @@ def test_owned_resume_rejects_checkpoint_missing_a_required_field(owned_ga, tmp_
         unique_id=209, checkpoint_file=checkpoint
     )
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    del state["run_params"]
+    del state["snapshot"]
     checkpoint.write_text(json.dumps(state), encoding="utf-8")
 
     resumed = _make_owned_checkpoint_minimizer(owned_ga, energy, generations=2)
@@ -2213,7 +2218,7 @@ def test_owned_resume_rejects_checkpoint_from_a_different_minimizer(
     checkpoint.write_text(json.dumps(state), encoding="utf-8")
 
     resumed = _make_owned_checkpoint_minimizer(owned_ga, energy, generations=2)
-    with pytest.raises(GBMinimizerError, match="Invalid explicit-ownership GA"):
+    with pytest.raises(GBMinimizerError, match="checkpoint was written by"):
         resumed.run_GA(unique_id=210, checkpoint_file=checkpoint)
 
 
@@ -2228,7 +2233,10 @@ def test_owned_resume_rejects_unsupported_schema_version(owned_ga, tmp_path):
     checkpoint.write_text(json.dumps(state), encoding="utf-8")
 
     resumed = _make_owned_checkpoint_minimizer(owned_ga, energy, generations=2)
-    with pytest.raises(GBMinimizerError, match="Invalid explicit-ownership GA"):
+    with pytest.raises(
+        GBMinimizerError,
+        match="unsupported GeneticAlgorithmMinimizer checkpoint schema version",
+    ):
         resumed.run_GA(unique_id=211, checkpoint_file=checkpoint)
 
 
@@ -2239,7 +2247,7 @@ def test_owned_resume_rejects_malformed_progress_index(owned_ga, tmp_path):
         unique_id=212, checkpoint_file=checkpoint
     )
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    state["progress_index"] = -1
+    state["snapshot"]["completed_generation"] = -1
     checkpoint.write_text(json.dumps(state), encoding="utf-8")
 
     resumed = _make_owned_checkpoint_minimizer(owned_ga, energy, generations=2)
@@ -2556,12 +2564,12 @@ def test_owned_retention_prunes_sources_only_after_checkpoint_commit(owned_ga, t
     _energy, best_path = minimizer.run_GA(unique_id=301, checkpoint_file=checkpoint)
 
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    store_state = state["state"]["artifact_store"]
+    store_state = state["snapshot"]["retention_state"]
     assert store_state["policy_signature"] == minimizer.retention_policy.signature
-    assert state["state"]["last_generation_evaluations"]
+    assert state["snapshot"]["last_generation_evaluations"]
     assert all(
         "structure_path" not in summary and "mapping" not in summary
-        for summary in state["state"]["last_generation_evaluations"]
+        for summary in state["snapshot"]["last_generation_evaluations"]
     )
     assert Path(best_path).is_file()
     assert Path(best_path).parent == checkpoint.with_suffix(".artifacts") / "structures"
@@ -2618,10 +2626,10 @@ def test_owned_retention_materializes_initial_candidate_when_still_top_n(
 
     assert best_energy == pytest.approx(0.0)
     assert Path(best_path).name == "GA_316_g0_c0.data"
-    state = json.loads(checkpoint.read_text(encoding="utf-8"))["state"]
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))["snapshot"]
     records = {
         record["candidate"]["candidate_id"]: record
-        for record in state["artifact_store"]["records"]
+        for record in state["retention_state"]["records"]
     }
     initial = records["GA_initial316"]
     assert initial["retention_reasons"]
@@ -2668,10 +2676,10 @@ def test_owned_retention_materializes_prior_generation_candidate_at_later_checkp
         checkpoint_interval=2,
     )
 
-    state = json.loads(checkpoint.read_text(encoding="utf-8"))["state"]
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))["snapshot"]
     records = {
         record["candidate"]["candidate_id"]: record
-        for record in state["artifact_store"]["records"]
+        for record in state["retention_state"]["records"]
     }
     prior = records["GA_317_g0_c1"]
     assert prior["retention_reasons"]
@@ -2698,12 +2706,12 @@ def test_owned_retention_writes_manifest_and_lifecycle_history(owned_ga, tmp_pat
         json.loads(line)
         for line in (artifact_root / "history.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    checkpoint_state = json.loads(checkpoint.read_text(encoding="utf-8"))["state"]
+    checkpoint_state = json.loads(checkpoint.read_text(encoding="utf-8"))["snapshot"]["retention_state"]
 
     assert manifest["calculation_context"] == _TEST_CALCULATION_CONTEXT
     expected_ids = sorted(
         record["candidate"]["candidate_id"]
-        for record in checkpoint_state["artifact_store"]["records"]
+        for record in checkpoint_state["records"]
     )
     assert [record["candidate_id"] for record in manifest["records"]] == expected_ids
     archived = [record for record in manifest["records"] if record["archive_path"]]
@@ -2756,7 +2764,7 @@ def test_owned_provenance_failure_does_not_invalidate_checkpoint(
 
     assert checkpoint.is_file()
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    store_state = state["state"]["artifact_store"]
+    store_state = state["snapshot"]["retention_state"]
     assert store_state is not None
     source_paths = [
         record["source_path"]
@@ -2818,7 +2826,7 @@ def test_owned_failed_evaluations_use_bounded_diagnostic_lifecycle(owned_ga, tmp
     assert not failed_paths[0].exists()
     assert failed_paths[1].is_file()
 
-    state = json.loads(checkpoint.read_text(encoding="utf-8"))["state"]
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))["snapshot"]
     diagnostics = state["failure_diagnostics"]
     assert len(diagnostics) == 1
     assert diagnostics[0]["candidate_id"] == "GA_315_g1_c0"
@@ -2861,10 +2869,10 @@ def test_owned_retention_archive_preserves_explicit_reconstruction_metadata(
     _energy, best_path = minimizer.run_GA(unique_id=302, checkpoint_file=checkpoint)
 
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    best_state = state["state"]["best_evaluation"]
+    best_state = state["snapshot"]["best"]
     candidate_id = best_state["candidate_id"]
-    assert candidate_id in state["state"]["retention_archive_mappings"]
-    assert best_state["structure_path"] == best_path
+    assert candidate_id in state["snapshot"]["retention_archive_mappings"]
+    assert best_state["artifact"]["path"] == best_path
 
     resumed = _make_owned_checkpoint_minimizer(
         owned_ga,
@@ -2877,7 +2885,8 @@ def test_owned_retention_archive_preserves_explicit_reconstruction_metadata(
     resumed.run_GA(unique_id=302, checkpoint_file=checkpoint)
     restored = resumed.best_evaluation.manipulator.parents[0]
     np.testing.assert_array_equal(restored.grain_labels, owned_ga[3])
-    assert restored.gb_plane_x == pytest.approx(best_state["mapping"]["gb_plane_x"])
+    best_mapping = state["snapshot"]["best_mapping"]
+    assert restored.gb_plane_x == pytest.approx(best_mapping["gb_plane_x"])
 
 
 def test_owned_retention_property_provider_receives_relaxed_candidate_state(
@@ -2976,7 +2985,10 @@ def test_owned_retention_checkpoint_contains_no_callback_object(owned_ga, tmp_pa
     text = checkpoint.read_text(encoding="utf-8")
     state = json.loads(text)
     assert "function provider" not in text
-    assert state["state"]["artifact_store"]["policy_signature"] == policy.signature
+    assert (
+        state["snapshot"]["retention_state"]["policy_signature"]
+        == policy.signature
+    )
 
 
 def test_owned_carryover_cache_is_rebased_before_source_pruning(owned_ga, tmp_path):
@@ -2995,13 +3007,13 @@ def test_owned_carryover_cache_is_rebased_before_source_pruning(owned_ga, tmp_pa
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
     cached = [
         item
-        for item in state["state"]["population_cached_evaluations"]
+        for item in state["snapshot"]["population_cache"]
         if item is not None
     ]
     assert len(cached) == 1
-    assert cached[0]["structure_path"].endswith(".owned.pending")
-    assert Path(cached[0]["structure_path"]).is_file()
-    for record in state["state"]["artifact_store"]["records"]:
+    assert cached[0]["artifact"]["path"].endswith(".owned.pending")
+    assert Path(cached[0]["artifact"]["path"]).is_file()
+    for record in state["snapshot"]["retention_state"]["records"]:
         if record["source_path"] is not None:
             assert not Path(record["source_path"]).exists()
 
@@ -3054,7 +3066,7 @@ def test_owned_retention_none_preserves_evaluator_sources(owned_ga, tmp_path):
     _energy, best_path = minimizer.run_GA(unique_id=309, checkpoint_file=checkpoint)
 
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert state["state"]["artifact_store"] is None
+    assert state["snapshot"]["retention_state"] is None
     assert Path(best_path).parent == tmp_path
     assert not checkpoint.with_suffix(".artifacts").exists()
     evaluator_sources = sorted(tmp_path.glob("GA_*.data"))
@@ -3097,7 +3109,7 @@ def test_owned_prune_resume_matches_continuous_run(owned_ga, tmp_path):
     partial_state = json.loads(resumed_checkpoint.read_text(encoding="utf-8"))
     assert all(
         record["source_path"] is None or not Path(record["source_path"]).exists()
-        for record in partial_state["state"]["artifact_store"]["records"]
+        for record in partial_state["snapshot"]["retention_state"]["records"]
     )
 
     resumed = _make_owned_checkpoint_minimizer(
@@ -3120,20 +3132,22 @@ def test_owned_prune_resume_matches_continuous_run(owned_ga, tmp_path):
         np.testing.assert_allclose(actual, expected)
 
     continuous_state = json.loads(continuous_checkpoint.read_text(encoding="utf-8"))[
-        "state"
+        "snapshot"
     ]
-    resumed_state = json.loads(resumed_checkpoint.read_text(encoding="utf-8"))["state"]
-    assert resumed_state["population_retention_lineages"] == continuous_state[
-        "population_retention_lineages"
+    resumed_state = json.loads(resumed_checkpoint.read_text(encoding="utf-8"))[
+        "snapshot"
+    ]
+    assert resumed_state["retention_lineages"] == continuous_state[
+        "retention_lineages"
     ]
     assert resumed_state["last_generation_evaluations"] == continuous_state[
         "last_generation_evaluations"
     ]
-    assert resumed_state["best_evaluation"]["candidate_id"] == continuous_state[
-        "best_evaluation"
+    assert resumed_state["best"]["candidate_id"] == continuous_state[
+        "best"
     ]["candidate_id"]
-    assert resumed_state["best_evaluation"]["energy"] == pytest.approx(
-        continuous_state["best_evaluation"]["energy"]
+    assert resumed_state["best"]["energy"] == pytest.approx(
+        continuous_state["best"]["energy"]
     )
 
     def normalized_store_records(state):
@@ -3144,7 +3158,7 @@ def test_owned_prune_resume_matches_continuous_run(owned_ga, tmp_path):
                 "retention_reasons": record["retention_reasons"],
                 "has_archive": record["archive_path"] is not None,
             }
-            for record in state["artifact_store"]["records"]
+            for record in state["retention_state"]["records"]
         ]
 
     assert normalized_store_records(resumed_state) == normalized_store_records(
@@ -3152,18 +3166,18 @@ def test_owned_prune_resume_matches_continuous_run(owned_ga, tmp_path):
     )
     retained_ids = {
         record["candidate"]["candidate_id"]
-        for record in resumed_state["artifact_store"]["records"]
+        for record in resumed_state["retention_state"]["records"]
         if record["archive_path"] is not None
     }
     assert retained_ids == {
         record["candidate"]["candidate_id"]
-        for record in continuous_state["artifact_store"]["records"]
+        for record in continuous_state["retention_state"]["records"]
         if record["archive_path"] is not None
     }
     assert retained_ids
     assert all(
         Path(record["archive_path"]).is_file()
-        for record in resumed_state["artifact_store"]["records"]
+        for record in resumed_state["retention_state"]["records"]
         if record["archive_path"] is not None
     )
 
@@ -3240,8 +3254,8 @@ def test_owned_cleanup_callback_removes_complete_work_directories_after_commit(
     assert Path(best_path).is_file()
     assert Path(best_path).parent == checkpoint.with_suffix(".artifacts") / "structures"
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert "managed_artifact_root" not in state["run_params"]
-    assert "cleanup_candidate" not in state["run_params"]
+    assert "managed_artifact_root" not in state["snapshot"]["configuration"]
+    assert "cleanup_candidate" not in state["snapshot"]["configuration"]
 
 
 def test_owned_cleanup_failure_leaks_source_but_checkpoint_remains_resumable(
