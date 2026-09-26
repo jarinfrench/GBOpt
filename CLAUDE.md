@@ -624,6 +624,27 @@ Established by `GBOpt/crystallography/` and `GBOpt/artifacts/`, and now also
   suite (unchanged, still green) was the criterion's actual discharge. Don't
   assume a checklist item implies a new test is owed — check whether the
   regression coverage already exists first.
+- **The mutator-crash technique for interrupting a run mid-progress to inspect
+  checkpoint state (`_install_mutate_crash`, established for MC) does not
+  reliably interrupt a GA run at a completed generation boundary, because GA's
+  own initial-population seeding alone can consume more mutate calls than a
+  naive `crash_after` count accounts for.** Writing R27's real-checkpoint
+  migration tests, a `crash_after=N` mutator patch modeled directly on MC's own
+  pattern crashed for both legacy- and owned-mode GA fixtures before generation
+  0's checkpoint was ever written — `population_size - 1` (or `- len(seed
+  manipulators)`) mutate calls happen during population construction, before
+  the main generation loop's own per-candidate mutate calls even begin, so a
+  small `crash_after` picked by analogy to an MC test crashes mid-seeding, not
+  mid-generation. `tests/test_optimization_genetic.py` already has the correct
+  technique for exactly this (`test_run_ga_checkpoint_file_is_valid_json_after_
+  crash`/`test_run_ga_checkpoint_format_pickle`): patch
+  `GBOpt.Checkpoint.CheckpointStore._save` to delegate to the real save and
+  *then* raise, so the interruption always happens immediately after a genuine
+  completed-generation checkpoint commit, independent of population size or
+  operation mix. Use this technique for any future GA checkpoint test that
+  needs to inspect state at a specific completed-generation boundary; reserve
+  the mutator-crash technique for MC, where it already works correctly because
+  MC has no equivalent population-seeding phase.
 
 ## Refactor-issue discipline
 
@@ -1603,6 +1624,37 @@ Established by `GBOpt/crystallography/` and `GBOpt/artifacts/`, and now also
   entry above (a domain check mypy can verify beats one it can't), just
   showing up as "restructure the boolean into the value's own type" instead
   of "add a `None`-check guard clause."
+- **A function reading an untrusted, dynamically-typed value (`raw: object`,
+  e.g. one field out of a deserialized checkpoint) needs an explicit
+  `isinstance(raw, dict)` guard before indexing it — relying on `except
+  (KeyError, TypeError)` around the indexing alone leaves mypy unable to narrow
+  `object` to something indexable, reporting "Value of type object is not
+  indexable" at every `raw["key"]` site even though the runtime behavior is
+  already correct.** R27's `GBOpt.snapshot.migration` helpers (`_owned_
+  evaluation_to_snapshot` and siblings) each take one raw, not-yet-validated
+  checkpoint sub-state as `object` and originally relied on a `try: ... except
+  (KeyError, TypeError):` block around several `raw["field"]` reads to translate
+  a malformed entry into `SnapshotMigrationError` — runtime-correct (a non-dict
+  `raw` raises `TypeError` on the first subscript, caught the same as a missing
+  key), but mypy has no way to know indexing was ever guarded, since `TypeError`
+  being caught somewhere doesn't retroactively prove the operation was safe.
+  `GBOpt.Checkpoint.validate_checkpoint_envelope` already establishes the
+  correct pattern (`if not isinstance(state, dict): raise ...` before any
+  indexing); adding the identical guard to each of these helpers (and narrowing
+  the `except` clause down to just `KeyError`, since a non-dict is now excluded
+  earlier) resolved every one of these findings with no behavior change, and
+  reads better to a human too, since it's now a dictionary-shape assertion
+  next to a real domain error message. **Separately, a small helper meant to
+  always raise (e.g. a `_fail(message) -> SnapshotMigrationError` one-liner
+  used for readability at several call sites) needs a `typing.NoReturn` return
+  annotation, or mypy won't narrow past an `if condition: _fail(...)` call the
+  way it narrows past a bare `raise` — without it, a variable checked via `if
+  x is None: _fail(...)` is still typed `X | None` on the next line.**
+  `GBOpt.snapshot.migration._fail`'s missing `NoReturn` annotation caused
+  exactly this at `_monte_carlo_snapshot_from_v1`'s `current_artifact`
+  narrowing; adding `-> NoReturn` fixed it with zero behavior change, same
+  category as the `isinstance` guard above (both are "give mypy the same
+  information a human reading the code already has," not appeasement).
 
 ## Tooling
 
