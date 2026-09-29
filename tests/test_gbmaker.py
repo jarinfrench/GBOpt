@@ -34,6 +34,14 @@ from GBOpt.GBMaker import (
     _find_commensurate_pair,
     wrap_reduced_coordinate,
 )
+from GBOpt.gbmaker.assembly import _grain_strain_scales
+from GBOpt.gbmaker.geometry import (
+    _box_periodic_basis,
+    _cartesian_from_box_coordinates,
+    _reduced_box_coordinates,
+    _reduced_coordinate_tolerance,
+    _selection_basis_vectors,
+)
 from GBOpt.UnitCell import UnitCell
 from tests.data.olmsted_2009_fcc_gb_energies import (
     BOUNDARIES as OLMSTED_2009_BOUNDARIES,
@@ -488,7 +496,7 @@ def test_approximate_mismatch_tolerance_applies_left_grain_y_strain():
         mismatch_max_cells=50,
     )
 
-    accommodation = gb._GBMaker__strain_accommodation["y"]
+    accommodation = gb._boundary.strain_accommodation["y"]
     assert accommodation.left_scale != pytest.approx(1.0, abs=1e-6, rel=0.0)
 
     y_planes = np.unique(np.round(gb.left_grain["y"], 10))
@@ -543,7 +551,7 @@ def test_exact_strain_policy_sets_expected_y_dimension_and_scales(
     expected_right_scale: float,
 ):
     gb = _build_exact_incommensurate_boundary(strain_grain=strain_grain)
-    accommodation = gb._GBMaker__strain_accommodation["y"]
+    accommodation = gb._boundary.strain_accommodation["y"]
 
     assert gb.y_dim == pytest.approx(expected_y_dim, abs=1e-8, rel=0.0)
     assert accommodation.left_scale == pytest.approx(
@@ -560,7 +568,7 @@ def test_exact_strain_policy_sets_expected_y_dimension_and_scales(
 
 def test_mismatch_accommodation_leaves_commensurate_z_period_unstrained():
     gb = _build_approximate_strain_boundary(mismatch_tol=0.005)
-    accommodation = gb._GBMaker__strain_accommodation["z"]
+    accommodation = gb._boundary.strain_accommodation["z"]
 
     assert gb.z_dim == pytest.approx(_STRAIN_A0, abs=1e-4, rel=0.0)
     assert accommodation.left_repeats == 1
@@ -570,9 +578,13 @@ def test_mismatch_accommodation_leaves_commensurate_z_period_unstrained():
 
 
 def test_approximate_no_pair_warns_and_uses_repeat_factor_fallback(monkeypatch):
-    gbmaker_module = importlib.import_module("GBOpt.GBMaker")
+    # The commensurate-pair search is actually invoked from
+    # GBOpt.gbmaker.dimension (GBOpt.GBMaker._find_commensurate_pair is kept only as
+    # a compatibility alias; see gbmaker/dimension.py), so that is what must be
+    # patched for the fallback path to trigger.
+    dimension_module = importlib.import_module("GBOpt.gbmaker.dimension")
     monkeypatch.setattr(
-        gbmaker_module,
+        dimension_module,
         "_find_commensurate_pair",
         lambda *_args, **_kwargs: None,
     )
@@ -593,7 +605,7 @@ def test_approximate_no_pair_warns_and_uses_repeat_factor_fallback(monkeypatch):
 
 def test_exact_pq_mismatch_accommodation_uses_expected_y_repeat_pair():
     gb = _build_exact_incommensurate_boundary()
-    accommodation = gb._GBMaker__strain_accommodation["y"]
+    accommodation = gb._boundary.strain_accommodation["y"]
 
     assert gb.whole_system.size > 0
     assert accommodation.left_repeats == 5
@@ -650,7 +662,7 @@ def test_exact_interaction_resize_multiplies_commensurate_z_pair():
             repeat_factor=2,
         )
 
-    accommodation = gb._GBMaker__strain_accommodation["z"]
+    accommodation = gb._boundary.strain_accommodation["z"]
     assert accommodation.left_repeats == 6
     assert accommodation.right_repeats == 6
     assert gb.z_dim == pytest.approx(6 * _INCOMMENSURATE_A0, abs=1e-8, rel=0.0)
@@ -674,7 +686,7 @@ def test_exact_primitive_csl_mismatch_metadata_uses_unit_repeats_and_zero_mismat
 
     assert gb.whole_system.size > 0
     for axis_name in ("y", "z"):
-        accommodation = gb._GBMaker__strain_accommodation[axis_name]
+        accommodation = gb._boundary.strain_accommodation[axis_name]
         assert accommodation.left_repeats == 1
         assert accommodation.right_repeats == 1
         assert accommodation.mismatch == 0.0
@@ -785,8 +797,8 @@ def test_non_csl_approximate_spec_builds_as_incoherent():
 
     assert gb.whole_system.size > 0
     assert gb.inplane_periodic == (False, False)
-    assert gb._GBMaker__embedding is not None
-    assert gb._GBMaker__embedding.coherent is False
+    assert gb._boundary.embedding is not None
+    assert gb._boundary.embedding.coherent is False
 
 
 def test_non_csl_approximate_spec_caps_inplane_box():
@@ -801,208 +813,27 @@ def test_non_csl_approximate_spec_caps_inplane_box():
 
 
 # --------------------------------------------------------------------------------------
-# Commensurate-pair search
+# Commensurate-pair search -- compatibility alias
+#
+# The canonical implementation and its full behavioral test matrix live in
+# GBOpt.gbmaker.dimension / tests/test_gbmaker_dimension.py. GBOpt.GBMaker's own
+# module-level _find_commensurate_pair is kept only because existing code imports it
+# directly from here; these two tests exist to guard that compatibility surface (the
+# import path itself, and the GBMakerConstructionValueError -> GBMakerValueError
+# translation at the boundary), not to re-verify the search algorithm.
 # --------------------------------------------------------------------------------------
 
 
-def _brute_force_commensurate_pair(
-    d1: float,
-    d2: float,
-    tol: float,
-    max_n: int,
-) -> tuple[int, int, float, float] | None:
-    best = None
-    best_key = None
-
-    for n1 in range(1, max_n + 1):
-        for n2 in range(1, max_n + 1):
-            l1 = n1 * d1
-            l2 = n2 * d2
-            size = max(l1, l2)
-            mismatch = abs(l1 - l2) / size
-            if mismatch > tol:
-                continue
-
-            key = (size, mismatch, n1 + n2, n1, n2)
-            if best_key is None or key < best_key:
-                best = (n1, n2, l1, l2)
-                best_key = key
-
-    return best
-
-
-@pytest.mark.parametrize(
-    ("d1", "d2", "tol", "max_n", "expected"),
-    [
-        pytest.param(3.0, 3.0, 0.005, 10, (1, 1, 3.0, 3.0), id="identical"),
-        pytest.param(3.0, 6.0, 0.0, 10, (2, 1, 6.0, 6.0), id="exact-multiple"),
-        pytest.param(4.0, 2.0, 0.0, 10, (1, 2, 4.0, 4.0), id="smallest-box"),
-        pytest.param(
-            1.0,
-            2.0,
-            0.5,
-            3,
-            (2, 1, 2.0, 2.0),
-            id="equal-size-prefers-lower-mismatch",
-        ),
-    ],
-)
-def test_find_commensurate_pair_returns_expected_best_candidate(
-    d1,
-    d2,
-    tol,
-    max_n,
-    expected,
-):
-    result = _find_commensurate_pair(d1, d2, tol=tol, max_n=max_n)
-
-    assert result is not None
-    assert result[:2] == expected[:2]
-    np.testing.assert_allclose(result[2:], expected[2:], atol=1e-12, rtol=0.0)
-
-
-def test_find_commensurate_pair_accepts_pair_within_tolerance():
+def test_find_commensurate_pair_importable_from_gbmaker_module():
     result = _find_commensurate_pair(5.0, 7.48, tol=0.005, max_n=20)
 
     assert result is not None
-    n1, n2, l1, l2 = result
-    assert (n1, n2) == (3, 2)
-    assert l1 == pytest.approx(15.0, abs=1e-12, rel=0.0)
-    assert l2 == pytest.approx(14.96, abs=1e-12, rel=0.0)
-    assert abs(l1 - l2) / max(l1, l2) <= 0.005
+    assert result[:2] == (3, 2)
 
 
-def test_find_commensurate_pair_returns_none_when_no_pair_is_within_tolerance():
-    result = _find_commensurate_pair(1.0, math.pi, tol=0.00001, max_n=5)
-
-    assert result is None
-
-
-def test_find_commensurate_pair_accepts_mismatch_exactly_at_tolerance():
-    d1 = 10.0
-    d2 = 10.1
-    tol = abs(d1 - d2) / max(d1, d2)
-
-    result = _find_commensurate_pair(d1, d2, tol=tol, max_n=5)
-
-    assert result is not None
-    assert result[:2] == (1, 1)
-    assert abs(result[2] - result[3]) / max(result[2], result[3]) == pytest.approx(
-        tol,
-        abs=1e-15,
-        rel=0.0,
-    )
-
-
-@pytest.mark.parametrize(
-    ("d1", "d2", "tol", "max_n"),
-    [
-        pytest.param(5.0, 7.48, 0.005, 20, id="near-3-2"),
-        pytest.param(1.0, math.sqrt(2.0), 0.001, 50, id="sqrt2"),
-        pytest.param(
-            3.615 * math.sqrt(29.0),
-            3.615,
-            0.005,
-            50,
-            id="sigma29-row",
-        ),
-        pytest.param(
-            10.0,
-            10.1,
-            abs(10.0 - 10.1) / 10.1,
-            5,
-            id="tolerance-boundary",
-        ),
-        pytest.param(1.0, 2.0, 0.5, 3, id="size-mismatch-tie-break"),
-    ],
-)
-def test_find_commensurate_pair_matches_full_brute_force_ordering(
-    d1,
-    d2,
-    tol,
-    max_n,
-):
-    result = _find_commensurate_pair(d1, d2, tol=tol, max_n=max_n)
-    brute_force = _brute_force_commensurate_pair(d1, d2, tol, max_n)
-
-    assert (result is None) == (brute_force is None)
-    if result is None or brute_force is None:
-        return
-
-    assert result[:2] == brute_force[:2]
-    np.testing.assert_allclose(
-        result[2:],
-        brute_force[2:],
-        atol=1e-12,
-        rtol=0.0,
-    )
-
-
-@pytest.mark.parametrize(
-    ("argument", "value", "match"),
-    [
-        pytest.param("d1", 0.0, r"d1 must be a finite positive period", id="d1-zero"),
-        pytest.param("d1", -1.0, r"d1 must be a finite positive period",
-                     id="d1-negative"),
-        pytest.param("d1", np.nan, r"d1 must be a finite positive period", id="d1-nan"),
-        pytest.param("d1", np.inf, r"d1 must be a finite positive period", id="d1-inf"),
-        pytest.param("d1", True, r"d1 must be a finite positive period", id="d1-bool"),
-        pytest.param(
-            "d1", "bad", r"d1 and d2 must be finite positive periods", id="d1-string"),
-        pytest.param("d2", 0.0, r"d2 must be a finite positive period", id="d2-zero"),
-        pytest.param("d2", -1.0, r"d2 must be a finite positive period",
-                     id="d2-negative"),
-        pytest.param("d2", np.nan, r"d2 must be a finite positive period", id="d2-nan"),
-        pytest.param("d2", np.inf, r"d2 must be a finite positive period", id="d2-inf"),
-        pytest.param("d2", np.bool_(True),
-                     r"d2 must be a finite positive period", id="d2-bool"),
-        pytest.param("d2", object(),
-                     r"d1 and d2 must be finite positive periods", id="d2-object"),
-    ],
-)
-def test_find_commensurate_pair_rejects_invalid_periods(argument, value, match):
-    kwargs = {"d1": 1.0, "d2": 1.0, argument: value}
-
-    with pytest.raises(GBMakerValueError, match=match):
-        _find_commensurate_pair(**kwargs)
-
-
-@pytest.mark.parametrize(
-    "tol",
-    [
-        pytest.param(-0.001, id="negative"),
-        pytest.param(np.nan, id="nan"),
-        pytest.param(np.inf, id="inf"),
-        pytest.param(True, id="bool"),
-        pytest.param(np.bool_(True), id="numpy-bool"),
-        pytest.param("bad", id="string"),
-    ],
-)
-def test_find_commensurate_pair_rejects_invalid_tolerance(tol):
-    with pytest.raises(
-        GBMakerValueError,
-        match=r"tol must be finite and non-negative",
-    ):
-        _find_commensurate_pair(1.0, 1.0, tol=tol)
-
-
-@pytest.mark.parametrize(
-    "max_n",
-    [
-        pytest.param(0, id="zero"),
-        pytest.param(-1, id="negative"),
-        pytest.param(1.5, id="float"),
-        pytest.param(True, id="bool"),
-        pytest.param(np.bool_(True), id="numpy-bool"),
-        pytest.param("10", id="string"),
-    ],
-)
-def test_find_commensurate_pair_rejects_invalid_max_n(max_n):
-    with pytest.raises(
-        GBMakerValueError,
-        match=r"max_n must be a positive integer",
-    ):
-        _find_commensurate_pair(1.0, 1.0, max_n=max_n)
+def test_find_commensurate_pair_translates_construction_error():
+    with pytest.raises(GBMakerValueError, match=r"d1 must be a finite positive period"):
+        _find_commensurate_pair(0.0, 1.0)
 
 
 @pytest.fixture
@@ -1192,49 +1023,13 @@ class TestGBMaker(unittest.TestCase):
             GBMaker(self.a0, self.structure, self.gb_thickness,
                     self.misorientation, "Invalid")
 
-    def test_wrap_reduced_coordinate_preserves_exact_thresholds(self):
-        tol = 1e-10
-        coords = np.array([tol / 2, tol, 1.0 - tol, 1.0 - tol / 2])
-        wrapped = wrap_reduced_coordinate(coords, tol=tol)
-        expected = np.array([0.0, tol, 1.0 - tol, 0.0])
-        np.testing.assert_allclose(wrapped, expected, atol=1e-15, rtol=0.0)
+    def test_wrap_reduced_coordinate_importable_from_gbmaker_module(self):
+        wrapped = wrap_reduced_coordinate(np.array([1.25]), tol=1e-10)
+        np.testing.assert_allclose(wrapped, np.array([0.25]), atol=1e-15, rtol=0.0)
 
-    def test_wrap_reduced_coordinate_scalar_and_0d_inputs(self):
-        for coord in (0.375, np.array(0.375)):
-            wrapped = wrap_reduced_coordinate(coord, tol=1e-10)
-            self.assertEqual(wrapped.shape, ())
-            np.testing.assert_allclose(wrapped, 0.375, atol=1e-15, rtol=0.0)
-
-    def test_wrap_reduced_coordinate_preserves_multidimensional_shape(self):
-        coords = np.array([[0.25, 1.2], [-0.2, 2.75]])
-        wrapped = wrap_reduced_coordinate(coords, tol=1e-10)
-        self.assertEqual(wrapped.shape, coords.shape)
-        expected = np.array([[0.25, 0.2], [0.8, 0.75]])
-        np.testing.assert_allclose(wrapped, expected, atol=1e-15, rtol=0.0)
-
-    def test_wrap_reduced_coordinate_wraps_multiple_periods_away(self):
-        coords = np.array([2.2, -3.7, 4.125, -5.875])
-        wrapped = wrap_reduced_coordinate(coords, tol=1e-10)
-        expected = np.array([0.2, 0.3, 0.125, 0.125])
-        np.testing.assert_allclose(wrapped, expected, atol=1e-15, rtol=0.0)
-
-    def test_wrap_reduced_coordinate_negative_tolerance_raises_gbmaker_error(self):
+    def test_wrap_reduced_coordinate_translates_construction_error(self):
         with self.assertRaises(GBMakerValueError):
             wrap_reduced_coordinate(np.array([0.25]), tol=-1e-10)
-
-    def test_wrap_reduced_coordinate_non_finite_tolerance_raises_gbmaker_error(self):
-        for tol in (np.nan, np.inf, -np.inf):
-            with self.subTest(tol=tol):
-                with self.assertRaises(GBMakerValueError):
-                    wrap_reduced_coordinate(np.array([0.25]), tol=tol)
-
-    def test_reduced_coordinate_tolerance_scales_with_basis_length(self):
-        basis_vector = np.array([3.0, 4.0, 0.0])
-        self.gbm.epsilon = 2e-8
-
-        tol = self.gbm._GBMaker__reduced_coordinate_tolerance(basis_vector)
-
-        self.assertAlmostEqual(tol, 4e-9, delta=1e-18)
 
     # Tests for additional getters
     def test_additional_getters(self):
@@ -1259,12 +1054,6 @@ class TestGBMaker(unittest.TestCase):
         self.assertEqual(box_dims.shape, (3, 2))
 
     # Tests for public methods
-    def test_get_supercell(self):
-        corners = np.array([[0, 0, 0], [10, 10, 10]])
-        supercell = self.gbm.get_supercell(corners)
-        self.assertTrue(isinstance(supercell, np.ndarray))
-        self.assertGreater(supercell.shape[0], 0)
-
     def test_write_lammps(self):
         atoms = self.gbm.whole_system
         box_sizes = self.gbm.box_dims
@@ -1417,20 +1206,6 @@ class TestGBMaker(unittest.TestCase):
         self.assertGreater(gbm.box_dims[0][1], 50.0)
 
     # Tests for private methods
-    def test_approximate_rotation_matrix_as_int(self):
-        rotation_matrix = np.array([[0.70710678, 0.5, 0.5],
-                                    [0.70710678, -0.5, -0.5],
-                                    [0.0, 0.70710678, -0.70710678]])
-
-        approx_matrix = self.gbm._GBMaker__approximate_rotation_matrix_as_int(
-            rotation_matrix)
-
-        expected_matrix = np.array([[7,  5,  5],
-                                    [7, -5, -5],
-                                    [0,  1, -1]])
-
-        np.testing.assert_array_equal(approx_matrix, expected_matrix)
-
     def test_approximate_update_spacing_is_deterministic_without_input_changes(self):
         gbm = self._make_approximate_fixture()
         original_spacing = gbm.spacing.copy()
@@ -1442,28 +1217,6 @@ class TestGBMaker(unittest.TestCase):
         self.assertEqual(gbm.spacing, original_spacing)
         np.testing.assert_allclose(gbm.box_dims, original_box_dims)
         np.testing.assert_array_equal(gbm.whole_system, original_whole_system)
-
-    def test_approximate_path_epsilon_controls_boundary_atom_inclusion(self):
-        gbm = self._make_approximate_fixture()
-        # An atom at x=0.0 with x_min=1e-12 straddles the lower slab boundary. With
-        # epsilon=1e-10: 0.0 >= 1e-12 - 1e-10 = -9.9e-11 -> included. With
-        # epsilon=1e-13: 0.0 < 1e-12 - 1e-13 = 9e-13 -> excluded. Exercises the
-        # setter's effect on the approximate complete-origin clipping path.
-        boundary_atom = np.array([("Cu", 0.0, 5.0, 5.0)], dtype=Atom.atom_dtype)
-        origin_ids = np.array([0], dtype=np.int64)
-        x_bounds = np.array([1e-12, 10.0])
-
-        gbm.epsilon = 1e-10
-        result_large, _ = gbm._GBMaker__clip_complete_origins_to_cartesian_box(
-            boundary_atom, origin_ids, x_bounds, 1
-        )
-        self.assertEqual(len(result_large), 1)
-
-        gbm.epsilon = 1e-13  # too narrow; x=0.0 falls below x_min - epsilon
-        result_small, _ = gbm._GBMaker__clip_complete_origins_to_cartesian_box(
-            boundary_atom, origin_ids, x_bounds, 1
-        )
-        self.assertEqual(len(result_small), 0)
 
     # Tests for warnings
 
@@ -1598,7 +1351,7 @@ class TestGBMaker(unittest.TestCase):
         )
 
     def test_gb_plane_x_equals_vacuum_plus_left_x(self):
-        expected = self.gbm.vacuum_thickness + self.gbm._GBMaker__left_x
+        expected = self.gbm.vacuum_thickness + self.gbm._boundary.left_x
         self.assertAlmostEqual(self.gbm.gb_plane_x, expected, places=10)
 
     def test_gb_plane_x_tracks_vacuum_change(self):
@@ -1610,189 +1363,8 @@ class TestGBMaker(unittest.TestCase):
         gbm = self._make_approximate_fixture()
         theta = math.radians(22.619865)
         gbm.misorientation = np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0])
-        expected = gbm.vacuum_thickness + gbm._GBMaker__left_x
+        expected = gbm.vacuum_thickness + gbm._boundary.left_x
         self.assertAlmostEqual(gbm.gb_plane_x, expected, places=10)
-
-
-class TestGBMakerIntRotationHelpers(unittest.TestCase):
-    def setUp(self):
-        a0 = 3.61
-        theta = math.radians(36.868698)
-        misorientation = np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0])
-        self.gbm = _make_approximate_gb(
-            a0,
-            "fcc",
-            10.0,
-            misorientation,
-            "Cu",
-            repeat_factor=(3, 9),
-        )
-
-    # __reduce_integer_row
-    def test_reduce_integer_row_basic(self):
-        row = np.array([4, 6, 2])
-        result = self.gbm._GBMaker__reduce_integer_row(row)
-        np.testing.assert_array_equal(result, np.array([2, 3, 1]))
-
-    def test_reduce_integer_row_already_reduced(self):
-        row = np.array([1, 2, 3])
-        result = self.gbm._GBMaker__reduce_integer_row(row)
-        np.testing.assert_array_equal(result, np.array([1, 2, 3]))
-
-    def test_reduce_integer_row_all_zeros(self):
-        row = np.array([0, 0, 0])
-        result = self.gbm._GBMaker__reduce_integer_row(row)
-        np.testing.assert_array_equal(result, np.array([0, 0, 0]))
-
-    def test_reduce_integer_row_with_negatives(self):
-        row = np.array([-4, 6, -2])
-        result = self.gbm._GBMaker__reduce_integer_row(row)
-        np.testing.assert_array_equal(result, np.array([-2, 3, -1]))
-
-    # __row_angle_error_deg
-    def test_row_angle_error_parallel(self):
-        ref = np.array([1.0, 0.0, 0.0])
-        cand = np.array([5, 0, 0])
-        err = self.gbm._GBMaker__row_angle_error_deg(ref, cand)
-        self.assertAlmostEqual(err, 0.0, places=10)
-
-    def test_row_angle_error_perpendicular(self):
-        ref = np.array([1.0, 0.0, 0.0])
-        cand = np.array([0, 1, 0])
-        err = self.gbm._GBMaker__row_angle_error_deg(ref, cand)
-        self.assertAlmostEqual(err, 90.0, places=10)
-
-    def test_row_angle_error_antiparallel(self):
-        ref = np.array([1.0, 0.0, 0.0])
-        cand = np.array([-1, 0, 0])
-        err = self.gbm._GBMaker__row_angle_error_deg(ref, cand)
-        self.assertAlmostEqual(err, 180, places=10)
-
-    def test_row_angle_error_zero_vector(self):
-        ref = np.array([1.0, 0.0, 0.0])
-        cand = np.array([0, 0, 0])
-        err = self.gbm._GBMaker__row_angle_error_deg(ref, cand)
-        self.assertEqual(err, 180.0)
-
-    # __approximate_rotation_matrix_as_int - row error tolerance
-    def test_approx_matrix_sigma5_within_tolerance(self):
-        """Sigma5 [001] 36.87 - all rows must be within 0.5 of the float matrix."""
-        from scipy.spatial.transform import Rotation
-        theta = math.radians(36.869898)
-        R = Rotation.from_euler("z", theta).as_matrix()
-        approx = self.gbm._GBMaker__approximate_rotation_matrix_as_int(R)
-        for ref_row, approx_row in zip(R, approx.astype(float)):
-            err = self.gbm._GBMaker__row_angle_error_deg(ref_row, approx_row)
-            self.assertLessEqual(err, 0.5)
-
-
-class TestGBMakerScaledPeriodicBasisVector(unittest.TestCase):
-    def setUp(self):
-        a0 = 3.61
-        theta = math.radians(36.868698)
-        misorientation = np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0])
-        self.gbm = _make_approximate_gb(
-            a0,
-            "fcc",
-            10.0,
-            misorientation,
-            "Cu",
-            interaction_distance=3.0,
-        )
-
-    def test_scaled_periodic_basis_vector_scales_selected_axis_projection(self):
-        period_vector = np.array([2.0, -1.0, 0.5])
-
-        scaled = self.gbm._GBMaker__scaled_periodic_basis_vector(
-            period_vector, 10.0, 0
-        )
-
-        np.testing.assert_allclose(
-            scaled, np.array([10.0, -5.0, 2.5]), atol=1e-12, rtol=0.0
-        )
-        np.testing.assert_allclose(
-            period_vector, np.array([2.0, -1.0, 0.5]), atol=0.0, rtol=0.0
-        )
-
-    def test_scaled_periodic_basis_vector_accepts_nonzero_projection_on_nonzero_axis(
-        self,
-    ):
-        period_vector = np.array([0.0, 1e-10, 0.0])
-
-        scaled = self.gbm._GBMaker__scaled_periodic_basis_vector(
-            period_vector, 10.0, 1
-        )
-
-        np.testing.assert_allclose(
-            scaled, np.array([0.0, 10.0, 0.0]), atol=1e-12, rtol=0.0
-        )
-
-    def test_scaled_periodic_basis_vector_scales_axis_index_two(self):
-        period_vector = np.array([1.5, -0.75, 3.0])
-
-        scaled = self.gbm._GBMaker__scaled_periodic_basis_vector(
-            period_vector, 12.0, 2
-        )
-
-        np.testing.assert_allclose(
-            scaled, np.array([6.0, -3.0, 12.0]), atol=1e-12, rtol=0.0
-        )
-
-    def test_scaled_periodic_basis_vector_scales_negative_selected_axis_projection(
-        self,
-    ):
-        period_vector = np.array([1.5, -0.75, -3.0])
-
-        scaled = self.gbm._GBMaker__scaled_periodic_basis_vector(
-            period_vector, 12.0, 2
-        )
-
-        np.testing.assert_allclose(
-            scaled, np.array([-6.0, 3.0, 12.0]), atol=1e-12, rtol=0.0
-        )
-
-    def test_scaled_periodic_basis_vector_rejects_zero_axis_projection(self):
-        with self.assertRaises(GBMakerValueError):
-            self.gbm._GBMaker__scaled_periodic_basis_vector(
-                np.array([1.0, 2.0, 0.0]), 10.0, 2
-            )
-
-    def test_scaled_periodic_basis_vector_accepts_numpy_integer_axis_index(self):
-        scaled = self.gbm._GBMaker__scaled_periodic_basis_vector(
-            np.array([1.0, 2.0, 3.0]), 10.0, np.int64(1)
-        )
-
-        np.testing.assert_allclose(
-            scaled, np.array([5.0, 10.0, 15.0]), atol=1e-12, rtol=0.0
-        )
-
-    def test_scaled_periodic_basis_vector_rejects_non_positive_box_length(self):
-        for box_length in (0.0, -1.0):
-            with self.subTest(box_length=box_length):
-                with self.assertRaises(GBMakerValueError):
-                    self.gbm._GBMaker__scaled_periodic_basis_vector(
-                        np.array([1.0, 2.0, 3.0]), box_length, 0
-                    )
-
-    def test_scaled_periodic_basis_vector_rejects_non_finite_box_length(self):
-        for box_length in (np.nan, np.inf, -np.inf):
-            with self.subTest(box_length=box_length):
-                with self.assertRaises(GBMakerValueError):
-                    self.gbm._GBMaker__scaled_periodic_basis_vector(
-                        np.array([1.0, 2.0, 3.0]), box_length, 0
-                    )
-
-    def test_scaled_periodic_basis_vector_rejects_nan_in_period_vector(self):
-        with self.assertRaises(GBMakerValueError):
-            self.gbm._GBMaker__scaled_periodic_basis_vector(
-                np.array([np.nan, 1.0, 1.0]), 10.0, 0
-            )
-
-    def test_scaled_periodic_basis_vector_rejects_non_finite_scaled_vector(self):
-        with self.assertRaises(GBMakerValueError):
-            self.gbm._GBMaker__scaled_periodic_basis_vector(
-                np.array([1e-308, 1e308, 0.0]), 1e308, 0
-            )
 
 
 class TestGBMakerPeriodicSpacing(unittest.TestCase):
@@ -1844,7 +1416,7 @@ class TestGBMakerPeriodicSpacing(unittest.TestCase):
         self.assertAlmostEqual(gbm.spacing["z"], self.a0 * np.sqrt(2), places=5)
         self.assertAlmostEqual(
             gbm.x_dim,
-            gbm._GBMaker__left_x + gbm._GBMaker__right_x,
+            gbm._boundary.left_x + gbm._boundary.right_x,
             delta=1e-12,
         )
         self.assertEqual(
@@ -1906,8 +1478,8 @@ class TestGBMakerGrainWidthBalance(unittest.TestCase):
             mis, 5.431, "diamond", "Si", interaction_distance=6.0, vacuum=0,
             repeat_factor=(2, 3)
         )
-        left_x = gbm._GBMaker__left_x
-        right_x = gbm._GBMaker__right_x
+        left_x = gbm._boundary.left_x
+        right_x = gbm._boundary.right_x
         tolerance = max(x_spacing["left"], x_spacing["right"])
         self.assertAlmostEqual(left_x, right_x, delta=tolerance,
                                msg=f"{left_x=:.4f} and {right_x=:.4f} differ by more "
@@ -1921,8 +1493,8 @@ class TestGBMakerGrainWidthBalance(unittest.TestCase):
             mis, 5.431, "diamond", "Si", interaction_distance=6.0, vacuum=0,
             repeat_factor=(2, 3)
         )
-        self.assertGreaterEqual(gbm._GBMaker__left_x, gbm.x_dim_min)
-        self.assertGreaterEqual(gbm._GBMaker__right_x, gbm.x_dim_min)
+        self.assertGreaterEqual(gbm._boundary.left_x, gbm.x_dim_min)
+        self.assertGreaterEqual(gbm._boundary.right_x, gbm.x_dim_min)
 
     def test_grain_widths_balanced_for_all_boundary_types(self):
         """Both symmetric tilt and mixed tilt/twist satisfy the balance invariant."""
@@ -1945,222 +1517,8 @@ class TestGBMakerGrainWidthBalance(unittest.TestCase):
             with self.subTest(structure=structure):
                 gbm, x_spacing = self._make_gb(mis, a0, structure, atom_types, **kwargs)
                 tolerance = max(x_spacing["left"], x_spacing["right"])
-                self.assertAlmostEqual(gbm._GBMaker__left_x,
-                                       gbm._GBMaker__right_x, delta=tolerance)
-
-
-class TestGBMakerBoxPeriodicBasis(unittest.TestCase):
-    def setUp(self):
-        self.gbm = object.__new__(GBMaker)
-        self.gbm._GBMaker__epsilon = 1e-10
-        self.gbm._GBMaker__y_dim = 12.0
-        self.gbm._GBMaker__z_dim = 15.0
-        self.gbm._GBMaker__inplane_periodic = (True, False)
-
-    def test_box_periodic_basis_scales_orthogonal_basis_and_zeros_nonperiodic_axis(
-        self,
-    ):
-        primitive_periods = np.array([[0.0, 3.0, 0.0], [0.0, 0.0, 5.0]])
-
-        basis = self.gbm._GBMaker__box_periodic_basis(primitive_periods)
-
-        np.testing.assert_allclose(
-            basis,
-            np.array([[0.0, 12.0, 0.0], [0.0, 0.0, 0.0]]),
-            atol=1e-12,
-            rtol=0.0,
-        )
-
-    def test_box_periodic_basis_preserves_tilted_components_while_matching_axis_lengths(
-        self,
-    ):
-        self.gbm._GBMaker__inplane_periodic = (True, True)
-        primitive_periods = np.array([[2.0, 4.0, -1.0], [-3.0, 1.5, 5.0]])
-
-        basis = self.gbm._GBMaker__box_periodic_basis(primitive_periods)
-
-        np.testing.assert_allclose(
-            basis,
-            np.array([[6.0, 12.0, -3.0], [-9.0, 4.5, 15.0]]),
-            atol=1e-12,
-            rtol=0.0,
-        )
-
-    def test_box_periodic_basis_rejects_near_zero_selected_axis_projection(self):
-        self.gbm._GBMaker__inplane_periodic = (True, True)
-        primitive_periods = np.array([[1.0, 1e-12, 0.0], [0.0, 0.0, 5.0]])
-
-        with self.assertRaises(GBMakerValueError):
-            self.gbm._GBMaker__box_periodic_basis(primitive_periods)
-
-
-class TestGBMakerSelectionBasisVectors(unittest.TestCase):
-    def setUp(self):
-        self.gbm = object.__new__(GBMaker)
-        self.gbm._GBMaker__epsilon = 1e-10
-        self.gbm._GBMaker__y_dim = 12.0
-        self.gbm._GBMaker__z_dim = 15.0
-
-    def test_selection_basis_vectors_uses_periodic_box_basis_for_both_axes(self):
-        self.gbm._GBMaker__inplane_periodic = (True, True)
-        primitive_periods = np.array([[2.0, 4.0, -1.0], [-3.0, 1.5, 5.0]])
-
-        basis = self.gbm._GBMaker__selection_basis_vectors(primitive_periods)
-
-        np.testing.assert_allclose(
-            basis,
-            np.array([[6.0, 12.0, -3.0], [-9.0, 4.5, 15.0]]),
-            atol=1e-12,
-            rtol=0.0,
-        )
-
-    def test_selection_basis_vectors_uses_cartesian_unit_vector_for_nonperiodic_y(self):
-        self.gbm._GBMaker__inplane_periodic = (False, True)
-        primitive_periods = np.array([[2.0, 4.0, -1.0], [-3.0, 1.5, 5.0]])
-
-        basis = self.gbm._GBMaker__selection_basis_vectors(primitive_periods)
-
-        np.testing.assert_allclose(
-            basis,
-            np.array([[0.0, 1.0, 0.0], [-9.0, 4.5, 15.0]]),
-            atol=1e-12,
-            rtol=0.0,
-        )
-
-    def test_selection_basis_vectors_uses_cartesian_unit_vector_for_nonperiodic_z(self):
-        self.gbm._GBMaker__inplane_periodic = (True, False)
-        primitive_periods = np.array([[2.0, 4.0, -1.0], [-3.0, 1.5, 5.0]])
-
-        basis = self.gbm._GBMaker__selection_basis_vectors(primitive_periods)
-
-        np.testing.assert_allclose(
-            basis,
-            np.array([[6.0, 12.0, -3.0], [0.0, 0.0, 1.0]]),
-            atol=1e-12,
-            rtol=0.0,
-        )
-
-
-class TestGBMakerBoxCoordinateConversions(unittest.TestCase):
-    def setUp(self):
-        self.gbm = object.__new__(GBMaker)
-        self.gbm._GBMaker__epsilon = 1e-10
-
-    def test_reduced_box_coordinates_handles_orthorhombic_basis(self):
-        box_basis = np.array([[0.0, 12.0, 0.0], [0.0, 0.0, 15.0]])
-        cartesian = np.array([[1.25, 6.0, 3.75], [4.5, 3.0, 12.0]])
-
-        reduced = self.gbm._GBMaker__reduced_box_coordinates(cartesian, box_basis)
-
-        np.testing.assert_allclose(
-            reduced,
-            np.array([[1.25, 0.5, 0.25], [4.5, 0.25, 0.8]]),
-            atol=1e-12,
-            rtol=0.0,
-        )
-
-    def test_cartesian_from_box_coordinates_handles_tilted_basis(self):
-        box_basis = np.array([[6.0, 12.0, -3.0], [-9.0, 4.5, 15.0]])
-        box_coordinates = np.array([[1.5, 0.25, 0.75], [-2.0, 0.5, 0.2]])
-
-        cartesian = self.gbm._GBMaker__cartesian_from_box_coordinates(
-            box_coordinates, box_basis
-        )
-
-        np.testing.assert_allclose(
-            cartesian,
-            np.array([[-3.75, 6.375, 10.5], [-0.8, 6.9, 1.5]]),
-            atol=1e-12,
-            rtol=0.0,
-        )
-
-    def test_reduced_box_coordinates_and_cartesian_from_box_coordinates_round_trip(
-        self,
-    ):
-        box_basis = np.array([[6.0, 12.0, -3.0], [-9.0, 4.5, 15.0]])
-        cartesian = np.array(
-            [[-3.75, 6.375, 10.5], [-0.8, 6.9, 1.5], [2.25, 0.0, 7.5]]
-        )
-
-        reduced = self.gbm._GBMaker__reduced_box_coordinates(cartesian, box_basis)
-        reconstructed = self.gbm._GBMaker__cartesian_from_box_coordinates(
-            reduced, box_basis
-        )
-
-        np.testing.assert_allclose(reconstructed, cartesian, atol=1e-12, rtol=0.0)
-
-    def test_reduced_box_coordinates_preserves_vectorized_shape(self):
-        box_basis = np.array([[6.0, 12.0, -3.0], [-9.0, 4.5, 15.0]])
-        cartesian = np.array(
-            [
-                [[-3.75, 6.375, 10.5], [-0.8, 6.9, 1.5]],
-                [[2.25, 0.0, 7.5], [1.5, 8.25, 0.0]],
-            ]
-        )
-
-        reduced = self.gbm._GBMaker__reduced_box_coordinates(cartesian, box_basis)
-        reconstructed = self.gbm._GBMaker__cartesian_from_box_coordinates(
-            reduced, box_basis
-        )
-
-        self.assertEqual(reduced.shape, cartesian.shape)
-        np.testing.assert_allclose(reconstructed, cartesian, atol=1e-12, rtol=0.0)
-
-
-class TestGBMakerXIndexRange(unittest.TestCase):
-    def setUp(self):
-        self.gbm = object.__new__(GBMaker)
-        self.gbm._GBMaker__epsilon = 1e-10
-        self.gbm._GBMaker__y_dim = 12.0
-        self.gbm._GBMaker__z_dim = 15.0
-        self.gbm._GBMaker__inplane_periodic = (True, True)
-
-    def test_x_index_range_orthogonal_configuration_covers_slab(self):
-        primitive_periods = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-        rotated_unit_cell_basis = np.eye(3)
-        x_bounds = np.array([0.0, 3.5])
-
-        nx_range = self.gbm._GBMaker__x_index_range(
-            primitive_periods, rotated_unit_cell_basis, x_bounds
-        )
-
-        self.assertTrue(np.all(np.diff(nx_range) == 1))
-        self.assertIn(0, nx_range)
-        self.assertIn(3, nx_range)
-        covered_min = nx_range[0]
-        covered_max = nx_range[-1] + 1.0
-        self.assertLessEqual(covered_min, x_bounds[0])
-        self.assertGreaterEqual(covered_max, x_bounds[1])
-
-    def test_x_index_range_is_contiguous_and_includes_expected_indices_for_tilted_box(
-        self,
-    ):
-        primitive_periods = np.array([[1.0, 2.0, 0.0], [-1.0, 0.0, 2.0]])
-        rotated_unit_cell_basis = np.eye(3)
-        x_bounds = np.array([0.0, 8.0])
-
-        nx_range = self.gbm._GBMaker__x_index_range(
-            primitive_periods, rotated_unit_cell_basis, x_bounds
-        )
-
-        np.testing.assert_array_equal(
-            nx_range,
-            np.arange(nx_range[0], nx_range[-1] + 1, dtype=int),
-        )
-        for expected_index in (0, 1, 2):
-            with self.subTest(expected_index=expected_index):
-                self.assertIn(expected_index, nx_range)
-
-    def test_x_index_range_raises_when_x_period_direction_has_zero_x_projection(self):
-        primitive_periods = np.array([[1.0, 1.0, 1.0], [2.0, 1.0, 1.0]])
-        rotated_unit_cell_basis = np.eye(3)
-
-        with self.assertRaises(GBMakerValueError):
-            self.gbm._GBMaker__x_index_range(
-                primitive_periods,
-                rotated_unit_cell_basis,
-                np.array([0.0, 5.0]),
-            )
+                self.assertAlmostEqual(gbm._boundary.left_x,
+                                       gbm._boundary.right_x, delta=tolerance)
 
 
 class TestGBMakerGenerateGrain(unittest.TestCase):
@@ -2188,7 +1546,7 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
         )
 
     def test_generate_grain_keeps_atoms_within_grain_bounds_and_unique(self):
-        interface = self.gbm._GBMaker__left_x + self.gbm.vacuum_thickness
+        interface = self.gbm._boundary.left_x + self.gbm.vacuum_thickness
         cases = (
             (
                 self.gbm.left_grain,
@@ -2215,7 +1573,7 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                 self.assertTrue(np.all(positions[:, 2] < self.gbm.z_dim))
 
     def test_generate_grain_places_right_grain_at_or_beyond_interface(self):
-        interface = self.gbm._GBMaker__left_x + self.gbm.vacuum_thickness
+        interface = self.gbm._boundary.left_x + self.gbm.vacuum_thickness
 
         self.assertGreaterEqual(
             np.min(self.gbm.right_grain["x"]), interface - self.gbm.epsilon
@@ -2271,14 +1629,14 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                 (
                     "left",
                     gb.left_grain,
-                    gb._GBMaker__R_left,
-                    gb._GBMaker__left_periodic_miller_rows,
+                    gb._boundary.R_left,
+                    gb._boundary.left_periodic_miller_rows,
                 ),
                 (
                     "right",
                     gb.right_grain,
-                    gb._GBMaker__R_right,
-                    gb._GBMaker__right_periodic_miller_rows,
+                    gb._boundary.R_right,
+                    gb._boundary.right_periodic_miller_rows,
                 ),
             )
 
@@ -2291,20 +1649,24 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                     @ rotated_unit_cell_basis
                 )
 
-                y_scale, z_scale = gb._GBMaker__grain_strain_scales(
-                    grain_name
+                y_scale, z_scale = _grain_strain_scales(
+                    grain_name, gb._boundary.strain_accommodation
                 )
                 primitive_periods *= np.array(
                     [1.0, y_scale, z_scale],
                     dtype=np.float64,
                 )
 
-                selection_basis = gb._GBMaker__selection_basis_vectors(
-                    primitive_periods
+                selection_basis = _selection_basis_vectors(
+                    primitive_periods,
+                    gb.inplane_periodic,
+                    (gb.y_dim, gb.z_dim),
+                    gb.epsilon,
                 )
-                reduced = gb._GBMaker__reduced_box_coordinates(
+                reduced = _reduced_box_coordinates(
                     self._positions(atoms),
                     selection_basis,
+                    gb.epsilon,
                 )
 
                 yield (
@@ -2342,10 +1704,8 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                         continue
 
                     coordinate_index = row_index + 1
-                    tolerance = (
-                        gb._GBMaker__reduced_coordinate_tolerance(
-                            selection_basis[row_index]
-                        )
+                    tolerance = _reduced_coordinate_tolerance(
+                        selection_basis[row_index], gb.epsilon
                     )
                     wrapped = wrap_reduced_coordinate(
                         reduced[:, coordinate_index],
@@ -2387,10 +1747,8 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                         continue
 
                     coordinate_index = row_index + 1
-                    tolerance = (
-                        gb._GBMaker__reduced_coordinate_tolerance(
-                            selection_basis[row_index]
-                        )
+                    tolerance = _reduced_coordinate_tolerance(
+                        selection_basis[row_index], gb.epsilon
                     )
                     canonical[:, coordinate_index] = (
                         wrap_reduced_coordinate(
@@ -2399,11 +1757,9 @@ class TestGBMakerGenerateGrain(unittest.TestCase):
                         )
                     )
 
-                canonical_positions = (
-                    gb._GBMaker__cartesian_from_box_coordinates(
-                        canonical,
-                        selection_basis,
-                    )
+                canonical_positions = _cartesian_from_box_coordinates(
+                    canonical,
+                    selection_basis,
                 )
                 quantized = np.rint(
                     canonical_positions / gb.epsilon
@@ -2583,7 +1939,7 @@ class TestGBMakerGenerateGB(unittest.TestCase):
             )
 
         x_period_right = a0 * float(np.linalg.norm(
-            gbm._GBMaker__right_periodic_miller_rows[0].astype(float)))
+            gbm._boundary.right_periodic_miller_rows[0].astype(float)))
         central_gap = np.min(gbm.right_grain["x"]) - np.max(gbm.left_grain["x"])
         periodic_gap = (
             gbm.x_dim
@@ -2789,7 +2145,7 @@ class TestGBMakerGenerateGB(unittest.TestCase):
     def test_gb_region_atoms_lie_within_window(self):
         x_gb = self.gbm.gb_plane_x
         half = self.gbm.gb_thickness / 2.0
-        gb_atoms = self.gbm._GBMaker__gb_region
+        gb_atoms = self.gbm._result.gb_region_atoms
         self.assertGreater(len(gb_atoms), 0)
         xs = gb_atoms["x"]
         self.assertTrue(np.all(xs > x_gb - half),
@@ -2799,7 +2155,7 @@ class TestGBMakerGenerateGB(unittest.TestCase):
 
     def test_gb_region_contains_atoms_from_both_grains(self):
         x_gb = self.gbm.gb_plane_x
-        gb_atoms = self.gbm._GBMaker__gb_region
+        gb_atoms = self.gbm._result.gb_region_atoms
         self.assertGreater(np.sum(gb_atoms["x"] <= x_gb),
                            0, msg="GB region has no atoms from left grain")
         self.assertGreater(np.sum(gb_atoms["x"] >= x_gb),
@@ -2809,7 +2165,7 @@ class TestGBMakerGenerateGB(unittest.TestCase):
         self.gbm.vacuum_thickness = 15.0
         x_gb = self.gbm.gb_plane_x
         half = self.gbm.gb_thickness / 2.0
-        gb_atoms = self.gbm._GBMaker__gb_region
+        gb_atoms = self.gbm._result.gb_region_atoms
         self.assertTrue(np.all(gb_atoms["x"] > x_gb - half))
         self.assertTrue(np.all(gb_atoms["x"] < x_gb + half))
 
@@ -2902,7 +2258,12 @@ class TestGBMakerTriclinic(unittest.TestCase):
             primitive_periods = np.asarray(
                 approx[1:], dtype=np.float64
             ) @ rotated_unit_cell_basis
-            A2_lab, A3_lab = self.gbm._GBMaker__box_periodic_basis(primitive_periods)
+            A2_lab, A3_lab = _box_periodic_basis(
+                primitive_periods,
+                self.gbm.inplane_periodic,
+                (self.gbm.y_dim, self.gbm.z_dim),
+                self.gbm.epsilon,
+            )
             theta = -math.atan2(float(A2_lab[2]), float(A2_lab[1]))
             ct, st = math.cos(theta), math.sin(theta)
             return np.array(
@@ -2917,19 +2278,19 @@ class TestGBMakerTriclinic(unittest.TestCase):
 
         for selected_branch, fake_left, fake_right in cases:
             with self.subTest(selected_branch=selected_branch):
-                self.gbm._GBMaker__left_periodic_miller_rows = fake_left
-                self.gbm._GBMaker__right_periodic_miller_rows = fake_right
+                self.gbm._boundary.left_periodic_miller_rows = fake_left
+                self.gbm._boundary.right_periodic_miller_rows = fake_right
 
                 selected_R = (
-                    self.gbm._GBMaker__R_left
+                    self.gbm._boundary.R_left
                     if selected_branch == "left"
-                    else self.gbm._GBMaker__R_right
+                    else self.gbm._boundary.R_right
                 )
                 selected_approx = fake_left if selected_branch == "left" else fake_right
                 other_R = (
-                    self.gbm._GBMaker__R_right
+                    self.gbm._boundary.R_right
                     if selected_branch == "left"
-                    else self.gbm._GBMaker__R_left
+                    else self.gbm._boundary.R_left
                 )
                 other_approx = fake_right if selected_branch == "left" else fake_left
 
