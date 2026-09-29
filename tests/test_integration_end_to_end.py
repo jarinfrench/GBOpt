@@ -22,6 +22,7 @@ unrelated fixtures' incidental vacuum values.
 
 from __future__ import annotations
 
+import logging
 import math
 
 import numpy as np
@@ -33,6 +34,7 @@ from GBOpt.CandidateLoader import CandidateLoader
 from GBOpt.GBManipulator import GBManipulator
 from GBOpt.GBMaker import GBMaker
 from GBOpt.GrainOwnership import LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL, GrainOwnership
+from GBOpt.observability import CompositeEventSink, JsonlEventSink, LoggingEventSink
 from GBOpt.optimization.genetic import GeneticAlgorithmMinimizer
 from GBOpt.optimization.monte_carlo import MonteCarloMinimizer
 
@@ -199,3 +201,72 @@ def test_end_to_end_owned_ga_optimize_periodic(tmp_path) -> None:
 
     assert len(minimizer.history) == 2
     assert len(minimizer.history[-1]) > 0
+
+
+def test_simultaneous_logging_journal_checkpoint_does_not_change_numerical_history(
+    tmp_path,
+) -> None:
+    """Enabling logging + a JSONL journal + checkpointing together is numerically inert.
+
+    Runs the same fixed-seed MC sequence twice: once with only checkpointing enabled
+    (the baseline every other test in this suite already exercises implicitly), once
+    with a `LoggingEventSink` and a `JsonlEventSink` also wired in through a
+    `CompositeEventSink`. Only the energy history is compared -- per
+    `GBOpt.observability`'s own contract, logging/journaling are observers of already-
+    decided optimizer state, never inputs to it, so wiring them in must not perturb the
+    accept/reject sequence a fixed seed produces.
+    """
+    gb = _build_gb(vacuum=0.0)
+
+    def make_energy_func():
+        count = 0
+
+        def energy_func(GB, manipulator, atom_positions, unique_id):
+            nonlocal count
+            count += 1
+            path = tmp_path / f"{unique_id}_{count}.data"
+            GB.write_lammps(str(path), atom_positions, manipulator.parents[0].box_dims)
+            return 2.0 - count * 0.001, str(path)
+
+        return energy_func
+
+    baseline = MonteCarloMinimizer(
+        gb, make_energy_func(), ["translate_right_grain"], seed=7
+    )
+    baseline.run_MC(
+        max_steps=4,
+        unique_id=1,
+        checkpoint_file=str(tmp_path / "baseline_checkpoint.json"),
+    )
+
+    journal_path = tmp_path / "run.jsonl"
+    logger = logging.getLogger("test_simultaneous_sinks")
+    with JsonlEventSink(journal_path) as jsonl_sink:
+        sink = CompositeEventSink(
+            (LoggingEventSink(logger), jsonl_sink)
+        )
+        instrumented = MonteCarloMinimizer(
+            gb,
+            make_energy_func(),
+            ["translate_right_grain"],
+            seed=7,
+            event_sink=sink,
+        )
+        instrumented.run_MC(
+            max_steps=4,
+            unique_id=2,
+            checkpoint_file=str(tmp_path / "instrumented_checkpoint.json"),
+        )
+
+    assert instrumented.GBE_vals == baseline.GBE_vals
+    assert journal_path.exists()
+    assert journal_path.stat().st_size > 0
+
+    # Journal files cannot be loaded as checkpoints: a JSONL event stream has none of
+    # a checkpoint envelope's required fields (schema_version/minimizer/progress_unit),
+    # so CheckpointStore.load rejects it rather than silently treating it as restart
+    # state.
+    from GBOpt.Checkpoint import CheckpointError, CheckpointStore
+
+    with pytest.raises((CheckpointError, ValueError)):
+        CheckpointStore.from_optional(journal_path).load()
