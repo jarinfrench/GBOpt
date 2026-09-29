@@ -1,5 +1,119 @@
 # Refactor cleanup backlog
 
+## R30 (integration gate, #90): built the branch from a real three-way merge; found and fixed one undetected duplication the automatic merge missed
+
+Issue #90 lists seven roadmap prerequisites (R10, R14, R20, R23, R25, R28, R29).
+Re-verified every ancestry claim with `git merge-base --is-ancestor` before branching
+(per this file's own standing discipline): `refactor/r29-ga-checkpoint-snapshots`
+already contained R14/R20/R23/R25 transitively; R10 and R28 were genuinely separate
+(R10 a parallel construction-track lineage never merged into the checkpoint/event
+track; R28/R29 true siblings off `refactor/r27-checkpoint-snapshots`'s tip, neither an
+ancestor of the other). Built `refactor/r30-integration-gate` from R29's tip, merged
+R10 (clean, zero file overlap), then merged R28 (two real conflicts: `GBOpt/snapshot/
+types.py` and `REFACTOR_CLEANUP.md` itself, both purely additive -- each branch added
+distinct functions/entries in the same region -- resolved by keeping both sides).
+
+Separately, and not flagged as a conflict by git at all (different files, no textual
+overlap): R28 had defined its own `_tuples_to_lists` helper locally in
+`GBOpt/optimization/monte_carlo.py`, while R29's equivalent already lived in
+`GBOpt/optimization/checkpointing.py` and was imported by `genetic.py`. Both branches'
+own `REFACTOR_CLEANUP.md` entries anticipated this exact duplication ("should collapse
+to one shared definition, not two") but a plain three-way merge has no way to detect
+duplication across files, only within one file's own diff hunks. Found by re-grepping
+`_tuples_to_lists` across the whole merged tree after the conflicted-file resolution,
+not by the merge tooling. Fixed by having `monte_carlo.py` import the shared helper
+from `checkpointing.py` instead of duplicating it, matching `genetic.py`'s own existing
+import. `pytest -m "not slow"` on the merged tip: 3167 passed, same 2 pre-existing
+Windows-only baseline failures documented below.
+
+**Caution for a future multi-branch merge in this repo**: don't assume "no conflict"
+means "no duplication" when two sibling branches were built to solve overlapping
+problems independently -- grep for suspiciously-named new helpers/functions across the
+*whole* merged tree, not just the files git flagged.
+
+## R30 confirmed `CandidateLoader` reuse and `WriteResult` scoping by construction; needed no new wiring
+
+Issue #90's "the same authoritative `CandidateLoader` is used for evaluator-returned
+structures and checkpoint-restored artifacts" and "`WriteResult` mappings are
+candidate-local and never treated as optimizer-wide atom identity" criteria were both
+already true, confirmed by grep rather than by adding new code:
+
+- `ExplicitOwnershipEvaluator._reload_mapping` (the evaluator-return path, in
+  `GBOpt/_explicit_ownership_evaluation.py`) and owned-mode GA's checkpoint-restore
+  resume (`GBOpt/optimization/genetic.py`, both call sites) both call the identical
+  `ExplicitOwnershipEvaluator._reload_mapping` -> `reload_explicit_manipulator` ->
+  `CandidateLoader().reload()` chain -- the same object graph R14 established, not two
+  parallel reload implementations that happen to agree.
+- `GBOpt/io/types.py`'s `WriteResult.atom_ids` docstring already states these IDs "are
+  local to this one write and carry no persistent atom identity across writes, reads,
+  or reloads"; every consumer (`CandidateLoader.write_candidate`, `GBManipulator`,
+  `GBOpt/optimization/types.py`'s mapping serialization) operates on one candidate's
+  own mapping at a time, never a shared cross-candidate identity table.
+
+Pinned as an explicit, first-class integration claim (rather than left inferable only
+from unrelated fixtures' incidental behavior) in
+`tests/test_integration_end_to_end.py`.
+
+**Resolve at**: no action needed; both criteria were satisfied by R14's own original
+design, confirmed rather than re-derived.
+
+## R30's five import-boundary acceptance criteria all held on the merged tip with zero production-code changes
+
+Verified each of #90's five import-boundary criteria (`GBOpt.gbmaker` imports neither
+optimizer nor file-format layers; `GBOpt.io` imports neither the `GBMaker` facade nor
+minimizer implementations; `GBOpt.manipulation` imports no file I/O or evaluation;
+checkpoint persistence code imports no live optimizer classes; `GBOpt.observability`
+imports neither `GBOpt.snapshot` nor `GBOpt.Checkpoint`) by grepping every subpackage's
+own module-scope imports, then pinning each with a subprocess-based test in the new
+`tests/test_integration_import_boundaries.py` (using this repo's established R12
+stub-parent-package technique wherever the forbidden target -- `GBOpt.GBMaker`,
+`GBOpt.GBManipulator`, or transitively `GBOpt.io`, since both facades import structure/
+writer/reader helpers -- is something `GBOpt/__init__.py` itself eagerly imports).
+None of the five needed a code change; every boundary the refactor's earlier steps
+established (R09/R12/R14/R15/R16/R18/R29, per this file's own accumulated entries) held
+exactly as designed once actually checked end to end, across all seven prerequisite
+branches merged together for the first time.
+
+**Resolve at**: no action needed.
+
+## R30 net tooling deltas: ruff net 0, mypy net 0, bandit unchanged, pyscn unchanged (46 quality issues, 51 clone pairs)
+
+Baseline taken at the merged tip immediately after both prerequisite merges (before any
+of R30's own new commits): ruff (`GBOpt`/`tests`) 247 errors; mypy `GBOpt` 330 errors in
+38 files (94 source files checked); bandit 7 Low + 1 Medium; pyscn 46 quality issues /
+51 clone pairs. This is the real, freshly-measured combination of R10's and R28's own
+previously-disclosed baselines plus R29's tip -- not re-derived from any single source
+branch's own recorded numbers, since none of them reflect what three merged branches'
+debt sums to together.
+
+R30 itself added only test files and documentation (`tests/test_integration_import_
+boundaries.py`, `tests/test_integration_end_to_end.py`, `EXTENDING.md`) plus the
+`_tuples_to_lists` dedup fix already counted in the merge-commit baseline above -- no
+further `GBOpt/` production-code changes. Two genuine `I001` (unsorted import block)
+findings appeared in the two new test files on first pass (both real, not established
+debt) and were fixed on the spot via `ruff check --fix`, bringing the final count back
+to exactly 247/330/38/46/51 -- identical to the merged-tip baseline on every tool.
+
+**Resolve at**: no action needed.
+
+## R30's full non-slow and slow suites both pass on the integration branch; #40 (example verification) kept as a separate, parallel item
+
+`pytest -m "not slow"`: 3187 passed (up from the merged-tip baseline's 3167, +20 for
+this step's own new import-boundary/end-to-end/simultaneous-sinks tests), same 2
+pre-existing Windows-only baseline failures already documented above (`test_checkpoint.py`'s
+hardcoded-POSIX-path `AssertionError`, and the identical-shape assertion on
+`StructureArtifact.path` in `test_evaluation_types.py`, introduced at R22 -- neither
+merge-related, neither new to this step). `pytest -m "slow"`: 13 passed, 0 failed.
+
+Issue #90 explicitly allows keeping #40 (example verification) as "a parallel
+release-readiness issue" rather than folding it into this step. Disclosed choice: kept
+separate -- #40 is about verifying the `examples/` directory's own scripts/notebooks
+against the finished refactor, which is orthogonal to #90's own "prove the layers
+compose without reverse dependencies or regressions" scope and would meaningfully
+expand this step's surface for no acceptance-criteria benefit.
+
+**Resolve at**: #40 remains open as its own, separately-scoped item.
+
 ## R29 net tooling deltas: ruff net 0, mypy net -8 (two real fixes, one pre-existing looseness surfaced), bandit unchanged, pyscn +2 quality issues (disclosed, not decomposed), clones 8 -> 5
 
 Baseline taken at the R29 branch point (`4d429d5`, tip of `refactor/r27-checkpoint-

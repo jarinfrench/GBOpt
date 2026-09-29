@@ -159,8 +159,8 @@ def test_gbmaker_facade_resolves_to_gbmaker_subpackage_construction_pipeline() -
 
 def test_top_level_compatibility_imports_resolve_to_documented_classes() -> None:
     import GBOpt
-    from GBOpt.GBManipulator import GBManipulator, InterfaceCandidate
     from GBOpt.GBMaker import GBMaker
+    from GBOpt.GBManipulator import GBManipulator, InterfaceCandidate
     from GBOpt.optimization import GeneticAlgorithmMinimizer, MonteCarloMinimizer
 
     assert GBOpt.GBMaker is GBMaker

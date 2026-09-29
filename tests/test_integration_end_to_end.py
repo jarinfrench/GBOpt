@@ -31,8 +31,8 @@ import pytest
 from GBOpt.BoundarySpec import CSLExactSpec
 from GBOpt.BoundaryTopology import BoundaryNormalTopology
 from GBOpt.CandidateLoader import CandidateLoader
-from GBOpt.GBManipulator import GBManipulator
 from GBOpt.GBMaker import GBMaker
+from GBOpt.GBManipulator import GBManipulator
 from GBOpt.GrainOwnership import LEFT_GRAIN_LABEL, RIGHT_GRAIN_LABEL, GrainOwnership
 from GBOpt.observability import CompositeEventSink, JsonlEventSink, LoggingEventSink
 from GBOpt.optimization.genetic import GeneticAlgorithmMinimizer
