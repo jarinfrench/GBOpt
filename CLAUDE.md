@@ -449,6 +449,69 @@ the issue or step that produced it.
   `diagnostic_note` field, in the same commit as the migrator rather than a follow-up,
   since the narrower design had not yet been separately committed. See
   `REFACTOR_CLEANUP.md`'s dedicated entry for the full shape breakdown.
+- **R27's own work had never been pushed under a `refactor/r27-...`-named branch --
+  create that branch explicitly, from the commit its actual harness-assigned branch
+  points to, before branching R28 off it, and verify with `git rev-parse` that both
+  names resolve to the same commit.** Starting R28, `git branch -a` showed no
+  `refactor/r27-...` branch at all -- only the harness's own `claude/
+  peaceful-noether-116cjh` name. Confirmed real R27 content on it (a `git diff` against
+  `refactor/r26-checkpoint-hardening` showing exactly the `GBOpt/snapshot/` module plus
+  its tests, nothing else) and confirmed ancestry with `git merge-base --is-ancestor`
+  before trusting it as R28's base. Created `refactor/r27-checkpoint-snapshots` at
+  `origin/claude/peaceful-noether-116cjh` and pushed it, then branched R28 from that
+  new name rather than the harness name directly -- keeping this repo's own
+  `refactor/rNN-...` naming convention intact for whoever picks up R29, while the
+  harness name stays around as a second ref to the same commit rather than being
+  deleted.
+- **Committing directly onto the just-created prerequisite branch instead of a new
+  branch for the current step is an easy slip when the prerequisite branch was only
+  just created in the same session -- catch it immediately with `git branch
+  --show-current` before the first commit's tree state gets any harder to unwind.**
+  R28's very first commit landed on `refactor/r27-checkpoint-snapshots` itself (created
+  moments earlier in the same session) instead of a new `refactor/r28-...` branch,
+  because the checkout from creating R27's branch was still the active one. Fixed
+  immediately, before any second commit, with `git branch refactor/r28-... HEAD` (new
+  branch at the commit with R28's work), then `git branch -f
+  refactor/r27-checkpoint-snapshots origin/claude/peaceful-noether-116cjh` (force-move
+  the R27 branch pointer back to pure R27 content) -- safe here specifically because
+  nothing had been pushed yet and no other branch depended on R27's branch pointer at
+  its (never-published) post-R28-commit position. Always check which branch is
+  actually checked out right after creating a new one, not just when starting a
+  session.
+- **A raw `python -m venv`/scratch-copy comparison for mypy or pyscn, done outside a
+  real checkout of the branch point, silently produces meaningless results -- use a
+  `git worktree` of the actual branch instead.** R28's first attempt at a tooling
+  baseline copied the three touched files (`types.py`, `migration.py`,
+  `monte_carlo.py`) from the R27 branch point into a scratch directory next to the
+  real files, then ran `mypy`/`pyscn` against both. mypy refused outright ("This file
+  shadows library module 'types'" -- the scratch copy had no real `GBOpt` package
+  around it to resolve `snapshot.types` as anything but a bare top-level module), and a
+  pyscn run without `.pyscn.toml` present at the scratch path would have hit the
+  documented default-threshold trap (see the R23/R24 entries above) even if mypy
+  hadn't already failed first. The fix: `git worktree add ../gbopt-r27-baseline
+  refactor/r27-checkpoint-snapshots`, copy the three tooling config files into *that*
+  worktree's own root (not a `.baseline_scratch/` subdirectory of the working
+  checkout), and run every tool against the worktree's real package layout. Remove the
+  worktree (`git worktree remove ... --force`) once the comparison is done, same as any
+  other scratch state per this file's own "delete before staging" discipline for the
+  tooling config files themselves.
+- **`MSYS_NO_PATHCONV=1 git cat-file -p '<branch>:.pyscn.toml' > <dest>` still needs
+  `MSYS_NO_PATHCONV=1` even when `<dest>` is a path in a *different* worktree, and
+  combining `git -C <other-worktree-path> cat-file ...` with a *relative* `-C` target
+  computed from an already-`cd`'d shell can silently fail with a confusing "cannot
+  change to" error naming a path that plainly exists.** Two dead ends while copying
+  `.pyscn.toml` into the R27 baseline worktree: first, running the `cat-file` command
+  from inside the baseline worktree's own directory with `git -C
+  /c/Users/jarin/projects/GBOpt cat-file ...` failed with `fatal: cannot change to
+  '.../GBOpt': No such file or directory`, even though that path was the shell's own
+  previous working directory seconds earlier (Git Bash's `cd` back to the original repo
+  between commands, combined with `-C` argument resolution, didn't compose the way a
+  plain absolute path suggested it would). The reliable fix was running `git cat-file`
+  from *inside* the source repo (no `-C` at all) with `MSYS_NO_PATHCONV=1` still
+  prefixed, redirecting to an absolute destination path in the other worktree
+  (`... > /c/Users/jarin/projects/gbopt-r27-baseline/.pyscn.toml`) -- avoid `-C` for
+  this specific cross-worktree copy pattern entirely; `cd` into the source and use an
+  absolute output path instead.
 - Before opening a PR, run `ruff`, `mypy`, `bandit`, and `pyscn` (see
   "Tooling" below) and report the results.
 - **Never open a PR without being explicitly told to.** The user reviews
