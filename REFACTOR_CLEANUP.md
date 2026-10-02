@@ -2167,7 +2167,7 @@ extraction shrank `GBMaker.py`). Purely mechanical -- no call site's actual
 nonnegative-vs-strictly-positive semantics changed, confirmed by the full non-slow suite
 passing unchanged before and after.
 
-## `MaterialState.atom_types` validates more strictly than the legacy constructor ever did
+## `MaterialState.atom_types` validates more strictly than the legacy constructor ever did -- RESOLVED at R03
 
 The legacy `GBMaker.__init__` never validated `atom_types` itself — it passed the raw
 value straight to `__init_unit_cell(atom_types)` -> `UnitCell.init_by_structure`, which
@@ -2175,22 +2175,30 @@ does its own type/count/species checking and raises `UnitCellTypeError`,
 `UnitCellValueError`, or `AtomValueError` (all propagating unwrapped, confirmed by
 `test_legacy_constructor_invalid_values_raise_exceptions`'s `atom_types="Invalid"`
 case, which still expects a bare `AtomValueError`). `MaterialState.__post_init__`
-(introduced in R03) now pre-validates `atom_types` as "a non-empty string or a tuple of
-non-empty strings" and raises `GBMakerConstructionValueError` (translated to
-`GBMakerValueError`) for anything that doesn't match that shape *before* `UnitCell` ever
-sees it — e.g. `atom_types=123` would previously reach `UnitCell.init_by_structure` and
-raise `UnitCellTypeError`; today it's rejected one layer earlier with a different
-exception type and message. No test currently exercises this specific shape of invalid
-input, so it hasn't surfaced as a failure the way `gb_id` did.
+(introduced in R03) pre-validates `atom_types` as "a non-empty string or a tuple of
+non-empty strings" and raises `GBMakerConstructionValueError` for anything that doesn't
+match that shape *before* `UnitCell` ever sees it. (Checked against the actual R03 code
+before resolving this: `GBMaker.py` does not construct a `MaterialState` at all yet, so
+there is no `GBMakerValueError` translation happening today either -- the "translated to
+`GBMakerValueError`" framing in this entry's original wording described a future wiring
+step's expected behavior, not R03's actual current behavior.)
 
-This may be a legitimate, desirable tightening (fail with a clearer error, one layer
-earlier) rather than a bug, unlike the `positive=True` cases above — but it wasn't a
-deliberate decision the way `a0`'s strict-positivity was; it was an assumption baked into
-`MaterialState`'s R03 design before any legacy call site was checked against it.
-
-**Resolve at**: whichever roadmap step next touches `MaterialState` or unit-cell
-resolution directly (nothing currently scheduled specifically) — worth a deliberate
-yes/no decision rather than leaving it as an unexamined side effect.
+Resolved as (a): kept the earlier, clearer rejection as intentional, matching the
+established precedent for `a0`'s strict positivity above -- a non-string/non-tuple
+`atom_types`, an empty string, or a tuple with a non-string element can never produce a
+valid unit cell either way, so the only real difference is which exception type/message
+surfaces and how early, not whether a previously-usable legacy value gets rejected.
+Documented explicitly on `MaterialState.atom_types`'s docstring
+(`GBOpt/gbmaker/types.py`) and added the previously-missing test for the one shape no
+test exercised (`atom_types=123`, a bare non-string, non-tuple value) in
+`tests/test_gbmaker_types.py`. `GBMaker.__init__`'s own direct `atom_types="Invalid"` -> `AtomValueError` path is
+untouched by this and needs no change when a later step wires `GBMaker` through
+`MaterialState`: `"Invalid"` is a non-empty string, so it passes `MaterialState`'s shape
+check and still reaches `UnitCell.init_by_structure` to raise `AtomValueError` exactly as
+before. Only the shapes `MaterialState` actually rejects (non-string/non-tuple,
+empty string, non-string tuple element) will surface `GBMakerValueError` earlier once
+that wiring lands, and that step should add its own test for the identity change rather
+than assuming this entry's resolution covers it.
 
 ## Grain builders (R08) still call geometry kernels mid-computation, not composed beforehand -- RESOLVED at R08
 
