@@ -170,7 +170,9 @@ def test_delete_is_safe_without_file(checkpoint_path):
     [
         pytest.param(np.array([1.0, 2.0, 3.0]), [1.0, 2.0, 3.0], id="array"),
         pytest.param(np.float64(-2.5), -2.5, id="scalar"),
-        pytest.param(Path("/some/dump.data"), "/some/dump.data", id="path"),
+        pytest.param(
+            Path("/some/dump.data"), str(Path("/some/dump.data")), id="path"
+        ),
     ],
 )
 def test_json_serialization_normalizes_supported_values(
