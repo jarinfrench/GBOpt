@@ -42,7 +42,7 @@ from GBOpt.gbmaker.geometry import (
     _reduced_coordinate_tolerance,
     _selection_basis_vectors,
 )
-from GBOpt.UnitCell import UnitCell
+from GBOpt.UnitCell import UnitCell, UnitCellValueError
 from tests.data.olmsted_2009_fcc_gb_energies import (
     BOUNDARIES as OLMSTED_2009_BOUNDARIES,
 )
@@ -1097,6 +1097,92 @@ class TestGBMaker(unittest.TestCase):
 
         self.gbm.id = 2
         self.assertEqual(self.gbm.id, 2)
+
+    def test_identity_changing_setters_emit_deprecation_warning(self):
+        cases = [
+            ("structure", "bcc"),
+            ("repeat_factor", 3),
+            ("vacuum_thickness", 15.0),
+            ("x_dim_min", 60.0),
+        ]
+        for name, value in cases:
+            with self.subTest(setter=name):
+                gbm = _make_exact_gb(
+                    self.a0,
+                    self.structure,
+                    self.atom_types,
+                    gb_thickness=self.gb_thickness,
+                    repeat_factor=self.repeat_factor,
+                    x_dim_min=self.x_dim_min,
+                    vacuum=self.vacuum,
+                    interaction_distance=self.interaction_distance,
+                    gb_id=self.gb_id,
+                )
+                with self.assertWarnsRegex(
+                    DeprecationWarning,
+                    rf"Setting GBMaker\.{name} on an existing instance changes "
+                    r"the system's identity",
+                ):
+                    setattr(gbm, name, value)
+
+    def test_a0_setter_emits_deprecation_warning(self):
+        # The a0 setter's own unit-cell rebuild passes every per-atom name in
+        # the unit cell (not deduplicated) to init_by_structure, so a
+        # monatomic structure's reassignment raises UnitCellValueError before
+        # completing -- a pre-existing defect, unrelated to the deprecation
+        # warning, pinned here rather than fixed.
+        gbm = _make_exact_gb(
+            self.a0,
+            self.structure,
+            self.atom_types,
+            gb_thickness=self.gb_thickness,
+            repeat_factor=self.repeat_factor,
+            x_dim_min=self.x_dim_min,
+            vacuum=self.vacuum,
+            interaction_distance=self.interaction_distance,
+            gb_id=self.gb_id,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with self.assertRaises(UnitCellValueError):
+                gbm.a0 = 3.65
+        deprecations = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        self.assertTrue(
+            any(
+                "Setting GBMaker.a0 on an existing instance changes the "
+                "system's identity" in str(w.message)
+                for w in deprecations
+            )
+        )
+
+    def test_misorientation_setter_emits_deprecation_warning(self):
+        gbm = self._make_approximate_fixture()
+        theta = math.radians(22.619865)
+        with self.assertWarnsRegex(
+            DeprecationWarning,
+            r"Setting GBMaker\.misorientation on an existing instance changes "
+            r"the system's identity",
+        ):
+            gbm.misorientation = np.array([theta, 0.0, 0.0, 0.0, -theta / 2.0])
+
+    def test_tuning_knob_setters_do_not_emit_deprecation_warning(self):
+        tuning_values = {
+            "interaction_distance": self.interaction_distance,
+            "epsilon": self.gbm.epsilon,
+            "id": self.gbm.id,
+            "gb_thickness": self.gb_thickness,
+        }
+        for name, value in tuning_values.items():
+            with self.subTest(setter=name):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    setattr(self.gbm, name, value)
+                deprecations = [
+                    w for w in caught if issubclass(w.category, DeprecationWarning)
+                ]
+                self.assertEqual(deprecations, [])
 
     def test_interaction_distance_setter_rebuilds_geometry(self):
         original_box_dims = self.gbm.box_dims.copy()

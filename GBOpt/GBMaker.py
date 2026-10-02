@@ -64,6 +64,12 @@ _LEGACY_CONSTRUCTOR_DEPRECATION = (
     "GBMaker(...) is deprecated; use GBMaker.from_boundary_spec(...)."
 )
 
+_IDENTITY_SETTER_DEPRECATION = (
+    "Setting GBMaker.{name} on an existing instance changes the system's identity "
+    "and is deprecated; construct a new instance via GBMaker.from_boundary_spec(...) "
+    "instead."
+)
+
 
 class GBMakerError(Exception):
     """Base class for Exceptions in the GBMaker class."""
@@ -1020,6 +1026,11 @@ class GBMaker:
 
     @a0.setter
     def a0(self, value: Number) -> None:
+        warnings.warn(
+            _IDENTITY_SETTER_DEPRECATION.format(name="a0"),
+            DeprecationWarning,
+            stacklevel=2,
+        )
         atom_types = tuple(self._config.unit_cell.names())
         self._config.a0 = self.__validate(value, float, "a0", nonnegative=True)
         self._config.unit_cell = self.__init_unit_cell(atom_types)
@@ -1068,6 +1079,11 @@ class GBMaker:
 
     @misorientation.setter
     def misorientation(self, value: np.ndarray):
+        warnings.warn(
+            _IDENTITY_SETTER_DEPRECATION.format(name="misorientation"),
+            DeprecationWarning,
+            stacklevel=2,
+        )
         misorientation = self.__validate(
             value, np.ndarray, "misorientation", expected_length=5
         )
@@ -1083,6 +1099,11 @@ class GBMaker:
 
     @repeat_factor.setter
     def repeat_factor(self, value: int):
+        warnings.warn(
+            _IDENTITY_SETTER_DEPRECATION.format(name="repeat_factor"),
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._config.repeat_factor = self.__validate(
             value, (int, Sequence), "repeat_factor", nonnegative=True)
         self.__update_dims()
@@ -1093,6 +1114,11 @@ class GBMaker:
 
     @structure.setter
     def structure(self, value: str) -> None:
+        warnings.warn(
+            _IDENTITY_SETTER_DEPRECATION.format(name="structure"),
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._config.structure = self.__validate(value, str, "structure")
         if {self._config.structure, value}.issubset(
             {"fluorite", "rocksalt", "zincblende"}
@@ -1111,6 +1137,11 @@ class GBMaker:
 
     @vacuum_thickness.setter
     def vacuum_thickness(self, value: Number):
+        warnings.warn(
+            _IDENTITY_SETTER_DEPRECATION.format(name="vacuum_thickness"),
+            DeprecationWarning,
+            stacklevel=2,
+        )
         old_vacuum = self._boundary.vacuum_thickness
         vacuum_value = self.__validate(
             value, Number, "vacuum_thickness", nonnegative=True
@@ -1134,6 +1165,11 @@ class GBMaker:
 
     @x_dim_min.setter
     def x_dim_min(self, value: Number):
+        warnings.warn(
+            _IDENTITY_SETTER_DEPRECATION.format(name="x_dim_min"),
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._config.x_dim_min = self.__validate(
             value, Number, "x_dim_min", nonnegative=True)
         self.update_spacing()
