@@ -2291,7 +2291,7 @@ question the same way R04 provisionally chose. The translation wrapper is not
 scaffolding to be removed later; it's the permanent boundary between `gbmaker`'s pure
 construction-error hierarchy and `GBMaker`'s own public one.
 
-## `gbmaker/geometry.py`'s complete-origin kernels have no direct unit tests
+## `gbmaker/geometry.py`'s complete-origin kernels have no direct unit tests -- RESOLVED on request
 
 R07 (#68) moved `_complete_origin_atom_mask`, `_filter_complete_origins`,
 `_deduplicate_complete_origins`, and the composed `_select_complete_origins_in_box_basis`
@@ -2325,7 +2325,20 @@ add direct unit tests for these four kernels: R08's scope was the extraction its
 R07 already extracted unchanged), and the existing indirect coverage through real
 grain construction continues to exercise all four via `test_gbmaker.py`.
 
-**Resolve at**: as a standalone test-hygiene pass on request.
+**Resolved** as the standalone test-hygiene pass this entry called for, on
+`refactor/r07-geometry-kernels` (commit `a463f15`): added 45 direct unit tests
+to `tests/test_gbmaker_geometry.py` -- `_complete_origin_atom_mask`'s grouped
+fast path and origin-ID-count fallback, `_filter_complete_origins`'s copy
+semantics, `_deduplicate_complete_origins`'s quantized-signature dedup
+(keeping first occurrence), and `_select_complete_origins_in_box_basis`'s two
+branches (axis-aligned fast path, including boundary snap-to-zero; general
+mixed-basis path, including non-periodic-axis clipping, incomplete-origin
+dropping, and the singular-selection-basis error), plus each function's
+validation-error paths. Full non-slow suite, ruff, mypy, and `pyscn check`
+all diffed clean against the pre-change baseline on that branch -- no
+behavior change. Pushed to `origin/refactor/r07-geometry-kernels`; not yet
+merged forward into this branch or any other roadmap branch descended from
+R07.
 
 ## `gbmaker/config.py` and `gbmaker/material.py` have no dedicated per-module test file
 
