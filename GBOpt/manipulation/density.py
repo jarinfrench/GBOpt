@@ -320,6 +320,156 @@ def grid_insertion_sites(
     return filtered_sites, probabilities
 
 
+def _resolve_removal_plan(
+    *,
+    atoms: np.ndarray,
+    positions: np.ndarray,
+    gb_atom_indices: np.ndarray,
+    type_map: dict[int, str],
+    ratio: dict[int, int],
+    unit_cell,
+    num_to_remove: int,
+    keep_ratio: bool,
+    rng,
+) -> tuple[dict[int, int], int | None, list | None, np.ndarray | None]:
+    """Resolve per-type removal counts, and the central-type ordering if needed.
+
+    :return: ``(num_to_remove_dict, central_type, neighbor_list, probabilities)``.
+        ``central_type``/``neighbor_list``/``probabilities`` are ``None`` unless
+        ``keep_ratio`` and ``len(type_map) > 1``.
+    """
+    if len(type_map) == 1:
+        return {1: num_to_remove}, None, None, None
+
+    if not keep_ratio:
+        counts = _random_type_counts(num_to_remove, len(type_map), rng)
+        num_to_remove_dict = {i + 1: int(counts[i]) for i in range(len(type_map))}
+        return num_to_remove_dict, None, None, None
+
+    num_to_remove_dict = _get_stoichiometric_change(num_to_remove, ratio)
+    central_type = min(num_to_remove_dict, key=num_to_remove_dict.get)
+    cutoff = (unit_cell.nn_distance(2) + unit_cell.nn_distance(1)) / 2
+    neighbor_list = _create_neighbor_list(cutoff, positions)
+    Delta = 0.05  # Bin size to calculate the fingerprint vector.
+    Rmax = 15  # Max distance allowed to be a neighbor
+    args_list = [
+        (
+            atoms[atom_idx],
+            atoms[neighbor_list[atom_idx]],
+            unit_cell.names(asint=True),
+            unit_cell.a0,
+            len(unit_cell.unit_cell),
+            Delta,
+            Rmax,
+        )
+        for atom_idx in gb_atom_indices
+    ]
+    order = np.zeros(len(args_list))
+    for i, args in enumerate(args_list):
+        order[i] = _calculate_local_order(*args)
+
+    probabilities = max(order) - order + min(order)
+    probabilities = probabilities / np.sum(probabilities, dtype=float)
+    return num_to_remove_dict, central_type, neighbor_list, probabilities
+
+
+def _select_central_type_removal_indices(
+    *,
+    atoms: np.ndarray,
+    positions: np.ndarray,
+    gb_atom_indices: np.ndarray,
+    ratio: dict[int, int],
+    central_type: int,
+    neighbor_list: list,
+    probabilities: np.ndarray,
+    num_to_remove_dict: dict[int, int],
+    rng,
+) -> list:
+    """Select removal indices favoring low local order, central type first.
+
+    :raises ManipulationCapabilityError: If no central-type atom is found in the GB
+        region, or there are not enough same-formula-unit neighbors of some type.
+    """
+    type_mask = atoms[gb_atom_indices][:, 0] == central_type
+    central_indices = gb_atom_indices[type_mask]
+    central_probabilities = probabilities[type_mask]
+    central_probabilities = central_probabilities / np.sum(central_probabilities)
+
+    if len(central_indices) == 0:
+        raise ManipulationCapabilityError(
+            f"No atoms found for type {central_type} in the grain boundary."
+        )
+
+    central_num_to_remove = num_to_remove_dict[central_type]
+    selected_central_indices = rng.choice(
+        central_indices,
+        central_num_to_remove,
+        replace=False,
+        p=central_probabilities,
+    )
+
+    distances = {
+        idx: np.full(len(neighbor_list[idx]), np.inf)
+        for idx in selected_central_indices
+    }
+    for central_idx in selected_central_indices:
+        neighbors = neighbor_list[central_idx]
+        gb_neighbors = np.intersect1d(neighbors, gb_atom_indices)
+        mask = np.isin(neighbors, gb_neighbors)
+        distances[central_idx][mask] = np.linalg.norm(
+            positions[gb_neighbors] - positions[central_idx], axis=1
+        )
+
+    indices_to_remove = list(distances.keys())
+    for atom_type, atom_ratio in ratio.items():
+        if atom_type == central_type:
+            continue
+        for idx, dists in distances.items():
+            neighbor_indices = np.asarray(neighbor_list[idx])
+            gb_neighbor_indices = np.intersect1d(neighbor_indices, gb_atom_indices)
+            mask = np.isin(neighbor_indices, gb_neighbor_indices)
+            type_mask = atoms[gb_neighbor_indices][:, 0] == atom_type
+            type_indices = neighbor_indices[mask][type_mask]
+            duplicates = [
+                i for i, el in enumerate(type_indices)
+                if el in indices_to_remove
+            ]
+
+            type_indices = list(set(type_indices) - set(duplicates))
+            if len(type_indices) < atom_ratio:
+                raise ManipulationCapabilityError(
+                    f"Not enough neighbor atoms of type {atom_type} to remove."
+                )
+
+            dists[dists < 1e-8] = 1e-8
+            type_probabilities = 1 / dists[mask][type_mask]
+            type_probabilities = type_probabilities / np.sum(type_probabilities)
+
+            type_idx_to_remove = rng.choice(
+                type_indices, atom_ratio, replace=False, p=type_probabilities
+            )
+
+            indices_to_remove.extend(type_idx_to_remove)
+
+    return indices_to_remove
+
+
+def _select_uniform_removal_indices(
+    *,
+    atoms: np.ndarray,
+    gb_atom_indices: np.ndarray,
+    num_to_remove_dict: dict[int, int],
+    rng,
+) -> list:
+    """Select removal indices uniformly per type, without regard to local order."""
+    indices_to_remove = []
+    for atom_type, num in num_to_remove_dict.items():
+        type_indices = gb_atom_indices[atoms[gb_atom_indices][:, 0] == atom_type]
+        type_idx_to_remove = rng.choice(type_indices, num, replace=False)
+        indices_to_remove.extend(type_idx_to_remove)
+    return indices_to_remove
+
+
 def select_removal_indices(
     *,
     atoms: np.ndarray,
@@ -359,117 +509,152 @@ def select_removal_indices(
         available to remove while preserving stoichiometry, or the produced selection
         does not match ``num_to_remove``.
     """
-    if len(type_map) == 1:
-        num_to_remove_dict = {1: num_to_remove}
-    elif keep_ratio:
-        num_to_remove_dict = _get_stoichiometric_change(num_to_remove, ratio)
-        num_to_remove = sum(list(num_to_remove_dict.values()))
-        central_type = min(num_to_remove_dict, key=num_to_remove_dict.get)
-        cutoff = (unit_cell.nn_distance(2) + unit_cell.nn_distance(1)) / 2
-        neighbor_list = _create_neighbor_list(cutoff, positions)
-        Delta = 0.05  # Bin size to calculate the fingerprint vector.
-        Rmax = 15  # Max distance allowed to be a neighbor
-        args_list = [
-            (
-                atoms[atom_idx],
-                atoms[neighbor_list[atom_idx]],
-                unit_cell.names(asint=True),
-                unit_cell.a0,
-                len(unit_cell.unit_cell),
-                Delta,
-                Rmax,
-            )
-            for idx, atom_idx in enumerate(gb_atom_indices)
-        ]
-        order = np.zeros(len(args_list))
-        for i, args in enumerate(args_list):
-            order[i] = _calculate_local_order(*args)
-
-        probabilities = max(order) - order + min(order)
-        probabilities = probabilities / np.sum(probabilities, dtype=float)
-    else:
-        counts = _random_type_counts(num_to_remove, len(type_map), rng)
-        num_to_remove_dict = {i + 1: int(counts[i]) for i in range(len(type_map))}
+    num_to_remove_dict, central_type, neighbor_list, probabilities = (
+        _resolve_removal_plan(
+            atoms=atoms,
+            positions=positions,
+            gb_atom_indices=gb_atom_indices,
+            type_map=type_map,
+            ratio=ratio,
+            unit_cell=unit_cell,
+            num_to_remove=num_to_remove,
+            keep_ratio=keep_ratio,
+            rng=rng,
+        )
+    )
+    num_to_remove = sum(num_to_remove_dict.values())
 
     if keep_ratio and len(type_map) > 1:
-        type_mask = atoms[gb_atom_indices][:, 0] == central_type
-        central_indices = gb_atom_indices[type_mask]
-        central_probabilities = probabilities[type_mask]
-        central_probabilities = (
-            central_probabilities / np.sum(central_probabilities)
+        indices_to_remove = _select_central_type_removal_indices(
+            atoms=atoms,
+            positions=positions,
+            gb_atom_indices=gb_atom_indices,
+            ratio=ratio,
+            central_type=central_type,
+            neighbor_list=neighbor_list,
+            probabilities=probabilities,
+            num_to_remove_dict=num_to_remove_dict,
+            rng=rng,
         )
-
-        if len(central_indices) == 0:
-            raise ManipulationCapabilityError(
-                f"No atoms found for type {central_type} in the grain boundary."
-            )
-
-        central_num_to_remove = num_to_remove_dict[central_type]
-        selected_central_indices = rng.choice(
-            central_indices,
-            central_num_to_remove,
-            replace=False,
-            p=central_probabilities,
+    else:
+        indices_to_remove = _select_uniform_removal_indices(
+            atoms=atoms,
+            gb_atom_indices=gb_atom_indices,
+            num_to_remove_dict=num_to_remove_dict,
+            rng=rng,
         )
-
-        distances = {
-            idx: np.full(len(neighbor_list[idx]), np.inf)
-            for idx in selected_central_indices
-        }
-        for central_idx in selected_central_indices:
-            neighbors = neighbor_list[central_idx]
-            gb_neighbors = np.intersect1d(neighbors, gb_atom_indices)
-            mask = np.isin(neighbors, gb_neighbors)
-            distances[central_idx][mask] = np.linalg.norm(
-                positions[gb_neighbors] - positions[central_idx], axis=1
-            )
-
-        indices_to_remove = list(distances.keys())
-        for atom_type, atom_ratio in ratio.items():
-            if atom_type == central_type:
-                continue
-            for idx, dists in distances.items():
-                neighbor_indices = np.asarray(neighbor_list[idx])
-                gb_neighbor_indices = np.intersect1d(
-                    neighbor_indices, gb_atom_indices)
-                mask = np.isin(neighbor_indices, gb_neighbor_indices)
-                type_mask = atoms[gb_neighbor_indices][:, 0] == atom_type
-                type_indices = neighbor_indices[mask][type_mask]
-                duplicates = [
-                    i for i, el in enumerate(type_indices)
-                    if el in indices_to_remove
-                ]
-
-                type_indices = list(set(type_indices) - set(duplicates))
-                if len(type_indices) < atom_ratio:
-                    raise ManipulationCapabilityError(
-                        f"Not enough neighbor atoms of type {atom_type} to remove."
-                    )
-
-                dists[dists < 1e-8] = 1e-8
-                type_probabilities = 1 / dists[mask][type_mask]
-                type_probabilities = type_probabilities / np.sum(type_probabilities)
-
-                type_idx_to_remove = rng.choice(
-                    type_indices, atom_ratio, replace=False, p=type_probabilities
-                )
-
-                indices_to_remove.extend(type_idx_to_remove)
-
-    else:  # keep_ratio == False or len(type_map) == 1
-        indices_to_remove = []
-        for atom_type, num in num_to_remove_dict.items():
-            type_indices = gb_atom_indices[
-                atoms[gb_atom_indices][:, 0] == atom_type
-            ]
-            type_idx_to_remove = rng.choice(type_indices, num, replace=False)
-            indices_to_remove.extend(type_idx_to_remove)
 
     if not len(indices_to_remove) == num_to_remove:
         raise ManipulationCapabilityError(
             "removal selection did not produce the requested atom count"
         )
     return np.asarray(indices_to_remove)
+
+
+def _resolve_insertion_counts(
+    *,
+    type_map: dict[int, str],
+    ratio: dict[int, int],
+    num_to_insert: int,
+    keep_ratio: bool,
+    rng,
+) -> tuple[dict[int, int], int | None]:
+    """Resolve per-type insertion counts, and the central type if needed.
+
+    :return: ``(num_to_insert_dict, central_type)``. ``central_type`` is ``None``
+        unless ``keep_ratio`` and ``len(type_map) > 1``.
+    """
+    if len(type_map) == 1:
+        return {1: num_to_insert}, None
+    if not keep_ratio:
+        counts = _random_type_counts(num_to_insert, len(type_map), rng)
+        return {i + 1: int(counts[i]) for i in range(len(type_map))}, None
+    num_to_insert_dict = _get_stoichiometric_change(num_to_insert, ratio)
+    central_type = min(num_to_insert_dict, key=num_to_insert_dict.get)
+    return num_to_insert_dict, central_type
+
+
+def _select_central_type_insertion_sites(
+    *,
+    possible_sites: np.ndarray,
+    probabilities: np.ndarray,
+    type_map: dict[int, str],
+    ratio: dict[int, int],
+    unit_cell,
+    central_type: int,
+    num_to_insert_dict: dict[int, int],
+    rng,
+) -> dict[int, list[int]]:
+    """Place central-type atoms first, then every other type at a nearby site.
+
+    :raises ManipulationCapabilityError: If there are not enough unassigned candidate
+        sites available near a central atom to preserve stoichiometry.
+    """
+    central_num_to_insert = num_to_insert_dict[central_type]
+    selected_central_indices = rng.choice(
+        list(range(len(possible_sites))),
+        central_num_to_insert,
+        replace=False,
+        p=probabilities
+    )
+    cutoff = (unit_cell.nn_distance(2) + unit_cell.nn_distance(1)) / 2.0
+    possible_sites_neighbor_list = _create_neighbor_list(cutoff, possible_sites)
+
+    atoms_to_add = {
+        type_map[i]: [] if type_map[i] != central_type else list(
+            selected_central_indices
+        )
+        for i in type_map
+    }
+    for atom_type, atom_ratio in ratio.items():
+        if atom_type == central_type:
+            continue
+        for idx in selected_central_indices:
+            neighbors = possible_sites_neighbor_list[idx]
+            already_assigned = {idx for v in atoms_to_add.values() for idx in v}
+            available_neighbors = list(set(neighbors) - already_assigned)
+            if len(available_neighbors) < atom_ratio:
+                raise ManipulationCapabilityError(
+                    "Not enough sites to insert atoms into."
+                )
+            partial_probabilities = probabilities[available_neighbors]
+            partial_probabilities = partial_probabilities / \
+                np.sum(partial_probabilities)
+            selected_neighbor_offsets = rng.choice(
+                list(range(len(available_neighbors))), atom_ratio, replace=False,
+                p=partial_probabilities
+            )
+            selected_indices = [
+                available_neighbors[offset]
+                for offset in selected_neighbor_offsets
+            ]
+            atoms_to_add[atom_type].extend(selected_indices)
+    return atoms_to_add
+
+
+def _select_uniform_insertion_sites(
+    *,
+    possible_sites: np.ndarray,
+    probabilities: np.ndarray,
+    num_to_insert_dict: dict[int, int],
+    rng,
+) -> dict[int, list[int]]:
+    """Select insertion sites independently per type, without regard to proximity."""
+    atoms_to_add = {}
+    site_indices = list(range(len(possible_sites)))
+    already_assigned: set[int] = set()
+    for atom_type, num in num_to_insert_dict.items():
+        available_indices = list(set(site_indices) - already_assigned)
+        available_probabilities = probabilities[available_indices]
+        available_probabilities = (
+            available_probabilities / np.sum(available_probabilities)
+        )
+        type_idx_to_insert = rng.choice(
+            available_indices, num, replace=False, p=available_probabilities
+        )
+        atoms_to_add[atom_type] = list(type_idx_to_insert)
+        already_assigned.update(type_idx_to_insert)
+    return atoms_to_add
 
 
 def select_insertion_sites(
@@ -509,73 +694,31 @@ def select_insertion_sites(
     :raises ManipulationCapabilityError: If there are not enough unassigned candidate
         sites available near a central atom to preserve stoichiometry.
     """
-    if len(type_map) == 1:
-        num_to_insert_dict = {1: num_to_insert}
-    elif keep_ratio:
-        num_to_insert_dict = _get_stoichiometric_change(num_to_insert, ratio)
-        num_to_insert = sum(list(num_to_insert_dict.values()))
-        central_type = min(num_to_insert_dict, key=num_to_insert_dict.get)
-    else:
-        counts = _random_type_counts(num_to_insert, len(type_map), rng)
-        num_to_insert_dict = {i + 1: int(counts[i]) for i in range(len(type_map))}
+    num_to_insert_dict, central_type = _resolve_insertion_counts(
+        type_map=type_map,
+        ratio=ratio,
+        num_to_insert=num_to_insert,
+        keep_ratio=keep_ratio,
+        rng=rng,
+    )
 
     if keep_ratio and len(type_map) > 1:
-        central_num_to_insert = num_to_insert_dict[central_type]
-        selected_central_indices = rng.choice(
-            list(range(len(possible_sites))),
-            central_num_to_insert,
-            replace=False,
-            p=probabilities
+        return _select_central_type_insertion_sites(
+            possible_sites=possible_sites,
+            probabilities=probabilities,
+            type_map=type_map,
+            ratio=ratio,
+            unit_cell=unit_cell,
+            central_type=central_type,
+            num_to_insert_dict=num_to_insert_dict,
+            rng=rng,
         )
-        cutoff = (unit_cell.nn_distance(2) + unit_cell.nn_distance(1)) / 2.0
-        possible_sites_neighbor_list = _create_neighbor_list(cutoff, possible_sites)
-
-        atoms_to_add = {
-            type_map[i]: [] if type_map[i] != central_type else list(
-                selected_central_indices
-            )
-            for i in type_map.keys()
-        }
-        for atom_type, atom_ratio in ratio.items():
-            if atom_type == central_type:
-                continue
-            for idx in selected_central_indices:
-                neighbors = possible_sites_neighbor_list[idx]
-                already_assigned = {idx for v in atoms_to_add.values() for idx in v}
-                available_neighbors = list(set(neighbors) - already_assigned)
-                if len(available_neighbors) < atom_ratio:
-                    raise ManipulationCapabilityError(
-                        "Not enough sites to insert atoms into."
-                    )
-                partial_probabilities = probabilities[available_neighbors]
-                partial_probabilities = partial_probabilities / \
-                    np.sum(partial_probabilities)
-                selected_neighbor_offsets = rng.choice(
-                    list(range(len(available_neighbors))), atom_ratio, replace=False,
-                    p=partial_probabilities
-                )
-                selected_indices = [
-                    available_neighbors[offset]
-                    for offset in selected_neighbor_offsets
-                ]
-                atoms_to_add[atom_type].extend(selected_indices)
-    else:
-        atoms_to_add = {}
-        site_indices = list(range(len(possible_sites)))
-        already_assigned: set[int] = set()
-        for atom_type, num in num_to_insert_dict.items():
-            available_indices = list(set(site_indices) - already_assigned)
-            available_probabilities = probabilities[available_indices]
-            available_probabilities = (
-                available_probabilities / np.sum(available_probabilities)
-            )
-            type_idx_to_insert = rng.choice(
-                available_indices, num, replace=False, p=available_probabilities
-            )
-            atoms_to_add[atom_type] = list(type_idx_to_insert)
-            already_assigned.update(type_idx_to_insert)
-
-    return atoms_to_add
+    return _select_uniform_insertion_sites(
+        possible_sites=possible_sites,
+        probabilities=probabilities,
+        num_to_insert_dict=num_to_insert_dict,
+        rng=rng,
+    )
 
 
 def _build_candidate(
@@ -732,6 +875,79 @@ class AtomRemoval:
         )
 
 
+def _validate_insertion_counts(
+    *, fill_fraction: float | None, num_to_insert: int | None, gb_atom_count: int,
+) -> int:
+    """Validate and resolve ``num_to_insert`` from ``fill_fraction``/``num_to_insert``.
+
+    :raises ManipulationCapabilityError: If the requested fraction/count is out of
+        range.
+    """
+    if fill_fraction is not None and (fill_fraction <= 0 or fill_fraction > 0.25):
+        raise ManipulationCapabilityError(
+            f"Invalid value for fill_fraction ({fill_fraction=}). Must be 0 < "
+            "fill_fraction <= 0.25"
+        )
+    if num_to_insert is not None and (
+        num_to_insert < 1 or num_to_insert > int(0.25 * gb_atom_count)
+    ):
+        raise ManipulationCapabilityError(
+            "Invalid num_to_insert value. Must be >= 1, and must be less than or "
+            "equal to 25% of the total number of atoms in the GB region."
+        )
+    if num_to_insert is None:
+        num_to_insert = int(fill_fraction * gb_atom_count)
+    return num_to_insert
+
+
+def _generate_insertion_sites(
+    method: str, gb_atoms_xyz: np.ndarray, unit_cell,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return candidate insertion sites and probabilities for ``method``.
+
+    :raises ManipulationCapabilityError: If ``method`` is unrecognized.
+    """
+    if method == "delaunay":
+        return delaunay_insertion_sites(gb_atoms_xyz, unit_cell.radius)
+    if method == "grid":
+        return grid_insertion_sites(gb_atoms_xyz, unit_cell.radius)
+    raise ManipulationCapabilityError(f"Unrecognized insert_atoms method: {method}")
+
+
+def _label_inserted_atoms(
+    new_atoms: np.ndarray,
+    *,
+    left_bounds,
+    right_bounds,
+    tolerance: float,
+    gb_plane_x: float,
+) -> np.ndarray:
+    """Assign a persistent grain label to each inserted atom by physical x interval.
+
+    :raises ManipulationCapabilityError: If an inserted atom lies outside both
+        explicit physical grain x intervals.
+    """
+    inserted_labels = np.empty(len(new_atoms), dtype=np.int8)
+    for index, x_value in enumerate(new_atoms["x"]):
+        x_coord = float(x_value)
+        in_left = x_coord >= left_bounds[0] - tolerance and x_coord < left_bounds[1]
+        in_right = x_coord >= right_bounds[0] - tolerance and x_coord < right_bounds[1]
+        if in_left and not in_right:
+            inserted_labels[index] = LEFT_GRAIN_LABEL
+        elif in_right and not in_left:
+            inserted_labels[index] = RIGHT_GRAIN_LABEL
+        elif in_left and in_right:
+            inserted_labels[index] = (
+                LEFT_GRAIN_LABEL if x_coord < gb_plane_x else RIGHT_GRAIN_LABEL
+            )
+        else:
+            raise ManipulationCapabilityError(
+                "inserted atom lies outside both explicit physical grain x "
+                "intervals"
+            )
+    return inserted_labels
+
+
 class AtomInsertion:
     """Insert a fraction or count of atoms into a single parent's GB region."""
 
@@ -789,21 +1005,11 @@ class AtomInsertion:
             )
         )
 
-        if fill_fraction is not None and (fill_fraction <= 0 or fill_fraction > 0.25):
-            raise ManipulationCapabilityError(
-                f"Invalid value for fill_fraction ({fill_fraction=}). Must be 0 < "
-                "fill_fraction <= 0.25"
-            )
-        if num_to_insert is not None and (
-            num_to_insert < 1 or num_to_insert > int(0.25 * len(gb_atom_indices))
-        ):
-            raise ManipulationCapabilityError(
-                "Invalid num_to_insert value. Must be >= 1, and must be less than or "
-                "equal to 25% of the total number of atoms in the GB region."
-            )
-
-        if num_to_insert is None:
-            num_to_insert = int(fill_fraction * len(gb_atom_indices))
+        num_to_insert = _validate_insertion_counts(
+            fill_fraction=fill_fraction,
+            num_to_insert=num_to_insert,
+            gb_atom_count=len(gb_atom_indices),
+        )
 
         labels = parent.grain_labels
         if num_to_insert == 0:
@@ -814,15 +1020,9 @@ class AtomInsertion:
                 lineage={"operation": self.name, "parent_count": 1},
             )
 
-        if method == "delaunay":
-            possible_sites, probabilities = delaunay_insertion_sites(
-                gb_atoms_xyz, unit_cell.radius)
-        elif method == "grid":
-            possible_sites, probabilities = grid_insertion_sites(
-                gb_atoms_xyz, unit_cell.radius)
-        else:
-            raise ManipulationCapabilityError(
-                f"Unrecognized insert_atoms method: {method}")
+        possible_sites, probabilities = _generate_insertion_sites(
+            method, gb_atoms_xyz, unit_cell
+        )
 
         atoms_to_add = select_insertion_sites(
             possible_sites=possible_sites,
@@ -844,35 +1044,13 @@ class AtomInsertion:
             dtype=atoms_struct.dtype,
         )
 
-        left_bounds = parent.left_grain_x_bounds
-        right_bounds = parent.right_grain_x_bounds
-        tolerance = parent.coordinate_tolerance
-        inserted_labels = np.empty(len(new_atoms), dtype=np.int8)
-        for index, x_value in enumerate(new_atoms["x"]):
-            x_coord = float(x_value)
-            in_left = (
-                x_coord >= left_bounds[0] - tolerance
-                and x_coord < left_bounds[1]
-            )
-            in_right = (
-                x_coord >= right_bounds[0] - tolerance
-                and x_coord < right_bounds[1]
-            )
-            if in_left and not in_right:
-                inserted_labels[index] = LEFT_GRAIN_LABEL
-            elif in_right and not in_left:
-                inserted_labels[index] = RIGHT_GRAIN_LABEL
-            elif in_left and in_right:
-                inserted_labels[index] = (
-                    LEFT_GRAIN_LABEL
-                    if x_coord < parent.gb_plane_x
-                    else RIGHT_GRAIN_LABEL
-                )
-            else:
-                raise ManipulationCapabilityError(
-                    "inserted atom lies outside both explicit physical grain x "
-                    "intervals"
-                )
+        inserted_labels = _label_inserted_atoms(
+            new_atoms,
+            left_bounds=parent.left_grain_x_bounds,
+            right_bounds=parent.right_grain_x_bounds,
+            tolerance=parent.coordinate_tolerance,
+            gb_plane_x=parent.gb_plane_x,
+        )
 
         candidate_atoms = np.hstack((atoms_struct, new_atoms))
         candidate_labels = np.hstack((labels, inserted_labels))
