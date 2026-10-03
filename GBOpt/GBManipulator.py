@@ -3398,7 +3398,9 @@ class GBManipulator:
         Displace atoms along a single selected soft phonon mode.
 
         :param threshold: Maximum displacement of atoms allowed, optional, defaults to 1.5
-            times the ideal bond length.
+            times the ideal bond length. The default is likely sufficient for most
+            cases; override it only if a specific system needs a tighter or looser
+            cap on displacement magnitude.
         :param mesh_size: Keyword argument. Specifies the size of the mesh for
             identifying unique q points. Optional. Defaults to 4.
         :param num_q: Keyword argument. Specifies the number of unique q points to use
@@ -3426,7 +3428,7 @@ class GBManipulator:
 
         ideal_bonds = parent.unit_cell.ideal_bond_lengths
         # TODO: justify the scaling factor. USPEX uses 1.5
-        if not threshold:
+        if threshold is None:
             threshold = 1.5 * max(ideal_bonds.values())
         cutoff = 1.5 * max(ideal_bonds.values())
         neighbor_list = _create_neighbor_list(cutoff, positions)
@@ -3542,6 +3544,24 @@ class GBManipulator:
                 safe_displacements[overlap_condition] = overlapped_atoms / overlap_disps
 
             adjusted_displacements = disp_vector * safe_displacements[:, None]
+
+            # Independently cap the final displacement magnitude at threshold. The
+            # overlap check above only constrains an atom that would collide with a
+            # neighbor; an atom with open space around it is otherwise displaced by
+            # the raw eigenvector magnitude with no upper bound. This clamps the
+            # already-overlap-adjusted vector's own magnitude, preserving its
+            # direction (including the overlap clamp's possible sign flip), rather
+            # than combining with the overlap scale factor directly -- that scale
+            # factor can itself be negative, which would make a naive elementwise
+            # minimum pick the larger-magnitude (more negative) value instead of
+            # the more restrictive one.
+            adjusted_magnitudes = np.linalg.norm(adjusted_displacements, axis=1)
+            over_threshold = adjusted_magnitudes > threshold
+            if np.any(over_threshold):
+                adjusted_displacements[over_threshold] *= (
+                    threshold / adjusted_magnitudes[over_threshold]
+                )[:, None]
+
             pos[parent.gb_indices] = positions[parent.gb_indices] + \
                 adjusted_displacements * (-1 if subtract_displacement else 1)
 
