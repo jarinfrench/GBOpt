@@ -2175,7 +2175,9 @@ class GBManipulator:
         Displace atoms along a single selected soft phonon mode.
 
         :param threshold: Maximum displacement of atoms allowed, optional, defaults to 1.5
-            times the ideal bond length.
+            times the ideal bond length. The default is likely sufficient for most
+            cases; override it only if a specific system needs a tighter or looser
+            cap on displacement magnitude.
         :param mesh_size: Keyword argument. Specifies the size of the mesh for
             identifying unique q points. Optional. Defaults to 4.
         :param num_q: Keyword argument. Specifies the number of unique q points to use
@@ -2203,7 +2205,8 @@ class GBManipulator:
         # parameter's handling) but, as before R17/R18, never actually used below --
         # see REFACTOR_CLEANUP.md's open entry on this parameter.
         ideal_bonds = parent.unit_cell.ideal_bond_lengths
-        if not threshold:
+        # TODO: justify the scaling factor. USPEX uses 1.5
+        if threshold is None:
             threshold = 1.5 * max(ideal_bonds.values())
 
         return self.__translate_manipulation_error(
@@ -2217,6 +2220,7 @@ class GBManipulator:
             num_q=num_q,
             mode_index=mode_index,
             subtract_displacement=subtract_displacement,
+            threshold=threshold,
         )
 
     def apply_group_symmetry(self, group: str) -> np.ndarray:

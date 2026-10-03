@@ -689,6 +689,31 @@ class TestGBManipulator(unittest.TestCase):
             child, self.manipulator_tilt.parents[0].whole_system))
 
     @pytest.mark.slow
+    def test_displace_along_soft_modes_threshold_caps_displacement_magnitude(self):
+        # threshold must cap per-atom displacement magnitude independent of the
+        # overlap-avoidance clamp, which only engages when atoms would collide.
+        parent = self.manipulator_tilt.parents[0]
+        gb_indices = np.asarray(parent.gb_indices, dtype=np.intp)
+        parent_positions = np.column_stack(
+            (parent.whole_system["x"], parent.whole_system["y"],
+             parent.whole_system["z"]))
+
+        uncapped = self.manipulator_tilt.displace_along_soft_modes(threshold=1e6)
+        uncapped_positions = np.column_stack(
+            (uncapped["x"], uncapped["y"], uncapped["z"]))
+        uncapped_magnitudes = np.linalg.norm(
+            uncapped_positions[gb_indices] - parent_positions[gb_indices], axis=1)
+        self.assertTrue(np.any(uncapped_magnitudes > 1e-6))
+
+        small_threshold = 1e-6
+        capped = self.manipulator_tilt.displace_along_soft_modes(small_threshold)
+        capped_positions = np.column_stack(
+            (capped["x"], capped["y"], capped["z"]))
+        capped_magnitudes = np.linalg.norm(
+            capped_positions[gb_indices] - parent_positions[gb_indices], axis=1)
+        self.assertTrue(np.all(capped_magnitudes <= small_threshold + 1e-9))
+
+    @pytest.mark.slow
     def test_displace_along_soft_modes_diff_mesh(self):
         # test differing mesh size
         child = self.manipulator_tilt.displace_along_soft_modes(mesh_size=2)
