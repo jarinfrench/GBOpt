@@ -537,6 +537,27 @@ class TestGBManipulator(unittest.TestCase):
         names, counts = np.unique(new_system["name"], return_counts=True)
         self.assertEqual(dict(zip(names, counts)), {"U": 1})
 
+    def test_make_removal_candidate(self):
+        before = self.tilt.whole_system.copy()
+
+        candidate = self.manipulator_tilt.make_removal_candidate(gb_fraction=0.10)
+
+        self.assertGreater(len(before), len(candidate.atoms))
+        self.assertEqual(len(candidate.atoms), len(candidate.grain_labels))
+        np.testing.assert_array_equal(self.tilt.whole_system, before)
+
+    def test_make_removal_candidate_fraction_error(self):
+        with self.assertRaises(GBManipulatorValueError):
+            _ = self.manipulator_tilt.make_removal_candidate(gb_fraction=0.50)
+
+    def test_make_removal_candidate_requires_one_parent(self):
+        manipulator = GBManipulator(self.tilt, self.tilt, seed=self.seed)
+        with self.assertRaisesRegex(
+            GBManipulatorValueError,
+            "a removal candidate requires exactly one parent",
+        ):
+            _ = manipulator.make_removal_candidate(gb_fraction=0.10)
+
     def test_insert_atoms(self):
         new_system_delaunay = self.manipulator_tilt.insert_atoms(
             fill_fraction=0.10, method='delaunay')
@@ -576,6 +597,29 @@ class TestGBManipulator(unittest.TestCase):
     def test_insert_atoms_invalid_method(self):
         with self.assertRaises(GBManipulatorValueError):
             _ = self.manipulator_tilt.insert_atoms(fill_fraction=0.10, method='invalid')
+
+    def test_make_insertion_candidate(self):
+        before = self.tilt.whole_system.copy()
+
+        candidate = self.manipulator_tilt.make_insertion_candidate(
+            fill_fraction=0.10, method="delaunay")
+
+        self.assertGreater(len(candidate.atoms), len(before))
+        self.assertEqual(len(candidate.atoms), len(candidate.grain_labels))
+        np.testing.assert_array_equal(self.tilt.whole_system, before)
+
+    def test_make_insertion_candidate_invalid_method(self):
+        with self.assertRaises(GBManipulatorValueError):
+            _ = self.manipulator_tilt.make_insertion_candidate(
+                fill_fraction=0.10, method="invalid")
+
+    def test_make_insertion_candidate_requires_one_parent(self):
+        manipulator = GBManipulator(self.tilt, self.tilt, seed=self.seed)
+        with self.assertRaisesRegex(
+            GBManipulatorValueError,
+            "an insertion candidate requires exactly one parent",
+        ):
+            _ = manipulator.make_insertion_candidate(fill_fraction=0.10)
 
     def test_insert_atoms_with_specific_number(self):
         new_system_delaunay = self.manipulator_tilt.insert_atoms(
@@ -712,6 +756,30 @@ class TestGBManipulator(unittest.TestCase):
         capped_magnitudes = np.linalg.norm(
             capped_positions[gb_indices] - parent_positions[gb_indices], axis=1)
         self.assertTrue(np.all(capped_magnitudes <= small_threshold + 1e-9))
+
+    def test_make_soft_mode_candidate_threshold_caps_displacement_magnitude(self):
+        parent = self.manipulator_tilt.parents[0]
+        gb_indices = np.asarray(parent.gb_indices, dtype=np.intp)
+        parent_positions = np.column_stack(
+            (parent.whole_system["x"], parent.whole_system["y"],
+             parent.whole_system["z"]))
+
+        small_threshold = 1e-6
+        candidate = self.manipulator_tilt.make_soft_mode_candidate(small_threshold)
+        candidate_positions = np.column_stack(
+            (candidate.atoms["x"], candidate.atoms["y"], candidate.atoms["z"]))
+        magnitudes = np.linalg.norm(
+            candidate_positions[gb_indices] - parent_positions[gb_indices], axis=1)
+        self.assertTrue(np.all(magnitudes <= small_threshold + 1e-9))
+        self.assertEqual(len(candidate.atoms), len(candidate.grain_labels))
+
+    def test_make_soft_mode_candidate_requires_one_parent(self):
+        manipulator = GBManipulator(self.tilt, self.tilt, seed=self.seed)
+        with self.assertRaisesRegex(
+            GBManipulatorValueError,
+            "a soft-mode displacement candidate requires exactly one parent",
+        ):
+            _ = manipulator.make_soft_mode_candidate()
 
     @pytest.mark.slow
     def test_displace_along_soft_modes_diff_mesh(self):

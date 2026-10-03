@@ -39,6 +39,8 @@ from GBOpt.interface.types import (
 from GBOpt.io import StructureData
 from GBOpt.io.lammps import LammpsDataError, read_structure_file
 from GBOpt.manipulation import (
+    AtomInsertion,
+    AtomRemoval,
     GrainTerminationCycle,
     InterfaceSeparation,
     Manipulation,
@@ -49,6 +51,7 @@ from GBOpt.manipulation import (
     ManipulationRegistry,
     ManipulationResult,
     RightGrainTranslation,
+    SoftModeDisplacement,
     default_registry,
 )
 from GBOpt.manipulation.density import (
@@ -2024,6 +2027,50 @@ class GBManipulator:
         else:
             return pos
 
+    def make_removal_candidate(
+        self,
+        *,
+        gb_fraction: float = None,
+        num_to_remove: int = None,
+        keep_ratio: bool = True,
+    ) -> InterfaceCandidate:
+        """Return a geometry-bearing GB-region atom-removal candidate.
+
+        :param gb_fraction: Keyword argument. The fraction of atoms in the GB plane to
+            remove. Must be less than or equal to 25% of the total number of atoms in
+            the GB region. One of ``gb_fraction``/``num_to_remove`` is required.
+        :param num_to_remove: Keyword argument. The specific number of atoms to remove.
+            Maximum is 25% of the total number of atoms in the GB region.
+        :param keep_ratio: Keyword argument, optional, defaults to ``True``. Whether or
+            not to maintain stoichiometric ratios.
+        :return: Complete immutable candidate with the selected atoms removed.
+        :raises GBManipulatorValueError: If the manipulator does not have exactly one
+            parent, neither ``gb_fraction`` nor ``num_to_remove`` is specified, the
+            requested fraction/count is out of range, or the selection cannot preserve
+            stoichiometry.
+        """
+        if not self.__one_parent:
+            raise GBManipulatorValueError(
+                "a removal candidate requires exactly one parent"
+            )
+
+        parent = self.__parents[0]
+        context = ManipulationContext(
+            parents=(self.__parent_candidate_geometry(0),),
+            rng=self.__rng,
+            params={
+                "unit_cell": parent.unit_cell,
+                "gb_thickness": parent.gb_thickness,
+                "gb_fraction": gb_fraction,
+                "num_to_remove": num_to_remove,
+                "keep_ratio": keep_ratio,
+            },
+        )
+        result = self.__translate_manipulation_error(AtomRemoval().execute, context)
+        child = result.children[0]
+        self.__set_candidate_labels(child.grain_labels, len(child.atoms))
+        return child
+
     def insert_atoms(
         self,
         *,
@@ -2162,6 +2209,56 @@ class GBManipulator:
             return (candidate, new_atoms)
         return candidate
 
+    def make_insertion_candidate(
+        self,
+        *,
+        fill_fraction: float = None,
+        num_to_insert: int = None,
+        method: str = "delaunay",
+        keep_ratio: bool = True,
+    ) -> InterfaceCandidate:
+        """Return a geometry-bearing GB-region atom-insertion candidate.
+
+        :param fill_fraction: Keyword argument. The fraction of empty lattice sites to
+            fill. Must be less than or equal to 25% of the total number of atoms in the
+            GB region. One of ``fill_fraction``/``num_to_insert`` is required.
+        :param num_to_insert: Keyword argument. The number of atoms to insert. Must be
+            less than or equal to 25% of the total number of atoms in the GB region.
+        :param method: Keyword argument, optional, defaults to ``"delaunay"``. The
+            empty-site-finding method to use. Must be either ``"delaunay"`` or
+            ``"grid"``.
+        :param keep_ratio: Keyword argument, optional, defaults to ``True``. Whether or
+            not to keep stoichiometric ratios in the system with the added atoms.
+        :return: Complete immutable candidate with the selected atoms inserted.
+        :raises GBManipulatorValueError: If the manipulator does not have exactly one
+            parent, neither ``fill_fraction`` nor ``num_to_insert`` is specified, the
+            requested fraction/count is out of range, ``method`` is unrecognized, an
+            insertion site falls outside both physical grain intervals, or the
+            selection cannot preserve stoichiometry.
+        """
+        if not self.__one_parent:
+            raise GBManipulatorValueError(
+                "an insertion candidate requires exactly one parent"
+            )
+
+        parent = self.__parents[0]
+        context = ManipulationContext(
+            parents=(self.__parent_candidate_geometry(0),),
+            rng=self.__rng,
+            params={
+                "unit_cell": parent.unit_cell,
+                "gb_thickness": parent.gb_thickness,
+                "fill_fraction": fill_fraction,
+                "num_to_insert": num_to_insert,
+                "method": method,
+                "keep_ratio": keep_ratio,
+            },
+        )
+        result = self.__translate_manipulation_error(AtomInsertion().execute, context)
+        child = result.children[0]
+        self.__set_candidate_labels(child.grain_labels, len(child.atoms))
+        return child
+
     def displace_along_soft_modes(
         self,
         threshold: float = None,
@@ -2222,6 +2319,60 @@ class GBManipulator:
             subtract_displacement=subtract_displacement,
             threshold=threshold,
         )
+
+    def make_soft_mode_candidate(
+        self,
+        threshold: float = None,
+        *,
+        mesh_size: int = 4,
+        num_q: int = 1,
+        mode_index: int = 0,
+        subtract_displacement: bool = False,
+    ) -> InterfaceCandidate:
+        """Return a geometry-bearing single-soft-mode displacement candidate.
+
+        :param threshold: Maximum displacement of atoms allowed, optional, defaults to
+            1.5 times the ideal bond length.
+        :param mesh_size: Keyword argument, optional, defaults to ``4``. Size of the
+            mesh for identifying unique q points.
+        :param num_q: Keyword argument, optional, defaults to ``1``. Number of unique q
+            points to use when calculating the dynamical matrix and displacements.
+        :param mode_index: Keyword argument, optional, defaults to ``0``. Selects which
+            non-acoustic soft mode to displace along, ordered from softest (0) to
+            next-softest (1), and so on.
+        :param subtract_displacement: Keyword argument, optional, defaults to
+            ``False``. Whether to subtract, rather than add, the eigenvector
+            displacement.
+        :return: Complete immutable candidate displaced along the selected mode.
+        :raises GBManipulatorValueError: If the manipulator does not have exactly one
+            parent, ``mesh_size``/``num_q``/``mode_index`` is out of range, or
+            ``threshold`` is negative.
+        """
+        if not self.__one_parent:
+            raise GBManipulatorValueError(
+                "a soft-mode displacement candidate requires exactly one parent"
+            )
+
+        parent = self.__parents[0]
+        context = ManipulationContext(
+            parents=(self.__parent_candidate_geometry(0),),
+            rng=self.__rng,
+            params={
+                "unit_cell": parent.unit_cell,
+                "gb_thickness": parent.gb_thickness,
+                "mesh_size": mesh_size,
+                "num_q": num_q,
+                "mode_index": mode_index,
+                "subtract_displacement": subtract_displacement,
+                "threshold": threshold,
+            },
+        )
+        result = self.__translate_manipulation_error(
+            SoftModeDisplacement().execute, context
+        )
+        child = result.children[0]
+        self.__set_candidate_labels(child.grain_labels, len(child.atoms))
+        return child
 
     def apply_group_symmetry(self, group: str) -> np.ndarray:
         """
