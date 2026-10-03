@@ -16,11 +16,17 @@
 import numpy as np
 import pytest
 
+from GBOpt.Atom import Atom
+from GBOpt.BoundaryTopology import BoundaryNormalTopology
+from GBOpt.interface.model import InterfaceCandidate
 from GBOpt.manipulation.density import (
+    AtomRemoval,
     _random_type_counts,
     select_insertion_sites,
     select_removal_indices,
 )
+from GBOpt.manipulation.types import ManipulationContext
+from GBOpt.UnitCell import UnitCell
 
 
 def test_random_type_counts_does_not_use_global_rng(monkeypatch):
@@ -120,3 +126,54 @@ def test_select_insertion_sites_multitype_keep_ratio_false_does_not_use_global_r
         keep_ratio=False,
         rng=np.random.default_rng(7),
     )
+
+
+def test_atom_removal_execute_converts_atom_names_using_unit_cell_type_map():
+    """Regression for a bug found while adding GBManipulator.make_removal_candidate.
+
+    ``AtomRemoval.execute`` used to invert ``unit_cell.type_map`` (already
+    ``dict[str, int]``, name -> integer type) before looking up each atom's numeric
+    type by name, producing an int-keyed dict and raising ``KeyError`` on the string
+    lookup for any real unit cell. No existing test called ``AtomRemoval.execute``
+    directly, so this went uncaught until a real ``GBMaker``-sourced unit cell (type
+    names like ``"Cu"``) was exercised through ``make_removal_candidate``.
+    """
+    unit_cell = UnitCell()
+    unit_cell.init_by_structure("fcc", 1.0, "Cu")
+
+    atoms = np.asarray(
+        [
+            ("Cu", 0.0, 0.0, 0.0),
+            ("Cu", 1.0, 0.0, 0.0),
+            ("Cu", 2.0, 0.0, 0.0),
+            ("Cu", 3.0, 0.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    box_dims = np.asarray([[0.0, 4.0], [0.0, 4.0], [0.0, 4.0]], dtype=float)
+    candidate = InterfaceCandidate(
+        atoms=atoms,
+        box_dims=box_dims,
+        gb_plane_x=2.0,
+        left_grain_x_bounds=(0.0, 2.0),
+        right_grain_x_bounds=(2.0, 4.0),
+        grain_labels=np.asarray([0, 0, 1, 1], dtype=np.int8),
+        inplane_periodic=(True, True),
+        normal_topology=BoundaryNormalTopology.PERIODIC_BICRYSTAL,
+        coordinate_tolerance=1.0e-8,
+        interface_separation=0.0,
+    )
+    context = ManipulationContext(
+        parents=(candidate,),
+        rng=np.random.default_rng(0),
+        params={
+            "unit_cell": unit_cell,
+            "gb_thickness": 4.0,
+            "num_to_remove": 1,
+            "keep_ratio": True,
+        },
+    )
+
+    result = AtomRemoval().execute(context)
+
+    assert len(result.children[0].atoms) == 3

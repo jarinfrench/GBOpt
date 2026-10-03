@@ -657,11 +657,10 @@ class AtomRemoval:
 
         atoms_struct = parent.atoms
         type_map = unit_cell.type_map
-        name_to_type = {name: type_id for type_id, name in type_map.items()}
         atoms = np.column_stack(
             (
                 np.array(
-                    [name_to_type[str(name)] for name in atoms_struct["name"]],
+                    [type_map[str(name)] for name in atoms_struct["name"]],
                     dtype=float,
                 ),
                 atoms_struct["x"].astype(float),
