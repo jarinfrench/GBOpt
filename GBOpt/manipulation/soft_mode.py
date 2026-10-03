@@ -305,6 +305,126 @@ def _calculate_dynamical_matrix(
     return Dij
 
 
+def _solve_soft_mode_eigenvectors(
+    *,
+    hardness,
+    positions: np.ndarray,
+    gb_indices: np.ndarray,
+    neighbor_list_typed,
+    q_points,
+    num_q: int,
+    mode_index: int,
+) -> np.ndarray:
+    """Return every non-acoustic soft-mode eigenvector, softest first.
+
+    :return: ``(num_non_acoustic_modes, 3 * len(gb_indices))`` real eigenvectors.
+    :raises ManipulationCapabilityError: If ``mode_index`` is out of range for this
+        system, or the requested mode cannot be generated from a sparse matrix.
+    """
+    n_atoms = len(gb_indices)
+    sparse_threshold = 10000
+
+    num_modes_needed = mode_index + 1
+    if num_modes_needed > 3 * n_atoms:
+        raise ManipulationCapabilityError(
+            f"mode_index={mode_index} is out of range: at most "
+            f"{3 * n_atoms} mode(s) can be computed for this system."
+        )
+
+    freqs = np.zeros((num_q, num_modes_needed))
+    disps = np.zeros((num_q, num_modes_needed, 3 * n_atoms))
+
+    for i, q_vec in enumerate(q_points[:num_q]):
+        dynamical_matrix = _calculate_dynamical_matrix(
+            hardness, positions, gb_indices, neighbor_list_typed, q_vec)
+        if 3 * n_atoms <= sparse_threshold:
+            freq_vals, disp_vals = np.linalg.eigh(dynamical_matrix)
+        else:
+            sparse_matrix = sps.csc_matrix(dynamical_matrix)
+            if num_modes_needed >= 3 * n_atoms - 1 != num_modes_needed:
+                raise ManipulationCapabilityError(
+                    "Cannot generate the requested soft mode.")
+            freq_vals, disp_vals = sps.linalg.eigsh(
+                sparse_matrix, k=num_modes_needed, which="SA")
+        freqs[i] = freq_vals[:num_modes_needed]
+        disps[i, :, :] = np.real(disp_vals)[:, :num_modes_needed].T
+
+    non_acoustic_indices = np.where(~np.isclose(freqs, 0))
+
+    filtered_freqs = freqs[non_acoustic_indices]
+    sorted_filtered_freq_indices = np.argsort(filtered_freqs)
+    saved_disps = disps[non_acoustic_indices[0][sorted_filtered_freq_indices],
+                        non_acoustic_indices[1][sorted_filtered_freq_indices], :]
+
+    if mode_index >= len(saved_disps):
+        raise ManipulationCapabilityError(
+            f"mode_index={mode_index} is out of range: only "
+            f"{len(saved_disps)} non-acoustic soft mode(s) available."
+        )
+    return saved_disps
+
+
+def _apply_gb_displacement(
+    *,
+    positions: np.ndarray,
+    gb_indices: np.ndarray,
+    neighbor_list,
+    radius: float,
+    disp_vector: np.ndarray,
+    threshold: float,
+    subtract_displacement: bool,
+) -> np.ndarray:
+    """Return ``positions`` with the GB region displaced along ``disp_vector``.
+
+    Caps each atom's displacement to avoid overlapping a neighbor, then
+    independently caps the resulting magnitude at ``threshold``. Leaves every
+    position unchanged if any atom's raw eigenvector displacement is exactly zero.
+    """
+    d_min = 2 * radius
+
+    precomputed_distances = np.zeros(len(gb_indices))
+    for i, atom_idx in enumerate(gb_indices):
+        neighbors = neighbor_list[atom_idx]
+        neighbor_positions = positions[neighbors]
+        dists = np.linalg.norm(positions[atom_idx] - neighbor_positions, axis=1)
+        precomputed_distances[i] = np.min(dists) - d_min
+
+    pos = np.copy(positions)
+    disp_magnitude = np.linalg.norm(disp_vector, axis=1)
+
+    if not np.any(disp_magnitude == 0):
+        overlap_condition = precomputed_distances < disp_magnitude
+        safe_displacements = np.ones_like(disp_magnitude)
+        if np.any(overlap_condition):
+            overlapped_atoms = precomputed_distances[overlap_condition]
+            overlap_disps = disp_magnitude[overlap_condition]
+            safe_displacements[overlap_condition] = overlapped_atoms / overlap_disps
+
+        adjusted_displacements = disp_vector * safe_displacements[:, None]
+
+        # Independently cap the final displacement magnitude at threshold. The
+        # overlap check above only constrains an atom that would collide with a
+        # neighbor; an atom with open space around it is otherwise displaced by
+        # the raw eigenvector magnitude with no upper bound. This clamps the
+        # already-overlap-adjusted vector's own magnitude, preserving its
+        # direction (including the overlap clamp's possible sign flip), rather
+        # than combining with the overlap scale factor directly -- that scale
+        # factor can itself be negative, which would make a naive elementwise
+        # minimum pick the larger-magnitude (more negative) value instead of
+        # the more restrictive one.
+        adjusted_magnitudes = np.linalg.norm(adjusted_displacements, axis=1)
+        over_threshold = adjusted_magnitudes > threshold
+        if np.any(over_threshold):
+            adjusted_displacements[over_threshold] *= (
+                threshold / adjusted_magnitudes[over_threshold]
+            )[:, None]
+
+        pos[gb_indices] = positions[gb_indices] + \
+            adjusted_displacements * (-1 if subtract_displacement else 1)
+
+    return pos
+
+
 def soft_mode_displacement_atoms(
     *,
     structured_atoms: np.ndarray,
@@ -372,90 +492,24 @@ def soft_mode_displacement_atoms(
             "Recommended to increase mesh size."
         )
 
-    n_atoms = len(gb_indices)
-
-    sparse_threshold = 10000
-
-    num_modes_needed = mode_index + 1
-    if num_modes_needed > 3 * n_atoms:
-        raise ManipulationCapabilityError(
-            f"mode_index={mode_index} is out of range: at most "
-            f"{3 * n_atoms} mode(s) can be computed for this system."
-        )
-
-    freqs = np.zeros((num_q, num_modes_needed))
-    disps = np.zeros((num_q, num_modes_needed, 3 * n_atoms))
-
-    for i, q_vec in enumerate(q_points[:num_q]):
-        dynamical_matrix = _calculate_dynamical_matrix(
-            hardness, positions, gb_indices, neighbor_list_typed, q_vec)
-        if 3 * n_atoms <= sparse_threshold:
-            freq_vals, disp_vals = np.linalg.eigh(dynamical_matrix)
-        else:
-            sparse_matrix = sps.csc_matrix(dynamical_matrix)
-            if num_modes_needed >= 3 * n_atoms - 1 != num_modes_needed:
-                raise ManipulationCapabilityError(
-                    "Cannot generate the requested soft mode.")
-            freq_vals, disp_vals = sps.linalg.eigsh(
-                sparse_matrix, k=num_modes_needed, which="SA")
-        freqs[i] = freq_vals[:num_modes_needed]
-        disps[i, :, :] = np.real(disp_vals)[:, :num_modes_needed].T
-
-    non_acoustic_indices = np.where(~np.isclose(freqs, 0))
-
-    filtered_freqs = freqs[non_acoustic_indices]
-    sorted_filtered_freq_indices = np.argsort(filtered_freqs)
-    saved_disps = disps[non_acoustic_indices[0][sorted_filtered_freq_indices],
-                        non_acoustic_indices[1][sorted_filtered_freq_indices], :]
-
-    if mode_index >= len(saved_disps):
-        raise ManipulationCapabilityError(
-            f"mode_index={mode_index} is out of range: only "
-            f"{len(saved_disps)} non-acoustic soft mode(s) available."
-        )
-
-    d_min = 2 * unit_cell.radius
-
-    precomputed_distances = np.zeros(len(gb_indices))
-    for i, atom_idx in enumerate(gb_indices):
-        neighbors = neighbor_list[atom_idx]
-        neighbor_positions = positions[neighbors]
-        dists = np.linalg.norm(positions[atom_idx] - neighbor_positions, axis=1)
-        precomputed_distances[i] = np.min(dists) - d_min
-
-    pos = np.copy(positions)
-    disp_vector = saved_disps[mode_index].reshape(-1, 3)
-    disp_magnitude = np.linalg.norm(disp_vector, axis=1)
-
-    if not np.any(disp_magnitude == 0):
-        overlap_condition = precomputed_distances < disp_magnitude
-        safe_displacements = np.ones_like(disp_magnitude)
-        if np.any(overlap_condition):
-            overlapped_atoms = precomputed_distances[overlap_condition]
-            overlap_disps = disp_magnitude[overlap_condition]
-            safe_displacements[overlap_condition] = overlapped_atoms / overlap_disps
-
-        adjusted_displacements = disp_vector * safe_displacements[:, None]
-
-        # Independently cap the final displacement magnitude at threshold. The
-        # overlap check above only constrains an atom that would collide with a
-        # neighbor; an atom with open space around it is otherwise displaced by
-        # the raw eigenvector magnitude with no upper bound. This clamps the
-        # already-overlap-adjusted vector's own magnitude, preserving its
-        # direction (including the overlap clamp's possible sign flip), rather
-        # than combining with the overlap scale factor directly -- that scale
-        # factor can itself be negative, which would make a naive elementwise
-        # minimum pick the larger-magnitude (more negative) value instead of
-        # the more restrictive one.
-        adjusted_magnitudes = np.linalg.norm(adjusted_displacements, axis=1)
-        over_threshold = adjusted_magnitudes > threshold
-        if np.any(over_threshold):
-            adjusted_displacements[over_threshold] *= (
-                threshold / adjusted_magnitudes[over_threshold]
-            )[:, None]
-
-        pos[gb_indices] = positions[gb_indices] + \
-            adjusted_displacements * (-1 if subtract_displacement else 1)
+    saved_disps = _solve_soft_mode_eigenvectors(
+        hardness=hardness,
+        positions=positions,
+        gb_indices=gb_indices,
+        neighbor_list_typed=neighbor_list_typed,
+        q_points=q_points,
+        num_q=num_q,
+        mode_index=mode_index,
+    )
+    pos = _apply_gb_displacement(
+        positions=positions,
+        gb_indices=gb_indices,
+        neighbor_list=neighbor_list,
+        radius=unit_cell.radius,
+        disp_vector=saved_disps[mode_index].reshape(-1, 3),
+        threshold=threshold,
+        subtract_displacement=subtract_displacement,
+    )
 
     structured_pos = np.zeros((len(atoms)), dtype=Atom.atom_dtype)
     structured_pos["name"] = structured_atoms["name"]
