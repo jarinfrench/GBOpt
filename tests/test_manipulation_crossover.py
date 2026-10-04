@@ -78,6 +78,7 @@ class _FakeParent:
     inplane_periodic: tuple = (True, True)
     normal_topology: object = BoundaryNormalTopology.PERIODIC_BICRYSTAL
     coordinate_tolerance: float = _TOLERANCE
+    interface_separation: float = 0.0
     unit_cell: object = field(default_factory=_unit_cell)
 
 
@@ -166,6 +167,23 @@ def test_pure_function_rejects_mismatched_topology_when_owned():
         whole_system=_atoms(), grain_labels=_labels(), inplane_periodic=(True, False)
     )
     with pytest.raises(ManipulationCompatibilityError, match="matching boundary topology"):
+        crossover_slice_and_merge(
+            first,
+            second,
+            surface_mode="normal_plane",
+            max_tilt_degrees=5.0,
+            rng=_FixedRandom(0.5),
+        )
+
+
+def test_pure_function_rejects_mismatched_interface_separation_when_owned():
+    first = _FakeParent(whole_system=_atoms(), grain_labels=_labels())
+    second = _FakeParent(
+        whole_system=_atoms(), grain_labels=_labels(), interface_separation=2.0
+    )
+    with pytest.raises(
+        ManipulationCompatibilityError, match="matching interface separation"
+    ):
         crossover_slice_and_merge(
             first,
             second,
@@ -359,6 +377,37 @@ def test_execute_produces_labeled_child_with_preserved_geometry():
     assert child.gb_plane_x == pytest.approx(parent1.gb_plane_x)
     assert child.normal_topology is parent1.normal_topology
     assert child.inplane_periodic == parent1.inplane_periodic
+
+
+def test_execute_child_coordinate_tolerance_is_looser_of_both_parents():
+    parent1 = _make_candidate(coordinate_tolerance=1.0e-8)
+    parent2 = _make_candidate(atoms=_atoms(2.0), coordinate_tolerance=1.0e-3)
+    result = SliceAndMerge().execute(
+        _context(
+            parent1,
+            parent2,
+            rng=np.random.default_rng(0),
+            unit_cell=(_unit_cell(), _unit_cell()),
+            gb_thickness=_GB_THICKNESS,
+        )
+    )
+    assert result.children[0].coordinate_tolerance == pytest.approx(1.0e-3)
+
+
+def test_execute_rejects_mismatched_interface_separation():
+    parent1 = _make_candidate()
+    parent2 = _make_candidate(atoms=_atoms(2.0), interface_separation=2.0)
+    with pytest.raises(
+        ManipulationCompatibilityError, match="matching interface separation"
+    ):
+        SliceAndMerge().execute(
+            _context(
+                parent1,
+                parent2,
+                unit_cell=(_unit_cell(), _unit_cell()),
+                gb_thickness=_GB_THICKNESS,
+            )
+        )
 
 
 def test_execute_records_lineage_and_parameters():

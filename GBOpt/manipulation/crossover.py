@@ -94,6 +94,9 @@ class CrossoverParent(Protocol):
     def coordinate_tolerance(self) -> float: ...
 
     @property
+    def interface_separation(self) -> float: ...
+
+    @property
     def unit_cell(self) -> object: ...
 
 
@@ -304,6 +307,305 @@ def _sample_interval_by_width(
     return cut
 
 
+def _validate_crossover_parameters(surface_mode: str, max_tilt_degrees: float) -> float:
+    """Validate ``surface_mode``/``max_tilt_degrees`` and return the validated tilt.
+
+    :param surface_mode: Crossover surface mode; must be ``"normal_plane"`` or
+        ``"periodic_wave"``.
+    :param max_tilt_degrees: Maximum combined local tilt for ``"periodic_wave"``, in
+        degrees; must satisfy ``0 <= value < 90``.
+    :return: ``max_tilt_degrees`` as a validated Python ``float``.
+    :raises TypeError: If ``max_tilt_degrees`` is Boolean or non-real.
+    :raises ManipulationConfigurationError: If ``surface_mode`` is not
+        ``"normal_plane"``/``"periodic_wave"``, or ``max_tilt_degrees`` is out of range.
+    """
+    if surface_mode not in {"normal_plane", "periodic_wave"}:
+        raise ManipulationConfigurationError(
+            "surface_mode must be 'normal_plane' or 'periodic_wave'"
+        )
+    tilt = _validate_finite_real("max_tilt_degrees", max_tilt_degrees)
+    if tilt < 0.0 or tilt >= 90.0:
+        raise ManipulationConfigurationError(
+            "max_tilt_degrees must satisfy 0 <= value < 90"
+        )
+    return tilt
+
+
+def _validate_owned_compatibility(
+    first: CrossoverParent,
+    second: CrossoverParent,
+) -> float:
+    """Validate topology/geometry/separation agreement between two owned parents.
+
+    Only called once both parents are known to carry real ``grain_labels``.
+
+    :param first: First parent.
+    :param second: Second parent.
+    :return: Coordinate tolerance used for these agreement checks (the looser of the
+        two parents' own tolerances), for reuse when deciding whether to rescale
+        ``second``'s atoms into ``first``'s box.
+    :raises ManipulationCompatibilityError: If the parents have mismatched boundary
+        topology, non-affine-equivalent physical grain geometry, or mismatched
+        interface separation.
+    """
+    tolerance = max(first.coordinate_tolerance, second.coordinate_tolerance)
+    if (
+        first.inplane_periodic != second.inplane_periodic
+        or first.normal_topology is not second.normal_topology
+    ):
+        raise ManipulationCompatibilityError(
+            "owned crossover requires matching boundary topology"
+        )
+    mapped_plane = _remap_axis_values(
+        second.gb_plane_x,
+        second.box_dims[0],
+        first.box_dims[0],
+    )
+    mapped_left_bounds = _remap_axis_values(
+        second.left_grain_x_bounds,
+        second.box_dims[0],
+        first.box_dims[0],
+    )
+    mapped_right_bounds = _remap_axis_values(
+        second.right_grain_x_bounds,
+        second.box_dims[0],
+        first.box_dims[0],
+    )
+    if (
+        not np.isclose(
+            first.gb_plane_x,
+            mapped_plane,
+            atol=tolerance,
+            rtol=0.0,
+        )
+        or not np.allclose(
+            first.left_grain_x_bounds,
+            mapped_left_bounds,
+            atol=tolerance,
+            rtol=0.0,
+        )
+        or not np.allclose(
+            first.right_grain_x_bounds,
+            mapped_right_bounds,
+            atol=tolerance,
+            rtol=0.0,
+        )
+    ):
+        raise ManipulationCompatibilityError(
+            "owned crossover requires affine-equivalent physical grain "
+            "geometry"
+        )
+    if not np.isclose(
+        first.interface_separation,
+        second.interface_separation,
+        atol=tolerance,
+        rtol=0.0,
+    ):
+        raise ManipulationCompatibilityError(
+            "owned crossover requires matching interface separation"
+        )
+    return tolerance
+
+
+def _align_crossover_positions(
+    first: CrossoverParent,
+    second: CrossoverParent,
+    pos2: np.ndarray,
+    tolerance: float,
+) -> np.ndarray:
+    """Rescale ``pos2`` into ``first``'s box when the two owned parents' boxes differ.
+
+    :param first: First parent, supplying the target box.
+    :param second: Second parent, supplying the source box.
+    :param pos2: Second parent's structured atom rows.
+    :param tolerance: Coordinate tolerance to use for the box-size comparison, as
+        returned by ``_validate_owned_compatibility``.
+    :return: ``pos2`` rescaled into ``first.box_dims`` if the boxes differ by more than
+        ``tolerance``; otherwise ``pos2`` unchanged.
+    """
+    if np.allclose(first.box_dims, second.box_dims, atol=tolerance, rtol=0.0):
+        return pos2
+    return _rescale_atoms(pos2, second.box_dims, first.box_dims)
+
+
+def _validate_formula_compatibility(
+    pos1: np.ndarray,
+    pos2: np.ndarray,
+    first_unit_cell: object,
+    second_unit_cell: object,
+) -> tuple[tuple[str, int], ...]:
+    """Validate both parents' atoms are formula multiples with the same formula vector.
+
+    :param pos1: First parent's structured atom rows.
+    :param pos2: Second parent's (possibly box-aligned) structured atom rows.
+    :param first_unit_cell: First parent's unit cell.
+    :param second_unit_cell: Second parent's unit cell.
+    :return: The formula vector shared by both parents.
+    :raises ManipulationCapabilityError: If either parent's atoms are not an exact
+        formula multiple, or the parents' unit cells use different normalized formula
+        vectors.
+    """
+    try:
+        validate_formula_composition(pos1, first_unit_cell)
+        validate_formula_composition(pos2, second_unit_cell)
+    except CandidateAdmissibilityError as exc:
+        raise ManipulationCapabilityError(str(exc)) from exc
+    first_formula = first_unit_cell.formula_ratio
+    second_formula = second_unit_cell.formula_ratio
+    if first_formula != second_formula:
+        raise ManipulationCapabilityError(
+            "crossover parents use different normalized formula vectors"
+        )
+    return first_formula
+
+
+def _sample_periodic_wave_parameters(
+    surface_mode: str,
+    tilt: float,
+    box_dims: np.ndarray,
+    rng,
+) -> tuple[float, float, float, float]:
+    """Sample periodic-wave amplitude/phase, or return all-zero for ``"normal_plane"``.
+
+    :param surface_mode: Crossover surface mode.
+    :param tilt: Validated ``max_tilt_degrees``.
+    :param box_dims: Crossover box bounds (the first parent's own ``box_dims``).
+    :param rng: Duck-typed random source exposing ``.random()``.
+    :return: ``(amplitude_y, amplitude_z, phase_y, phase_z)``, all ``0.0`` unless
+        ``surface_mode == "periodic_wave"`` and ``tilt > 0.0``.
+    """
+    if surface_mode != "periodic_wave" or tilt <= 0.0:
+        return 0.0, 0.0, 0.0, 0.0
+    maximum_slope = np.tan(np.deg2rad(tilt))
+    slope_radius = maximum_slope * np.sqrt(float(rng.random()))
+    slope_angle = 2.0 * np.pi * float(rng.random())
+    slope_y = slope_radius * np.cos(slope_angle)
+    slope_z = slope_radius * np.sin(slope_angle)
+    y_length = float(np.ptp(box_dims[1]))
+    z_length = float(np.ptp(box_dims[2]))
+    amplitude_y = slope_y * y_length / (2.0 * np.pi)
+    amplitude_z = slope_z * z_length / (2.0 * np.pi)
+    phase_y = 2.0 * np.pi * float(rng.random())
+    phase_z = 2.0 * np.pi * float(rng.random())
+    return amplitude_y, amplitude_z, phase_y, phase_z
+
+
+def _crossover_coordinates_and_window(
+    pos1: np.ndarray,
+    pos2: np.ndarray,
+    first: CrossoverParent,
+    *,
+    amplitude_y: float,
+    amplitude_z: float,
+    phase_y: float,
+    phase_z: float,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Project both parents onto the crossover coordinate and bound the cut window.
+
+    :param pos1: First parent's structured atom rows.
+    :param pos2: Second parent's (possibly box-aligned) structured atom rows.
+    :param first: First parent, supplying the crossover box and GB-region geometry.
+    :param amplitude_y: Keyword argument, required. y-periodic wave amplitude.
+    :param amplitude_z: Keyword argument, required. z-periodic wave amplitude.
+    :param phase_y: Keyword argument, required. y-periodic phase.
+    :param phase_z: Keyword argument, required. z-periodic phase.
+    :return: ``(first_coordinates, second_coordinates, lower, upper)``.
+    :raises ManipulationCapabilityError: If the periodic crossover surface does not fit
+        inside the GB cut window.
+    """
+    first_coordinates = _crossover_scalar_coordinates(
+        pos1,
+        first.box_dims,
+        amplitude_y=amplitude_y,
+        amplitude_z=amplitude_z,
+        phase_y=phase_y,
+        phase_z=phase_z,
+    )
+    second_coordinates = _crossover_scalar_coordinates(
+        pos2,
+        first.box_dims,
+        amplitude_y=amplitude_y,
+        amplitude_z=amplitude_z,
+        phase_y=phase_y,
+        phase_z=phase_z,
+    )
+    half_window = 0.25 * first.gb_thickness
+    maximum_excursion = abs(amplitude_y) + abs(amplitude_z)
+    lower = first.gb_plane_x - half_window + maximum_excursion
+    upper = first.gb_plane_x + half_window - maximum_excursion
+    if lower >= upper:
+        raise ManipulationCapabilityError(
+            "periodic crossover surface does not fit inside the GB cut window"
+        )
+    return first_coordinates, second_coordinates, lower, upper
+
+
+def _select_crossover_cut(
+    pos1: np.ndarray,
+    pos2: np.ndarray,
+    first_coordinates: np.ndarray,
+    second_coordinates: np.ndarray,
+    labels1: np.ndarray | None,
+    labels2: np.ndarray | None,
+    *,
+    lower: float,
+    upper: float,
+    species_ratio: tuple[tuple[str, int], ...],
+    rng,
+    unit_cell: object,
+) -> tuple[np.ndarray, np.ndarray | None, float]:
+    """Search for an admissible cut, sample one, and assemble the merged child.
+
+    :param pos1: First parent's structured atom rows.
+    :param pos2: Second parent's (possibly box-aligned) structured atom rows.
+    :param first_coordinates: First parent's scalar crossover coordinates.
+    :param second_coordinates: Second parent's scalar crossover coordinates.
+    :param labels1: First parent's grain labels, or ``None`` if unowned.
+    :param labels2: Second parent's grain labels, or ``None`` if unowned.
+    :param lower: Keyword argument, required. Inclusive offset lower bound.
+    :param upper: Keyword argument, required. Exclusive offset upper bound.
+    :param species_ratio: Keyword argument, required. Normalized formula vector.
+    :param rng: Keyword argument, required. Duck-typed random source exposing
+        ``.random()``.
+    :param unit_cell: Keyword argument, required. Used to re-validate the merged
+        child's own composition (the first parent's unit cell).
+    :return: ``(new_positions, child_labels, slice_pos)``.
+    :raises ManipulationCapabilityError: If no positive-width formula-preserving
+        crossover interval exists, or the merged child unexpectedly fails its own
+        composition check.
+    """
+    intervals = _admissible_crossover_intervals(
+        pos1,
+        pos2,
+        first_coordinates,
+        second_coordinates,
+        lower=lower,
+        upper=upper,
+        species_ratio=species_ratio,
+    )
+    if not intervals:
+        raise ManipulationCapabilityError(
+            "no positive-width formula-preserving crossover interval exists"
+        )
+    slice_pos = _sample_interval_by_width(intervals, rng)
+    mask1 = first_coordinates < slice_pos
+    mask2 = second_coordinates >= slice_pos
+    new_positions = np.hstack((pos1[mask1], pos2[mask2]))
+    if labels1 is None:
+        child_labels = None
+    else:
+        child_labels = np.hstack((labels1[mask1], labels2[mask2]))
+
+    try:
+        validate_formula_composition(new_positions, unit_cell)
+    except CandidateAdmissibilityError as exc:
+        raise ManipulationCapabilityError(
+            f"internal crossover composition invariant failed: {exc}"
+        ) from exc
+
+    return new_positions, child_labels, slice_pos
+
+
 def crossover_slice_and_merge(
     first: CrossoverParent,
     second: CrossoverParent,
@@ -343,21 +645,13 @@ def crossover_slice_and_merge(
     :raises ManipulationConfigurationError: If ``surface_mode`` is not
         ``"normal_plane"``/``"periodic_wave"``, or ``max_tilt_degrees`` is out of range.
     :raises ManipulationCompatibilityError: If the parents use different ownership
-        modes, mismatched boundary topology, or non-affine-equivalent physical grain
-        geometry.
+        modes, mismatched boundary topology, non-affine-equivalent physical grain
+        geometry, or mismatched interface separation.
     :raises ManipulationCapabilityError: If the parents' unit cells use different
         normalized formula vectors, either parent's atoms are not an exact formula
         multiple, or no positive-width formula-preserving crossover interval exists.
     """
-    if surface_mode not in {"normal_plane", "periodic_wave"}:
-        raise ManipulationConfigurationError(
-            "surface_mode must be 'normal_plane' or 'periodic_wave'"
-        )
-    tilt = _validate_finite_real("max_tilt_degrees", max_tilt_degrees)
-    if tilt < 0.0 or tilt >= 90.0:
-        raise ManipulationConfigurationError(
-            "max_tilt_degrees must satisfy 0 <= value < 90"
-        )
+    tilt = _validate_crossover_parameters(surface_mode, max_tilt_degrees)
 
     labels1 = first.grain_labels
     labels2 = second.grain_labels
@@ -365,149 +659,43 @@ def crossover_slice_and_merge(
         raise ManipulationCompatibilityError(
             "slice_and_merge requires both parents to use the same ownership mode"
         )
-    if labels1 is not None:
-        tolerance = max(first.coordinate_tolerance, second.coordinate_tolerance)
-        if (
-            first.inplane_periodic != second.inplane_periodic
-            or first.normal_topology is not second.normal_topology
-        ):
-            raise ManipulationCompatibilityError(
-                "owned crossover requires matching boundary topology"
-            )
-        mapped_plane = _remap_axis_values(
-            second.gb_plane_x,
-            second.box_dims[0],
-            first.box_dims[0],
-        )
-        mapped_left_bounds = _remap_axis_values(
-            second.left_grain_x_bounds,
-            second.box_dims[0],
-            first.box_dims[0],
-        )
-        mapped_right_bounds = _remap_axis_values(
-            second.right_grain_x_bounds,
-            second.box_dims[0],
-            first.box_dims[0],
-        )
-        if (
-            not np.isclose(
-                first.gb_plane_x,
-                mapped_plane,
-                atol=tolerance,
-                rtol=0.0,
-            )
-            or not np.allclose(
-                first.left_grain_x_bounds,
-                mapped_left_bounds,
-                atol=tolerance,
-                rtol=0.0,
-            )
-            or not np.allclose(
-                first.right_grain_x_bounds,
-                mapped_right_bounds,
-                atol=tolerance,
-                rtol=0.0,
-            )
-        ):
-            raise ManipulationCompatibilityError(
-                "owned crossover requires affine-equivalent physical grain "
-                "geometry"
-            )
     pos1 = first.whole_system
     pos2 = second.whole_system
-    if labels1 is not None and not np.allclose(
-        first.box_dims,
-        second.box_dims,
-        atol=tolerance,
-        rtol=0.0,
-    ):
-        pos2 = _rescale_atoms(
+    if labels1 is not None:
+        tolerance = _validate_owned_compatibility(first, second)
+        pos2 = _align_crossover_positions(first, second, pos2, tolerance)
+
+    species_ratio = _validate_formula_compatibility(
+        pos1, pos2, first.unit_cell, second.unit_cell
+    )
+
+    amplitude_y, amplitude_z, phase_y, phase_z = _sample_periodic_wave_parameters(
+        surface_mode, tilt, first.box_dims, rng
+    )
+    first_coordinates, second_coordinates, lower, upper = (
+        _crossover_coordinates_and_window(
+            pos1,
             pos2,
-            second.box_dims,
-            first.box_dims,
+            first,
+            amplitude_y=amplitude_y,
+            amplitude_z=amplitude_z,
+            phase_y=phase_y,
+            phase_z=phase_z,
         )
-
-    try:
-        validate_formula_composition(pos1, first.unit_cell)
-        validate_formula_composition(pos2, second.unit_cell)
-    except CandidateAdmissibilityError as exc:
-        raise ManipulationCapabilityError(str(exc)) from exc
-    first_formula = first.unit_cell.formula_ratio
-    second_formula = second.unit_cell.formula_ratio
-    if first_formula != second_formula:
-        raise ManipulationCapabilityError(
-            "crossover parents use different normalized formula vectors"
-        )
-
-    amplitude_y = 0.0
-    amplitude_z = 0.0
-    phase_y = 0.0
-    phase_z = 0.0
-    if surface_mode == "periodic_wave" and tilt > 0.0:
-        maximum_slope = np.tan(np.deg2rad(tilt))
-        slope_radius = maximum_slope * np.sqrt(float(rng.random()))
-        slope_angle = 2.0 * np.pi * float(rng.random())
-        slope_y = slope_radius * np.cos(slope_angle)
-        slope_z = slope_radius * np.sin(slope_angle)
-        y_length = float(np.ptp(first.box_dims[1]))
-        z_length = float(np.ptp(first.box_dims[2]))
-        amplitude_y = slope_y * y_length / (2.0 * np.pi)
-        amplitude_z = slope_z * z_length / (2.0 * np.pi)
-        phase_y = 2.0 * np.pi * float(rng.random())
-        phase_z = 2.0 * np.pi * float(rng.random())
-
-    first_coordinates = _crossover_scalar_coordinates(
-        pos1,
-        first.box_dims,
-        amplitude_y=amplitude_y,
-        amplitude_z=amplitude_z,
-        phase_y=phase_y,
-        phase_z=phase_z,
     )
-    second_coordinates = _crossover_scalar_coordinates(
-        pos2,
-        first.box_dims,
-        amplitude_y=amplitude_y,
-        amplitude_z=amplitude_z,
-        phase_y=phase_y,
-        phase_z=phase_z,
-    )
-    half_window = 0.25 * first.gb_thickness
-    maximum_excursion = abs(amplitude_y) + abs(amplitude_z)
-    lower = first.gb_plane_x - half_window + maximum_excursion
-    upper = first.gb_plane_x + half_window - maximum_excursion
-    if lower >= upper:
-        raise ManipulationCapabilityError(
-            "periodic crossover surface does not fit inside the GB cut window"
-        )
-    intervals = _admissible_crossover_intervals(
+    new_positions, child_labels, slice_pos = _select_crossover_cut(
         pos1,
         pos2,
         first_coordinates,
         second_coordinates,
+        labels1,
+        labels2,
         lower=lower,
         upper=upper,
-        species_ratio=first_formula,
+        species_ratio=species_ratio,
+        rng=rng,
+        unit_cell=first.unit_cell,
     )
-    if not intervals:
-        raise ManipulationCapabilityError(
-            "no positive-width formula-preserving crossover interval exists"
-        )
-    slice_pos = _sample_interval_by_width(intervals, rng)
-    mask1 = first_coordinates < slice_pos
-    mask2 = second_coordinates >= slice_pos
-    new_positions = np.hstack((pos1[mask1], pos2[mask2]))
-    if labels1 is None:
-        child_labels = None
-    else:
-        child_labels = np.hstack((labels1[mask1], labels2[mask2]))
-
-    try:
-        validate_formula_composition(new_positions, first.unit_cell)
-    except CandidateAdmissibilityError as exc:
-        raise ManipulationCapabilityError(
-            f"internal crossover composition invariant failed: {exc}"
-        ) from exc
 
     provenance = {
         "surface_mode": surface_mode,
@@ -579,6 +767,10 @@ class _CandidateCrossoverParent:
         return self._candidate.coordinate_tolerance
 
     @property
+    def interface_separation(self) -> float:
+        return self._candidate.interface_separation
+
+    @property
     def unit_cell(self) -> object:
         return self._unit_cell
 
@@ -618,8 +810,8 @@ class SliceAndMerge:
         :raises ManipulationConfigurationError: If a required parameter is missing or
             malformed.
         :raises ManipulationCompatibilityError: If the parents use different ownership
-            modes, mismatched boundary topology, or non-affine-equivalent physical
-            grain geometry.
+            modes, mismatched boundary topology, non-affine-equivalent physical grain
+            geometry, or mismatched interface separation.
         :raises ManipulationCapabilityError: If the parents' unit cells are
             incompatible or no positive-width formula-preserving crossover interval
             exists.
@@ -661,7 +853,10 @@ class SliceAndMerge:
                 grain_labels=child_labels,
                 inplane_periodic=context.parents[0].inplane_periodic,
                 normal_topology=context.parents[0].normal_topology,
-                coordinate_tolerance=context.parents[0].coordinate_tolerance,
+                coordinate_tolerance=max(
+                    context.parents[0].coordinate_tolerance,
+                    context.parents[1].coordinate_tolerance,
+                ),
                 interface_separation=context.parents[0].interface_separation,
             )
         except InterfaceCandidateTypeError as exc:

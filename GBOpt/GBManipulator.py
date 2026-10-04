@@ -47,7 +47,7 @@ from GBOpt.manipulation import (
     RightGrainTranslation,
     default_registry,
 )
-from GBOpt.manipulation.crossover import crossover_slice_and_merge
+from GBOpt.manipulation.crossover import SliceAndMerge, crossover_slice_and_merge
 from GBOpt.manipulation.density import (
     _calculate_local_order as _calculate_local_order,  # re-exported for compatibility
 )
@@ -870,6 +870,16 @@ class Parent:
         return self.__coordinate_tolerance
 
     @property
+    def interface_separation(self) -> float:
+        """Inserted central separation in angstroms.
+
+        ``Parent`` never stores a previously inserted separation itself (that state
+        lives only on an ``InterfaceCandidate`` produced by ``InterfaceSeparation``);
+        this is always ``0.0``, matching ``_to_interface_candidate``'s own default.
+        """
+        return 0.0
+
+    @property
     def left_grain_x_bounds(self) -> np.ndarray:
         """Copy of the left physical grain interval."""
         return np.array(self.__left_grain_x_bounds, dtype=float, copy=True)
@@ -1688,6 +1698,52 @@ class GBManipulator:
         self.__last_crossover_provenance = tuple(provenance.items())
 
         return new_positions
+
+    def make_slice_and_merge_candidate(
+        self,
+        *,
+        surface_mode: str = "normal_plane",
+        max_tilt_degrees: float = 5.0,
+    ) -> InterfaceCandidate:
+        """Return a geometry-bearing two-parent slice-and-merge crossover candidate.
+
+        :param surface_mode: Keyword argument, optional, defaults to
+            ``"normal_plane"``. Crossover surface mode.
+        :param max_tilt_degrees: Keyword argument, optional, defaults to ``5.0``.
+            Maximum combined local tilt for ``periodic_wave``, in degrees.
+        :return: Complete immutable merged child candidate.
+        :raises GBManipulatorValueError: If the manipulator does not have exactly two
+            parents, either parent's boundary-normal topology is unknown, or parent
+            geometry or arguments are invalid.
+        :raises CompositionAwareCrossoverError: If the parents are compositionally
+            inadmissible or no positive-width admissible cut interval exists.
+        """
+        if self.__one_parent:
+            raise GBManipulatorValueError(
+                "a slice-and-merge candidate requires exactly two parents"
+            )
+        parents = self.__current_parent_candidates()
+        context = ManipulationContext(
+            parents=parents,
+            rng=self.__rng,
+            params={
+                "unit_cell": (
+                    self.__parents[0].unit_cell,
+                    self.__parents[1].unit_cell,
+                ),
+                "gb_thickness": self.__parents[0].gb_thickness,
+                "surface_mode": surface_mode,
+                "max_tilt_degrees": max_tilt_degrees,
+            },
+        )
+        result = self.__translate_manipulation_error(
+            SliceAndMerge().execute,
+            context,
+            capability_exception=CompositionAwareCrossoverError,
+        )
+        child = result.children[0]
+        self.__set_candidate_labels(child.grain_labels, len(child.atoms))
+        return child
 
     def remove_atoms(
         self,
