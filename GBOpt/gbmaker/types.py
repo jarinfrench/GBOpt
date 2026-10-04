@@ -338,7 +338,12 @@ class MaterialState:
         ``"bcc"``, ``"sc"``, ``"diamond"``, ``"fluorite"``, ``"rocksalt"``, and
         ``"zincblende"``.
     :param atom_types: Atom type string or tuple of atom type strings accepted by
-        ``UnitCell``.
+        ``UnitCell``. Rejected here, synchronously and with
+        ``GBMakerConstructionValueError``, if it is not a non-empty string or a tuple of
+        non-empty strings -- a deliberately earlier and more specific check than
+        ``UnitCell.init_by_structure`` itself performs; this never rejects a shape that
+        could otherwise produce a valid unit cell, since ``UnitCell`` has no legitimate
+        use for a non-string, empty-string, or non-string-element ``atom_types`` either.
     :param unit_cell: Constructed ``UnitCell`` for this material identity, or ``None``
         before resolution. Carries species, charges, rational-basis metadata, and
         lattice-derived quantities; this field references that existing object rather

@@ -95,6 +95,11 @@ def test_material_state_rejects_non_string_atom_type_element() -> None:
         _material(atom_types=(1,))
 
 
+def test_material_state_rejects_non_string_non_tuple_atom_types() -> None:
+    with pytest.raises(GBMakerConstructionValueError):
+        _material(atom_types=123)
+
+
 # --------------------------------------------------------------------------------------
 # GBBuildConfig
 # --------------------------------------------------------------------------------------
