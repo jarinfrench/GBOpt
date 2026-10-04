@@ -10,10 +10,14 @@ from GBOpt.gbmaker.geometry import (
     _box_periodic_basis,
     _cartesian_from_box_coordinates,
     _clip_complete_origins_to_cartesian_box,
+    _complete_origin_atom_mask,
+    _deduplicate_complete_origins,
+    _filter_complete_origins,
     _reduced_box_coordinates,
     _reduced_coordinate_tolerance,
     _rotate_atoms_about_x,
     _scaled_periodic_basis_vector,
+    _select_complete_origins_in_box_basis,
     _selection_basis_vectors,
     _triclinic_tilt_params,
     _x_index_range,
@@ -559,3 +563,439 @@ def test_rotate_atoms_about_x_does_not_mutate_input():
     original = atoms.copy()
     _rotate_atoms_about_x(atoms, math.pi / 4)
     np.testing.assert_array_equal(atoms, original)
+
+
+# --------------------------------------------------------------------------------------
+# _complete_origin_atom_mask
+# --------------------------------------------------------------------------------------
+
+
+def test_complete_origin_atom_mask_fast_path_keeps_complete_groups_and_drops_incomplete():
+    # Contiguous, unique groups of size 2 -> eligible for the grouped fast path.
+    origin_ids = np.array([0, 0, 1, 1], dtype=np.int64)
+    atom_mask = np.array([True, True, True, False])
+
+    result = _complete_origin_atom_mask(atom_mask, origin_ids, 2)
+
+    np.testing.assert_array_equal(result, [True, True, False, False])
+
+
+def test_complete_origin_atom_mask_general_path_for_noncontiguous_origin_ids():
+    # Interleaved origin IDs are not contiguous groups, so the fast-path reshape
+    # check fails and the function falls back to the origin-ID-count path.
+    origin_ids = np.array([0, 1, 0, 1], dtype=np.int64)
+    atom_mask = np.array([True, False, True, True])
+
+    result = _complete_origin_atom_mask(atom_mask, origin_ids, 2)
+
+    np.testing.assert_array_equal(result, [True, False, True, False])
+
+
+def test_complete_origin_atom_mask_general_path_triggered_by_duplicate_group_ids():
+    # len(atom_mask) % basis_size == 0, but the reshaped groups don't have unique
+    # IDs, so grouped_unique is False and the fallback path is used instead.
+    origin_ids = np.array([0, 0, 0, 0], dtype=np.int64)
+    atom_mask = np.array([True, True, True, True])
+
+    result = _complete_origin_atom_mask(atom_mask, origin_ids, 2)
+
+    # All four atoms share origin 0, so its total count (4) never equals basis_size
+    # (2); the whole origin is dropped.
+    np.testing.assert_array_equal(result, [False, False, False, False])
+
+
+def test_complete_origin_atom_mask_basis_size_one_is_pass_through():
+    atom_mask = np.array([True, False, True])
+    origin_ids = np.array([0, 1, 2], dtype=np.int64)
+
+    result = _complete_origin_atom_mask(atom_mask, origin_ids, 1)
+
+    np.testing.assert_array_equal(result, atom_mask)
+
+
+def test_complete_origin_atom_mask_empty_input_returns_copy():
+    atom_mask = np.array([], dtype=bool)
+    origin_ids = np.array([], dtype=np.int64)
+
+    result = _complete_origin_atom_mask(atom_mask, origin_ids, 1)
+
+    assert result.shape == (0,)
+    assert result is not atom_mask
+
+
+def test_complete_origin_atom_mask_rejects_non_1d_atom_mask():
+    with pytest.raises(GBMakerConstructionValueError):
+        _complete_origin_atom_mask(
+            np.array([[True, False]]), np.array([0, 1], dtype=np.int64), 1
+        )
+
+
+def test_complete_origin_atom_mask_rejects_non_bool_atom_mask():
+    with pytest.raises(GBMakerConstructionValueError):
+        _complete_origin_atom_mask(
+            np.array([1, 0]), np.array([0, 1], dtype=np.int64), 1
+        )
+
+
+def test_complete_origin_atom_mask_rejects_non_1d_origin_ids():
+    with pytest.raises(GBMakerConstructionValueError):
+        _complete_origin_atom_mask(
+            np.array([True, False]), np.array([[0], [1]], dtype=np.int64), 1
+        )
+
+
+def test_complete_origin_atom_mask_rejects_non_integer_origin_ids():
+    with pytest.raises(GBMakerConstructionValueError):
+        _complete_origin_atom_mask(np.array([True, False]), np.array([0.0, 1.0]), 1)
+
+
+def test_complete_origin_atom_mask_rejects_mismatched_lengths():
+    with pytest.raises(GBMakerConstructionValueError):
+        _complete_origin_atom_mask(
+            np.array([True, False, True]), np.array([0, 1], dtype=np.int64), 1
+        )
+
+
+@pytest.mark.parametrize("basis_size", [True, 2.5, 0, -1, "2"])
+def test_complete_origin_atom_mask_rejects_invalid_basis_size(basis_size):
+    with pytest.raises(GBMakerConstructionValueError):
+        _complete_origin_atom_mask(
+            np.array([True, False]), np.array([0, 1], dtype=np.int64), basis_size
+        )
+
+
+# --------------------------------------------------------------------------------------
+# _filter_complete_origins
+# --------------------------------------------------------------------------------------
+
+
+def test_filter_complete_origins_keeps_only_complete_groups_and_returns_copies():
+    atoms = np.array(
+        [
+            ("Cu", 0.0, 0.0, 0.0),
+            ("Cu", 1.0, 0.0, 0.0),
+            ("Fe", 2.0, 0.0, 0.0),
+            ("Fe", 3.0, 0.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    origin_ids = np.array([0, 0, 1, 1], dtype=np.int64)
+    atom_mask = np.array([True, True, True, False])
+
+    filtered_atoms, filtered_origin_ids = _filter_complete_origins(
+        atoms, origin_ids, atom_mask, 2
+    )
+
+    np.testing.assert_array_equal(filtered_atoms["name"], ["Cu", "Cu"])
+    np.testing.assert_array_equal(filtered_origin_ids, [0, 0])
+
+    # Returned arrays must be independent copies, not views into the inputs.
+    filtered_atoms["x"][0] = 99.0
+    assert atoms["x"][0] == 0.0
+    filtered_origin_ids[0] = 99
+    assert origin_ids[0] == 0
+
+
+def test_filter_complete_origins_rejects_mismatched_atoms_and_origin_ids_lengths():
+    atoms = np.array([("Cu", 0.0, 0.0, 0.0)], dtype=Atom.atom_dtype)
+    origin_ids = np.array([0, 1], dtype=np.int64)
+
+    with pytest.raises(GBMakerConstructionValueError):
+        _filter_complete_origins(atoms, origin_ids, np.array([True]), 1)
+
+
+def test_filter_complete_origins_propagates_mask_validation_error():
+    atoms = np.array([("Cu", 0.0, 0.0, 0.0)], dtype=Atom.atom_dtype)
+    origin_ids = np.array([0], dtype=np.int64)
+
+    with pytest.raises(GBMakerConstructionValueError):
+        _filter_complete_origins(atoms, origin_ids, np.array([True]), 0)
+
+
+# --------------------------------------------------------------------------------------
+# _deduplicate_complete_origins
+# --------------------------------------------------------------------------------------
+
+
+def test_deduplicate_complete_origins_removes_exact_duplicate_groups_keeping_first():
+    atoms = np.array(
+        [
+            ("Cu", 0.0, 0.0, 0.0),
+            ("Fe", 1.0, 0.0, 0.0),  # origin 0
+            ("Cu", 0.0, 0.0, 0.0),
+            ("Fe", 1.0, 0.0, 0.0),  # origin 1, duplicate of origin 0
+            ("Cu", 5.0, 0.0, 0.0),
+            ("Fe", 6.0, 0.0, 0.0),  # origin 2, distinct
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    origin_ids = np.array([0, 0, 1, 1, 2, 2], dtype=np.int64)
+
+    deduped_atoms, deduped_origin_ids = _deduplicate_complete_origins(
+        atoms, origin_ids, 2, epsilon=1e-6
+    )
+
+    np.testing.assert_array_equal(deduped_origin_ids, [0, 0, 2, 2])
+    np.testing.assert_allclose(deduped_atoms["x"], [0.0, 1.0, 5.0, 6.0])
+
+
+def test_deduplicate_complete_origins_epsilon_controls_quantization():
+    atoms = np.array(
+        [("Cu", 0.0, 0.0, 0.0), ("Cu", 1e-9, 0.0, 0.0)],
+        dtype=Atom.atom_dtype,
+    )
+    origin_ids = np.array([0, 1], dtype=np.int64)
+
+    deduped_loose, _ = _deduplicate_complete_origins(
+        atoms, origin_ids, 1, epsilon=1e-6
+    )
+    assert len(deduped_loose) == 1
+
+    deduped_tight, _ = _deduplicate_complete_origins(
+        atoms, origin_ids, 1, epsilon=1e-12
+    )
+    assert len(deduped_tight) == 2
+
+
+def test_deduplicate_complete_origins_empty_input_returns_copies():
+    atoms = np.array([], dtype=Atom.atom_dtype)
+    origin_ids = np.array([], dtype=np.int64)
+
+    deduped_atoms, deduped_origin_ids = _deduplicate_complete_origins(
+        atoms, origin_ids, 1, epsilon=1e-6
+    )
+
+    assert len(deduped_atoms) == 0
+    assert deduped_atoms is not atoms
+    assert deduped_origin_ids is not origin_ids
+
+
+def test_deduplicate_complete_origins_rejects_noncontiguous_origin_groups():
+    atoms = np.array(
+        [
+            ("Cu", 0.0, 0.0, 0.0),
+            ("Fe", 1.0, 0.0, 0.0),
+            ("Cu", 2.0, 0.0, 0.0),
+            ("Fe", 3.0, 0.0, 0.0),
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    origin_ids = np.array([0, 1, 1, 0], dtype=np.int64)
+
+    with pytest.raises(GBMakerConstructionValueError):
+        _deduplicate_complete_origins(atoms, origin_ids, 2, epsilon=1e-6)
+
+
+def test_deduplicate_complete_origins_rejects_length_not_divisible_by_basis_size():
+    atoms = np.array(
+        [("Cu", 0.0, 0.0, 0.0), ("Fe", 1.0, 0.0, 0.0), ("Fe", 2.0, 0.0, 0.0)],
+        dtype=Atom.atom_dtype,
+    )
+    origin_ids = np.array([0, 0, 1], dtype=np.int64)
+
+    with pytest.raises(GBMakerConstructionValueError):
+        _deduplicate_complete_origins(atoms, origin_ids, 2, epsilon=1e-6)
+
+
+def test_deduplicate_complete_origins_rejects_mismatched_lengths():
+    atoms = np.array([("Cu", 0.0, 0.0, 0.0)], dtype=Atom.atom_dtype)
+    origin_ids = np.array([0, 1], dtype=np.int64)
+
+    with pytest.raises(GBMakerConstructionValueError):
+        _deduplicate_complete_origins(atoms, origin_ids, 1, epsilon=1e-6)
+
+
+def test_deduplicate_complete_origins_rejects_non_1d_origin_ids():
+    atoms = np.array([("Cu", 0.0, 0.0, 0.0)], dtype=Atom.atom_dtype)
+    origin_ids = np.array([[0]], dtype=np.int64)
+
+    with pytest.raises(GBMakerConstructionValueError):
+        _deduplicate_complete_origins(atoms, origin_ids, 1, epsilon=1e-6)
+
+
+def test_deduplicate_complete_origins_rejects_non_integer_origin_ids():
+    atoms = np.array([("Cu", 0.0, 0.0, 0.0)], dtype=Atom.atom_dtype)
+    origin_ids = np.array([0.0])
+
+    with pytest.raises(GBMakerConstructionValueError):
+        _deduplicate_complete_origins(atoms, origin_ids, 1, epsilon=1e-6)
+
+
+@pytest.mark.parametrize("basis_size", [True, 2.5, 0, -1])
+def test_deduplicate_complete_origins_rejects_invalid_basis_size(basis_size):
+    atoms = np.array([("Cu", 0.0, 0.0, 0.0)], dtype=Atom.atom_dtype)
+    origin_ids = np.array([0], dtype=np.int64)
+
+    with pytest.raises(GBMakerConstructionValueError):
+        _deduplicate_complete_origins(atoms, origin_ids, basis_size, epsilon=1e-6)
+
+
+# --------------------------------------------------------------------------------------
+# _select_complete_origins_in_box_basis
+# --------------------------------------------------------------------------------------
+
+
+def test_select_complete_origins_in_box_basis_axis_aligned_fast_path():
+    # Both primitive periods lie purely in the y/z plane, so the selection basis
+    # has a zero x column and the axis-aligned fast path is used.
+    primitive_periods = np.array([[0.0, 3.0, 0.0], [0.0, 0.0, 4.0]])
+
+    atoms = np.array(
+        [
+            ("Cu", 0.0, 1.0, 1.0),  # clearly interior -> kept unchanged
+            ("Cu", 0.0, 3.0 - 1e-12, 1.0),  # just above the y boundary -> snaps to 0
+            ("Cu", 0.0, 1.0, -5e-11),  # just below the z boundary -> snaps to 0
+            ("Cu", 0.0, -0.5, 1.0),  # well outside the periodic tolerance -> dropped
+            ("Cu", 5.0, 1.0, 1.0),  # passes y/z but fails the final x-slab check
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    origin_ids = np.arange(len(atoms), dtype=np.int64)
+
+    selected_atoms, selected_origin_ids = _select_complete_origins_in_box_basis(
+        atoms,
+        origin_ids,
+        primitive_periods,
+        np.array([-1.0, 1.0]),
+        1,
+        inplane_periodic=(True, True),
+        box_lengths=(3.0, 4.0),
+        epsilon=1e-10,
+    )
+
+    np.testing.assert_array_equal(selected_origin_ids, [0, 1, 2])
+    np.testing.assert_allclose(
+        selected_atoms["y"], [1.0, 0.0, 1.0], atol=1e-9, rtol=0.0
+    )
+    np.testing.assert_allclose(
+        selected_atoms["z"], [1.0, 1.0, 0.0], atol=1e-9, rtol=0.0
+    )
+
+
+def test_select_complete_origins_in_box_basis_fast_path_returns_empty_when_nothing_selected():
+    atoms = np.array([("Cu", 0.0, -5.0, -5.0)], dtype=Atom.atom_dtype)
+    origin_ids = np.array([0], dtype=np.int64)
+    primitive_periods = np.array([[0.0, 3.0, 0.0], [0.0, 0.0, 4.0]])
+
+    selected_atoms, selected_origin_ids = _select_complete_origins_in_box_basis(
+        atoms,
+        origin_ids,
+        primitive_periods,
+        np.array([-1.0, 1.0]),
+        1,
+        inplane_periodic=(True, True),
+        box_lengths=(3.0, 4.0),
+        epsilon=1e-10,
+    )
+
+    assert len(selected_atoms) == 0
+    assert len(selected_origin_ids) == 0
+
+
+def test_select_complete_origins_in_box_basis_general_path_drops_incomplete_origin():
+    # The primitive y period has a nonzero x component, so the selection basis has
+    # a nonzero x column and the general mixed-basis path is used.
+    primitive_periods = np.array([[1.0, 3.0, 0.0], [0.0, 0.0, 4.0]])
+
+    atoms = np.array(
+        [
+            ("Cu", 0.0, 1.0, 1.0),  # origin 0, both atoms interior -> kept
+            ("Fe", 0.2, 1.5, 2.0),  # origin 0
+            ("Cu", 0.0, 1.0, 1.0),  # origin 1, interior
+            ("Fe", 0.0, 10.0, 1.0),  # origin 1, well outside the y period -> dropped
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    origin_ids = np.array([0, 0, 1, 1], dtype=np.int64)
+
+    selected_atoms, selected_origin_ids = _select_complete_origins_in_box_basis(
+        atoms,
+        origin_ids,
+        primitive_periods,
+        np.array([-1.0, 1.0]),
+        2,
+        inplane_periodic=(True, True),
+        box_lengths=(3.0, 4.0),
+        epsilon=1e-10,
+    )
+
+    np.testing.assert_array_equal(selected_origin_ids, [0, 0])
+    np.testing.assert_array_equal(selected_atoms["name"], ["Cu", "Fe"])
+    np.testing.assert_allclose(selected_atoms["x"], [0.0, 0.2], atol=1e-9, rtol=0.0)
+
+
+def test_select_complete_origins_in_box_basis_general_path_clips_nonperiodic_axis():
+    # y is periodic (tilted into x); z is non-periodic and clipped to box_lengths[1].
+    primitive_periods = np.array([[1.0, 3.0, 0.0], [0.0, 0.0, 0.0]])
+
+    atoms = np.array(
+        [
+            ("Cu", 0.0, 1.0, 2.0),  # interior on both axes -> kept
+            ("Fe", 0.0, 1.0, 6.0),  # z outside the non-periodic box extent -> dropped
+        ],
+        dtype=Atom.atom_dtype,
+    )
+    origin_ids = np.array([0, 1], dtype=np.int64)
+
+    selected_atoms, selected_origin_ids = _select_complete_origins_in_box_basis(
+        atoms,
+        origin_ids,
+        primitive_periods,
+        np.array([-1.0, 1.0]),
+        1,
+        inplane_periodic=(True, False),
+        box_lengths=(3.0, 5.0),
+        epsilon=1e-10,
+    )
+
+    np.testing.assert_array_equal(selected_origin_ids, [0])
+    np.testing.assert_array_equal(selected_atoms["name"], ["Cu"])
+    np.testing.assert_allclose(selected_atoms["y"], [1.0], atol=1e-9, rtol=0.0)
+    np.testing.assert_allclose(selected_atoms["z"], [2.0], atol=1e-9, rtol=0.0)
+
+
+def test_select_complete_origins_in_box_basis_raises_for_singular_selection_basis():
+    # Both primitive periods point in the same direction, so the y/z columns of the
+    # resulting (nonzero-x-column) selection basis are linearly dependent.
+    atoms = np.array([("Cu", 0.0, 0.0, 0.0)], dtype=Atom.atom_dtype)
+    origin_ids = np.array([0], dtype=np.int64)
+    primitive_periods = np.array([[1.0, 2.0, 4.0], [2.0, 4.0, 8.0]])
+
+    with pytest.raises(GBMakerConstructionValueError):
+        _select_complete_origins_in_box_basis(
+            atoms,
+            origin_ids,
+            primitive_periods,
+            np.array([-1.0, 1.0]),
+            1,
+            inplane_periodic=(True, True),
+            box_lengths=(2.0, 8.0),
+            epsilon=1e-10,
+        )
+
+
+@pytest.mark.parametrize(
+    "x_bounds",
+    [
+        np.array([1.0, 1.0]),
+        np.array([1.0, 0.0]),
+        np.array([np.nan, 1.0]),
+        np.array([0.0]),
+    ],
+)
+def test_select_complete_origins_in_box_basis_rejects_invalid_x_bounds(x_bounds):
+    atoms = np.array([("Cu", 0.0, 0.0, 0.0)], dtype=Atom.atom_dtype)
+    origin_ids = np.array([0], dtype=np.int64)
+    primitive_periods = np.array([[0.0, 3.0, 0.0], [0.0, 0.0, 4.0]])
+
+    with pytest.raises(GBMakerConstructionValueError):
+        _select_complete_origins_in_box_basis(
+            atoms,
+            origin_ids,
+            primitive_periods,
+            x_bounds,
+            1,
+            inplane_periodic=(True, True),
+            box_lengths=(3.0, 4.0),
+            epsilon=1e-10,
+        )
