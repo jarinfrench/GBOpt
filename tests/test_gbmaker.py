@@ -1069,6 +1069,18 @@ class TestGBMaker(unittest.TestCase):
         finally:
             os.unlink(fname)
 
+    def test_write_lammps_rejects_non_finite_box_sizes(self):
+        atoms = self.gbm.whole_system
+        box_sizes = self.gbm.box_dims.copy()
+        box_sizes[0, 1] = np.nan
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            fname = temp_file.name
+        try:
+            with self.assertRaises(GBMakerValueError):
+                self.gbm.write_lammps(fname, atoms, box_sizes)
+        finally:
+            os.unlink(fname)
+
     # Tests for setters
     def test_box_dimensions_after_updates(self):
         original_box_dims = self.gbm.box_dims.copy()

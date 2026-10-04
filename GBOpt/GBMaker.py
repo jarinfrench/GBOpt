@@ -972,6 +972,8 @@ class GBMaker:
         :param charges: dict containing the charge values for each type. Keys are
             expected to be integers, values are expected to be numeric. Optional,
             default is None.
+        :raises GBMakerValueError: If ``box_sizes`` contains non-finite (NaN or inf)
+            entries.
         """
         if not isinstance(file_name, str):
             raise GBMakerTypeError("file_name must be of type str")
