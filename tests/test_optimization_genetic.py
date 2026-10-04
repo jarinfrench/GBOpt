@@ -3426,14 +3426,16 @@ def test_legacy_ga_initial_evaluation_failure_emits_run_failed_and_propagates(
         event_sink=sink,
     )
 
-    with pytest.raises(RuntimeError, match="boom"):
+    with pytest.raises(GBMinimizerError, match="initial evaluation failed"):
         minimizer.run_GA(unique_id=1)
 
     event_types = [event.event_type for event in sink.events]
     assert event_types == [
         OptimizationEventType.RUN_STARTED,
+        OptimizationEventType.INITIAL_EVALUATION,
         OptimizationEventType.RUN_FAILED,
     ]
+    assert sink.events[1].status is EvaluationStatus.FAILED
     assert sink.events[-1].failure_message is not None
 
 

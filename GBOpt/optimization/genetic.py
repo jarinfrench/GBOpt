@@ -2061,14 +2061,34 @@ class GeneticAlgorithmMinimizer:
                     initial_candidate_id,
                 )
             except Exception as exc:
+                # There is no sensible penalized starting point for a whole GA run,
+                # so an initial-evaluation failure is fatal -- matching
+                # MonteCarloMinimizer's initial evaluation, which raises the same way
+                # rather than seeding a run from a penalty value.
+                initial_result = EvaluationResult(
+                    candidate_id=initial_candidate_id,
+                    input_index=0,
+                    status=EvaluationStatus.FAILED,
+                    selection_energy=ENERGY_PENALTY,
+                    failure_stage=FailureStage.EVALUATOR,
+                    failure_message=f"{type(exc).__name__}: {exc}",
+                )
+                self._emit(
+                    OptimizationEventType.INITIAL_EVALUATION,
+                    run_context=run_context,
+                    iteration=0,
+                    **evaluation_event_fields(initial_result),
+                )
                 self._emit(
                     OptimizationEventType.RUN_FAILED,
                     run_context=run_context,
                     iteration=0,
-                    failure_stage=FailureStage.EVALUATOR,
-                    failure_message=f"{type(exc).__name__}: {exc}",
+                    failure_stage=initial_result.failure_stage,
+                    failure_message=initial_result.failure_message,
                 )
-                raise
+                raise GBMinimizerError(
+                    f"initial evaluation failed: {initial_result.failure_message}"
+                ) from exc
             self._emit(
                 OptimizationEventType.INITIAL_EVALUATION,
                 run_context=run_context,
