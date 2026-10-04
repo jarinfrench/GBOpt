@@ -485,6 +485,22 @@ class TestGBManipulator(unittest.TestCase):
         with self.assertRaises(GBManipulatorValueError):
             _ = self.manipulator_tilt.slice_and_merge()
 
+    def test_make_slice_and_merge_candidate(self):
+        manipulator = GBManipulator(self.tilt, self.tilt, seed=self.seed)
+        before = self.tilt.whole_system.copy()
+
+        candidate = manipulator.make_slice_and_merge_candidate()
+
+        self.assertEqual(len(candidate.atoms), len(candidate.grain_labels))
+        np.testing.assert_array_equal(self.tilt.whole_system, before)
+
+    def test_make_slice_and_merge_candidate_requires_two_parents(self):
+        with self.assertRaisesRegex(
+            GBManipulatorValueError,
+            "a slice-and-merge candidate requires exactly two parents",
+        ):
+            _ = self.manipulator_tilt.make_slice_and_merge_candidate()
+
     def test_remove_atoms(self):
         new_system = self.manipulator_tilt.remove_atoms(gb_fraction=0.10)
         self.assertGreater(len(self.tilt.whole_system), len(new_system))

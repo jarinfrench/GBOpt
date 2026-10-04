@@ -94,6 +94,9 @@ class CrossoverParent(Protocol):
     def coordinate_tolerance(self) -> float: ...
 
     @property
+    def interface_separation(self) -> float: ...
+
+    @property
     def unit_cell(self) -> object: ...
 
 
@@ -343,8 +346,8 @@ def crossover_slice_and_merge(
     :raises ManipulationConfigurationError: If ``surface_mode`` is not
         ``"normal_plane"``/``"periodic_wave"``, or ``max_tilt_degrees`` is out of range.
     :raises ManipulationCompatibilityError: If the parents use different ownership
-        modes, mismatched boundary topology, or non-affine-equivalent physical grain
-        geometry.
+        modes, mismatched boundary topology, non-affine-equivalent physical grain
+        geometry, or mismatched interface separation.
     :raises ManipulationCapabilityError: If the parents' unit cells use different
         normalized formula vectors, either parent's atoms are not an exact formula
         multiple, or no positive-width formula-preserving crossover interval exists.
@@ -412,6 +415,15 @@ def crossover_slice_and_merge(
             raise ManipulationCompatibilityError(
                 "owned crossover requires affine-equivalent physical grain "
                 "geometry"
+            )
+        if not np.isclose(
+            first.interface_separation,
+            second.interface_separation,
+            atol=tolerance,
+            rtol=0.0,
+        ):
+            raise ManipulationCompatibilityError(
+                "owned crossover requires matching interface separation"
             )
     pos1 = first.whole_system
     pos2 = second.whole_system
@@ -579,6 +591,10 @@ class _CandidateCrossoverParent:
         return self._candidate.coordinate_tolerance
 
     @property
+    def interface_separation(self) -> float:
+        return self._candidate.interface_separation
+
+    @property
     def unit_cell(self) -> object:
         return self._unit_cell
 
@@ -618,8 +634,8 @@ class SliceAndMerge:
         :raises ManipulationConfigurationError: If a required parameter is missing or
             malformed.
         :raises ManipulationCompatibilityError: If the parents use different ownership
-            modes, mismatched boundary topology, or non-affine-equivalent physical
-            grain geometry.
+            modes, mismatched boundary topology, non-affine-equivalent physical grain
+            geometry, or mismatched interface separation.
         :raises ManipulationCapabilityError: If the parents' unit cells are
             incompatible or no positive-width formula-preserving crossover interval
             exists.
@@ -661,7 +677,10 @@ class SliceAndMerge:
                 grain_labels=child_labels,
                 inplane_periodic=context.parents[0].inplane_periodic,
                 normal_topology=context.parents[0].normal_topology,
-                coordinate_tolerance=context.parents[0].coordinate_tolerance,
+                coordinate_tolerance=max(
+                    context.parents[0].coordinate_tolerance,
+                    context.parents[1].coordinate_tolerance,
+                ),
                 interface_separation=context.parents[0].interface_separation,
             )
         except InterfaceCandidateTypeError as exc:
