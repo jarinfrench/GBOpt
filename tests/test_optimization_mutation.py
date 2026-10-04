@@ -71,7 +71,7 @@ def test_translation_mutation_uses_current_parent_dimensions():
 
     manipulator = ManipulatorStub()
     mutator = Mutator(["translate_right_grain"], manipulator)
-    mutation, _candidate = mutator.mutate(
+    mutation, _candidate, parameters = mutator.mutate(
         FixedRandom(),
         GBStub(),
         manipulator,
@@ -81,6 +81,7 @@ def test_translation_mutation_uses_current_parent_dimensions():
     # factors (2, 5) therefore give dy=5 A and dz=3 A.
     assert manipulator.translation == pytest.approx((5.0, 3.0))
     assert mutation == "shift5.00000000dy3.00000000dz"
+    assert parameters == pytest.approx({"dy": 5.0, "dz": 3.0})
 
 
 def test_mutator_retries_after_infeasible_mutation():
@@ -133,7 +134,7 @@ def test_mutator_retries_after_infeasible_mutation():
         manipulator,
     )
 
-    mutation, new_system = mutator.mutate(
+    mutation, new_system, parameters = mutator.mutate(
         local_random=FakeRandom(),
         GB=GB(),
         manipulator=manipulator,
@@ -145,6 +146,7 @@ def test_mutator_retries_after_infeasible_mutation():
     ]
     assert mutation == "shift10.00000000dy15.00000000dz"
     assert new_system == "translated-system"
+    assert parameters == pytest.approx({"dy": 10.0, "dz": 15.0})
 
 
 def test_mutator_does_not_hide_unexpected_mutation_error():
