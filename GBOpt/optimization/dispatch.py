@@ -31,7 +31,10 @@ import numpy as np
 from GBOpt.GBManipulator import GBManipulator, GBManipulatorValueError
 from GBOpt.optimization.types import GBMinimizerError, OperationSpec
 
-LegacyInvoker = Callable[[GBManipulator, np.random.Generator], tuple[str, np.ndarray]]
+LegacyInvoker = Callable[
+    [GBManipulator, np.random.Generator],
+    tuple[str, np.ndarray, Mapping[str, object] | None],
+]
 
 
 def select_operation_order(
@@ -66,7 +69,8 @@ def select_operation_order(
 
 
 LegacyBinaryInvoker = Callable[
-    [object, object, np.random.Generator], tuple[str, GBManipulator, np.ndarray]
+    [object, object, np.random.Generator],
+    tuple[str, GBManipulator, np.ndarray, Mapping[str, object] | None],
 ]
 
 
@@ -77,7 +81,7 @@ def run_legacy_compat_binary_operation(
     parent1: object,
     parent2: object,
     legacy_invokers: Mapping[str, LegacyBinaryInvoker],
-) -> tuple[str, GBManipulator, np.ndarray] | None:
+) -> tuple[str, GBManipulator, np.ndarray, Mapping[str, object] | None] | None:
     """Try ``specs`` in weighted order against one parent pair; ``None`` if all fail.
 
     Unlike :func:`run_legacy_compat_operation`, a failure here does not mean "try
@@ -97,8 +101,10 @@ def run_legacy_compat_binary_operation(
     :param parent2: Keyword argument, required. Second parent.
     :param legacy_invokers: Keyword argument, required. Maps each spec's ``name`` to a
         callable performing that operation directly against ``(parent1, parent2, rng)``.
-    :return: The successful operation's label, resulting manipulator, and atom
-        positions; ``None`` if every configured operation was infeasible for this pair.
+    :return: The successful operation's label, resulting manipulator, atom positions,
+        and a JSON-safe mapping of the concrete parameter values used (or ``None``);
+        ``None`` (the whole tuple) if every configured operation was infeasible for this
+        pair.
     """
     order = select_operation_order(rng, specs)
     for index in order:
@@ -116,7 +122,7 @@ def run_legacy_compat_operation(
     rng: np.random.Generator,
     manipulator: GBManipulator,
     legacy_invokers: Mapping[str, LegacyInvoker],
-) -> tuple[str, np.ndarray]:
+) -> tuple[str, np.ndarray, Mapping[str, object] | None]:
     """Try ``specs`` in weighted order until one legacy invocation succeeds.
 
     Mirrors the pre-OperationSpec ``Mutator.mutate``/``_apply_mutation`` shape exactly:
@@ -130,7 +136,8 @@ def run_legacy_compat_operation(
     :param manipulator: Keyword argument, required. Manipulator to operate on.
     :param legacy_invokers: Keyword argument, required. Maps each spec's ``name`` to a
         callable performing that operation directly against ``manipulator``.
-    :return: The successful operation's label and resulting atom positions.
+    :return: The successful operation's label, resulting atom positions, and a
+        JSON-safe mapping of the concrete parameter values used (or ``None``).
     :raises GBMinimizerError: If no configured operation can produce a valid candidate.
     """
     order = select_operation_order(rng, specs)

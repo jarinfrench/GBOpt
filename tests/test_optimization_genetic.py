@@ -3445,12 +3445,13 @@ def test_third_party_binary_operation_participates_without_editing_optimizer_sou
     invoker = minimizer._owned_generic_binary_invoker(
         registry.get("identity_binary")
     )
-    label, new_manipulator, new_atoms = invoker(
+    label, new_manipulator, new_atoms, parameters = invoker(
         manipulator1.parents[0], manipulator2.parents[0], minimizer.local_random
     )
     assert label == "identity_binary"
     assert isinstance(new_manipulator, GBManipulator)
     np.testing.assert_array_equal(new_atoms, manipulator1.parents[0].whole_system)
+    assert parameters is None
 
 
 def test_third_party_multi_child_binary_operation_is_rejected(ga_gb, tmp_path):
@@ -3624,14 +3625,16 @@ def test_legacy_ga_initial_evaluation_failure_emits_run_failed_and_propagates(
         event_sink=sink,
     )
 
-    with pytest.raises(RuntimeError, match="boom"):
+    with pytest.raises(GBMinimizerError, match="initial evaluation failed"):
         minimizer.run_GA(unique_id=1)
 
     event_types = [event.event_type for event in sink.events]
     assert event_types == [
         OptimizationEventType.RUN_STARTED,
+        OptimizationEventType.INITIAL_EVALUATION,
         OptimizationEventType.RUN_FAILED,
     ]
+    assert sink.events[1].status is EvaluationStatus.FAILED
     assert sink.events[-1].failure_message is not None
 
 

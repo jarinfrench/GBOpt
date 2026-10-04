@@ -632,7 +632,11 @@ class GeneticAlgorithmMinimizer:
                 surface_mode=self.crossover_surface,
                 max_tilt_degrees=self.crossover_max_tilt_degrees,
             )
-            return "slice_and_merge", new_manipulator, new_structure
+            crossover_parameters = {
+                "surface_mode": self.crossover_surface,
+                "max_tilt_degrees": self.crossover_max_tilt_degrees,
+            }
+            return "slice_and_merge", new_manipulator, new_structure, crossover_parameters
 
         return _invoke
 
@@ -651,13 +655,17 @@ class GeneticAlgorithmMinimizer:
                 surface_mode=self.crossover_surface,
                 max_tilt_degrees=self.crossover_max_tilt_degrees,
             )
-            return "slice_and_merge", new_manipulator, new_structure
+            crossover_parameters = {
+                "surface_mode": self.crossover_surface,
+                "max_tilt_degrees": self.crossover_max_tilt_degrees,
+            }
+            return "slice_and_merge", new_manipulator, new_structure, crossover_parameters
 
         return _invoke
 
     def _run_generic_binary_operation(
         self, operation: Manipulation, candidate1, candidate2, rng
-    ) -> tuple[str, GBManipulator, np.ndarray]:
+    ) -> tuple[str, GBManipulator, np.ndarray, Mapping[str, object] | None]:
         """Run a registry-resolved two-parent operation through ``ManipulationContext``.
 
         Shared by the owned and legacy binary invokers below; only how each builds its
@@ -672,7 +680,8 @@ class GeneticAlgorithmMinimizer:
         :param candidate2: Second parent candidate.
         :param rng: Random-number generator to draw from.
         :return: The operation's name, a manipulator wrapping its single output child,
-            and that child's atom positions.
+            that child's atom positions, and a JSON-safe mapping of the concrete
+            parameter values used (or ``None``).
         :raises GBMinimizerValueError: If the operation produces other than one child.
         """
         context = ManipulationContext(
@@ -691,7 +700,12 @@ class GeneticAlgorithmMinimizer:
             gb_thickness=self.GB.gb_thickness,
             rng=rng,
         )
-        return operation.name, new_manipulator, np.array(child.atoms, copy=True)
+        return (
+            operation.name,
+            new_manipulator,
+            np.array(child.atoms, copy=True),
+            dict(result.parameters) if result.parameters else None,
+        )
 
     def _owned_generic_binary_invoker(self, operation: Manipulation):
         """Return a binary invoker running ``operation`` against two ``Parent``s."""
@@ -1136,13 +1150,20 @@ class GeneticAlgorithmMinimizer:
         records: list[CandidateEvaluation],
         intermediate_indices: list[int],
         offspring_count: int,
-    ) -> tuple[list[GBManipulator], list[np.ndarray], list[list[str]]]:
+    ) -> tuple[
+        list[GBManipulator],
+        list[np.ndarray],
+        list[list[str]],
+        list[Mapping[str, object] | None],
+    ]:
         """Create exactly the requested number of ownership-aware offspring.
 
         :param records: Successful evaluations eligible for breeding.
         :param intermediate_indices: Indices eligible to become parents.
         :param offspring_count: Number of unfilled population slots.
-        :return: Aligned manipulators, atom arrays, and lineages.
+        :return: Aligned manipulators, atom arrays, lineages, and each offspring's
+            operation parameters (or ``None``) -- the last is never checkpointed and is
+            only available for the generation that just produced it.
         :raises ValueError: If records are empty or ``offspring_count`` is invalid.
         """
         if not records:
@@ -1155,13 +1176,14 @@ class GeneticAlgorithmMinimizer:
             raise ValueError("offspring_count must be a nonnegative integer")
         offspring_count = int(offspring_count)
         if offspring_count == 0:
-            return [], [], []
+            return [], [], [], []
         if not intermediate_indices:
             intermediate_indices = list(range(len(records)))
 
         manipulators: list[GBManipulator] = []
         candidates: list[np.ndarray] = []
         lineages: list[list[str]] = []
+        operation_parameters: list[Mapping[str, object] | None] = []
         n_slice = math.floor(
             offspring_count * self.slice_and_merge_pct / 100.0
         )
@@ -1200,7 +1222,7 @@ class GeneticAlgorithmMinimizer:
                 if outcome is None:
                     inadmissible_attempts += 1
                     continue
-                label, new_manipulator, new_structure = outcome
+                label, new_manipulator, new_structure, crossover_parameters = outcome
                 provenance = dict(new_manipulator.last_crossover_provenance or ())
                 manipulators.append(new_manipulator)
                 candidates.append(new_structure)
@@ -1212,12 +1234,13 @@ class GeneticAlgorithmMinimizer:
                         repr(provenance),
                     ]
                 )
+                operation_parameters.append(crossover_parameters)
                 crossed = True
                 break
             if crossed:
                 continue
             fallback = self._clone_owned_record(record1)
-            mutation, new_structure = self.mutator.mutate(
+            mutation, new_structure, mutation_parameters = self.mutator.mutate(
                 local_random=self.local_random,
                 GB=self.GB,
                 manipulator=fallback,
@@ -1231,6 +1254,7 @@ class GeneticAlgorithmMinimizer:
                     f"{inadmissible_attempts} inadmissible crossover attempts",
                 ]
             )
+            operation_parameters.append(mutation_parameters)
 
         if n_mutate:
             selected = self.local_random.choice(
@@ -1241,7 +1265,7 @@ class GeneticAlgorithmMinimizer:
             for idx in selected:
                 record = records[int(idx)]
                 new_manipulator = self._clone_owned_record(record)
-                mutation, new_structure = self.mutator.mutate(
+                mutation, new_structure, mutation_parameters = self.mutator.mutate(
                     local_random=self.local_random,
                     GB=self.GB,
                     manipulator=new_manipulator,
@@ -1249,8 +1273,9 @@ class GeneticAlgorithmMinimizer:
                 manipulators.append(new_manipulator)
                 candidates.append(new_structure)
                 lineages.append([mutation, str(record.structure_path)])
+                operation_parameters.append(mutation_parameters)
 
-        return manipulators, candidates, lineages
+        return manipulators, candidates, lineages, operation_parameters
 
     def _select_indices_by_energy(self, energies: list) -> tuple[list[int], list[int]]:
         idx_sorted = sorted(range(len(energies)), key=lambda i: energies[i])
@@ -1572,13 +1597,20 @@ class GeneticAlgorithmMinimizer:
         files: list[str],
         intermediate_indices: list[int],
         offspring_count: int,
-    ) -> tuple[list[GBManipulator], list[np.ndarray], list[list[str]]]:
+    ) -> tuple[
+        list[GBManipulator],
+        list[np.ndarray],
+        list[list[str]],
+        list[Mapping[str, object] | None],
+    ]:
         """Create exactly the requested number of legacy-path offspring.
 
         :param files: Valid evaluated structure files eligible for breeding.
         :param intermediate_indices: Indices eligible to become parents.
         :param offspring_count: Number of unfilled population slots.
-        :return: Aligned manipulators, atom arrays, and lineages.
+        :return: Aligned manipulators, atom arrays, lineages, and each offspring's
+            operation parameters (or ``None``) -- the last is never checkpointed and is
+            only available for the generation that just produced it.
         :raises ValueError: If no parent files are provided or ``offspring_count`` is
             invalid.
         """
@@ -1594,13 +1626,14 @@ class GeneticAlgorithmMinimizer:
             raise ValueError("offspring_count must be a nonnegative integer")
         offspring_count = int(offspring_count)
         if offspring_count == 0:
-            return [], [], []
+            return [], [], [], []
 
         if not intermediate_indices:
             intermediate_indices = list(range(len(files)))
         candidates: list[np.ndarray] = []
         manipulators: list[GBManipulator] = []
         lineages: list[list[str]] = []
+        operation_parameters: list[Mapping[str, object] | None] = []
 
         N_slice = math.floor(
             offspring_count * self.slice_and_merge_pct / 100.0
@@ -1636,7 +1669,7 @@ class GeneticAlgorithmMinimizer:
                 )
                 if outcome is None:
                     continue
-                label, new_manip, new_struct = outcome
+                label, new_manip, new_struct, crossover_parameters = outcome
                 candidates.append(new_struct)
                 manipulators.append(new_manip)
                 lineages.append(
@@ -1647,12 +1680,13 @@ class GeneticAlgorithmMinimizer:
                         repr(dict(new_manip.last_crossover_provenance or ())),
                     ]
                 )
+                operation_parameters.append(crossover_parameters)
                 crossed = True
                 break
             if crossed:
                 continue
             fallback = self._make_manipulator_from_file(p1)
-            mutation, new_struct = self.mutator.mutate(
+            mutation, new_struct, mutation_parameters = self.mutator.mutate(
                 local_random=self.local_random,
                 GB=self.GB,
                 manipulator=fallback,
@@ -1660,6 +1694,7 @@ class GeneticAlgorithmMinimizer:
             candidates.append(new_struct)
             manipulators.append(fallback)
             lineages.append(["crossover_fallback_" + mutation, p1])
+            operation_parameters.append(mutation_parameters)
 
         # Mutations
         if not intermediate_indices:
@@ -1675,7 +1710,7 @@ class GeneticAlgorithmMinimizer:
                 gb_thickness=self.GB.gb_thickness,
             )
             new_manip.rng = self.local_random
-            mutation, new_struct = self.mutator.mutate(
+            mutation, new_struct, mutation_parameters = self.mutator.mutate(
                 local_random=self.local_random,
                 GB=self.GB,
                 manipulator=new_manip,
@@ -1684,8 +1719,9 @@ class GeneticAlgorithmMinimizer:
             candidates.append(new_struct)
             manipulators.append(new_manip)
             lineages.append([mutation, parent])
+            operation_parameters.append(mutation_parameters)
 
-        return manipulators, candidates, lineages
+        return manipulators, candidates, lineages, operation_parameters
 
     def _is_valid_file(self, p: str | None) -> bool:
         return bool(p) and Path(p).is_file()
@@ -2160,6 +2196,12 @@ class GeneticAlgorithmMinimizer:
                     _lineage_entry_from_snapshot(candidate.lineage)
                     for candidate in snapshot.population
                 ]
+                # operation_parameters is in-memory-only (never checkpointed), so a
+                # resumed population's candidates report no operation parameters until
+                # the next generation produces new offspring.
+                population_operation_parameters: list[Mapping[str, object] | None] = (
+                    [None] * len(population_lineages)
+                )
                 population_cached_evaluations = [
                     None
                     if cache is None
@@ -2232,14 +2274,34 @@ class GeneticAlgorithmMinimizer:
                     initial_candidate_id,
                 )
             except Exception as exc:
+                # There is no sensible penalized starting point for a whole GA run,
+                # so an initial-evaluation failure is fatal -- matching
+                # MonteCarloMinimizer's initial evaluation, which raises the same way
+                # rather than seeding a run from a penalty value.
+                initial_result = EvaluationResult(
+                    candidate_id=initial_candidate_id,
+                    input_index=0,
+                    status=EvaluationStatus.FAILED,
+                    selection_energy=ENERGY_PENALTY,
+                    failure_stage=FailureStage.EVALUATOR,
+                    failure_message=f"{type(exc).__name__}: {exc}",
+                )
+                self._emit(
+                    OptimizationEventType.INITIAL_EVALUATION,
+                    run_context=run_context,
+                    iteration=0,
+                    **evaluation_event_fields(initial_result),
+                )
                 self._emit(
                     OptimizationEventType.RUN_FAILED,
                     run_context=run_context,
                     iteration=0,
-                    failure_stage=FailureStage.EVALUATOR,
-                    failure_message=f"{type(exc).__name__}: {exc}",
+                    failure_stage=initial_result.failure_stage,
+                    failure_message=initial_result.failure_message,
                 )
-                raise
+                raise GBMinimizerError(
+                    f"initial evaluation failed: {initial_result.failure_message}"
+                ) from exc
             self._emit(
                 OptimizationEventType.INITIAL_EVALUATION,
                 run_context=run_context,
@@ -2266,6 +2328,7 @@ class GeneticAlgorithmMinimizer:
             population_manipulators = []
             population_structures = []
             population_lineages = []
+            population_operation_parameters: list[Mapping[str, object] | None] = []
 
             if self.initial_structure is not None:
                 seed_manip = self._make_manipulator_from_file(base_parent)
@@ -2274,11 +2337,12 @@ class GeneticAlgorithmMinimizer:
                     np.array(seed_manip.parents[0].whole_system, copy=True)
                 )
                 population_lineages.append(["START", base_parent])
+                population_operation_parameters.append(None)
 
             n_to_generate = self.population_size - len(population_manipulators)
             for _ in range(n_to_generate):
                 candidate_manip = self._make_manipulator_from_file(base_parent)
-                mutation, candidate_struct = self.mutator.mutate(
+                mutation, candidate_struct, mutation_parameters = self.mutator.mutate(
                     local_random=self.local_random,
                     GB=self.GB,
                     manipulator=candidate_manip,
@@ -2286,6 +2350,7 @@ class GeneticAlgorithmMinimizer:
                 population_manipulators.append(candidate_manip)
                 population_structures.append(candidate_struct)
                 population_lineages.append([mutation, base_parent])
+                population_operation_parameters.append(mutation_parameters)
 
             population_checkpoint_paths = [lin[1] for lin in population_lineages]
             population_cached_evaluations = [None] * self.population_size
@@ -2404,6 +2469,7 @@ class GeneticAlgorithmMinimizer:
                     run_context=run_context,
                     iteration=gen,
                     operation_name=population_lineages[i][0],
+                    operation_parameters=population_operation_parameters[i],
                     **evaluation_event_fields(result),
                 )
 
@@ -2422,6 +2488,7 @@ class GeneticAlgorithmMinimizer:
                         run_context=run_context,
                         iteration=gen,
                         operation_name=population_lineages[i][0],
+                        operation_parameters=population_operation_parameters[i],
                         **evaluation_event_fields(result),
                     )
                 self._emit(
@@ -2434,13 +2501,14 @@ class GeneticAlgorithmMinimizer:
                 next_manipulators = []
                 next_structures = []
                 next_lineages = []
+                next_operation_parameters: list[Mapping[str, object] | None] = []
                 next_cached_evaluations: list[_CachedEvaluation | None] = []
 
                 for _ in range(self.population_size):
                     candidate_manip = self._make_manipulator_from_file(
                         best_dump
                     )
-                    mutation, candidate_struct = self.mutator.mutate(
+                    mutation, candidate_struct, mutation_parameters = self.mutator.mutate(
                         local_random=self.local_random,
                         GB=self.GB,
                         manipulator=candidate_manip,
@@ -2448,11 +2516,13 @@ class GeneticAlgorithmMinimizer:
                     next_manipulators.append(candidate_manip)
                     next_structures.append(candidate_struct)
                     next_lineages.append([mutation, best_dump])
+                    next_operation_parameters.append(mutation_parameters)
                     next_cached_evaluations.append(None)
 
                 population_manipulators = next_manipulators
                 population_structures = next_structures
                 population_lineages = next_lineages
+                population_operation_parameters = next_operation_parameters
                 population_cached_evaluations = next_cached_evaluations
             else:
                 for i in valid_old_idxs:
@@ -2497,6 +2567,7 @@ class GeneticAlgorithmMinimizer:
                         run_context=run_context,
                         iteration=gen,
                         operation_name=population_lineages[i][0],
+                        operation_parameters=population_operation_parameters[i],
                         **evaluation_event_fields(result),
                     )
 
@@ -2504,6 +2575,7 @@ class GeneticAlgorithmMinimizer:
                 next_manipulators = []
                 next_structures = []
                 next_lineages = []
+                next_operation_parameters = []
                 next_cached_evaluations = []
                 for j in lowest_valid_idxs:
                     old_idx = valid_old_idxs[j]
@@ -2514,6 +2586,7 @@ class GeneticAlgorithmMinimizer:
                     next_manipulators.append(manip)
                     next_structures.append(manip.parents[0].whole_system)
                     next_lineages.append(["carryover", dump])
+                    next_operation_parameters.append(None)
                     next_cached_evaluations.append(
                         _CachedEvaluation(gen_energies[old_idx], dump)
                         if self.reuse_carryover_evaluations
@@ -2522,20 +2595,24 @@ class GeneticAlgorithmMinimizer:
 
                 valid_files_str = [f for f in valid_files if f is not None]
                 offspring_count = self.population_size - len(next_manipulators)
-                new_manips, new_structs, new_lineages = self._make_next_generation(
-                    valid_files_str,
-                    inter_valid_idxs,
-                    offspring_count,
+                new_manips, new_structs, new_lineages, new_operation_parameters = (
+                    self._make_next_generation(
+                        valid_files_str,
+                        inter_valid_idxs,
+                        offspring_count,
+                    )
                 )
 
                 next_manipulators.extend(new_manips)
                 next_structures.extend(new_structs)
                 next_lineages.extend(new_lineages)
+                next_operation_parameters.extend(new_operation_parameters)
                 next_cached_evaluations.extend([None] * len(new_lineages))
 
                 population_manipulators = next_manipulators
                 population_structures = next_structures
                 population_lineages = next_lineages
+                population_operation_parameters = next_operation_parameters
                 population_cached_evaluations = next_cached_evaluations
 
             logger.debug(
@@ -2856,6 +2933,12 @@ class GeneticAlgorithmMinimizer:
                     raise GBMinimizerError(
                         "owned checkpoint population lineages are invalid"
                     )
+                # operation_parameters is in-memory-only (never checkpointed), so a
+                # resumed population's candidates report no operation parameters until
+                # the next generation produces new offspring.
+                population_operation_parameters: list[Mapping[str, object] | None] = (
+                    [None] * len(population_lineages)
+                )
                 population_snapshots = [
                     {
                         "structure_path": candidate.artifact.path,
@@ -3011,6 +3094,7 @@ class GeneticAlgorithmMinimizer:
             population_manipulators = []
             population_structures = []
             population_lineages = []
+            population_operation_parameters: list[Mapping[str, object] | None] = []
             population_retention_lineages: list[tuple[str, ...]] = []
             population_cached_evaluations: list[
                 CandidateEvaluation | None
@@ -3021,12 +3105,13 @@ class GeneticAlgorithmMinimizer:
                 np.array(seed_manipulator.parents[0].whole_system, copy=True)
             )
             population_lineages.append(["START", initial_record.structure_path])
+            population_operation_parameters.append(None)
             population_retention_lineages.append((initial_record.candidate_id,))
             population_cached_evaluations.append(None)
 
             for _ in range(self.population_size - 1):
                 candidate_manipulator = self._clone_owned_record(initial_record)
-                mutation, candidate_structure = self.mutator.mutate(
+                mutation, candidate_structure, mutation_parameters = self.mutator.mutate(
                     local_random=self.local_random,
                     GB=self.GB,
                     manipulator=candidate_manipulator,
@@ -3034,6 +3119,7 @@ class GeneticAlgorithmMinimizer:
                 population_manipulators.append(candidate_manipulator)
                 population_structures.append(candidate_structure)
                 population_lineages.append([mutation, initial_record.structure_path])
+                population_operation_parameters.append(mutation_parameters)
                 population_retention_lineages.append((initial_record.candidate_id,))
                 population_cached_evaluations.append(None)
             _start_gen = 0
@@ -3215,6 +3301,9 @@ class GeneticAlgorithmMinimizer:
                     run_context=run_context,
                     iteration=gen,
                     operation_name=population_lineages[record.input_index][0],
+                    operation_parameters=population_operation_parameters[
+                        record.input_index
+                    ],
                     **evaluation_event_fields(from_candidate_evaluation(record)),
                 )
             self.last_generation_evaluations = records
@@ -3269,6 +3358,9 @@ class GeneticAlgorithmMinimizer:
                         run_context=run_context,
                         iteration=gen,
                         operation_name=population_lineages[record.input_index][0],
+                        operation_parameters=population_operation_parameters[
+                            record.input_index
+                        ],
                         **evaluation_event_fields(from_candidate_evaluation(record)),
                     )
                 self._emit(
@@ -3283,13 +3375,14 @@ class GeneticAlgorithmMinimizer:
                 next_manipulators: list[GBManipulator] = []
                 next_structures: list[np.ndarray] = []
                 next_lineages: list[list[str]] = []
+                next_operation_parameters: list[Mapping[str, object] | None] = []
                 next_retention_lineages: list[tuple[str, ...]] = []
                 next_cached_evaluations: list[
                     CandidateEvaluation | None
                 ] = []
                 for _ in range(self.population_size):
                     candidate_manipulator = self._clone_owned_record(best_record)
-                    mutation, candidate_structure = self.mutator.mutate(
+                    mutation, candidate_structure, mutation_parameters = self.mutator.mutate(
                         local_random=self.local_random,
                         GB=self.GB,
                         manipulator=candidate_manipulator,
@@ -3297,11 +3390,13 @@ class GeneticAlgorithmMinimizer:
                     next_manipulators.append(candidate_manipulator)
                     next_structures.append(candidate_structure)
                     next_lineages.append([mutation, best_record.structure_path])
+                    next_operation_parameters.append(mutation_parameters)
                     next_retention_lineages.append((best_record.candidate_id,))
                     next_cached_evaluations.append(None)
                 population_manipulators = next_manipulators
                 population_structures = next_structures
                 population_lineages = next_lineages
+                population_operation_parameters = next_operation_parameters
                 population_cached_evaluations = next_cached_evaluations
             else:
                 best_selection_energy = from_candidate_evaluation(
@@ -3358,11 +3453,15 @@ class GeneticAlgorithmMinimizer:
                         run_context=run_context,
                         iteration=gen,
                         operation_name=population_lineages[record.input_index][0],
+                        operation_parameters=population_operation_parameters[
+                            record.input_index
+                        ],
                         **evaluation_event_fields(from_candidate_evaluation(record)),
                     )
                 next_manipulators = []
                 next_structures = []
                 next_lineages = []
+                next_operation_parameters = []
                 next_retention_lineages = []
                 next_cached_evaluations = []
                 for index in lowest_indices:
@@ -3373,13 +3472,14 @@ class GeneticAlgorithmMinimizer:
                         np.array(carryover.parents[0].whole_system, copy=True)
                     )
                     next_lineages.append(["carryover", record.structure_path])
+                    next_operation_parameters.append(None)
                     next_retention_lineages.append((record.candidate_id,))
                     next_cached_evaluations.append(
                         record if self.reuse_carryover_evaluations else None
                     )
 
                 offspring_count = self.population_size - len(next_manipulators)
-                new_manipulators, new_structures, new_lineages = (
+                new_manipulators, new_structures, new_lineages, new_operation_parameters = (
                     self._make_next_owned_generation(
                         valid_records,
                         intermediate_indices,
@@ -3389,6 +3489,7 @@ class GeneticAlgorithmMinimizer:
                 next_manipulators.extend(new_manipulators)
                 next_structures.extend(new_structures)
                 next_lineages.extend(new_lineages)
+                next_operation_parameters.extend(new_operation_parameters)
                 path_to_candidate_id = {
                     str(record.structure_path): record.candidate_id
                     for record in valid_records
@@ -3416,6 +3517,7 @@ class GeneticAlgorithmMinimizer:
             population_manipulators = next_manipulators
             population_structures = next_structures
             population_lineages = next_lineages
+            population_operation_parameters = next_operation_parameters
             population_retention_lineages = next_retention_lineages
             population_cached_evaluations = next_cached_evaluations
 

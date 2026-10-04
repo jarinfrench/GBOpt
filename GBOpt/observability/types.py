@@ -478,6 +478,9 @@ class OptimizationEvent:
         Optimizer-facing selection energy, when applicable.
     :param energy: Keyword argument, optional, defaults to ``None``. Physical energy,
         populated only alongside a ``SUCCESS`` status.
+    :param artifact_path: Keyword argument, optional, defaults to ``None``. Reconstructed
+        structure file path, mirroring ``EvaluationResult.artifact.path`` -- ``None``
+        for any event with no artifact (every non-``SUCCESS`` outcome).
     :param failure_stage: Keyword argument, optional, defaults to ``None``. Pipeline
         stage a failure originated from.
     :param failure_code: Keyword argument, optional, defaults to ``None``. Stable
@@ -506,6 +509,7 @@ class OptimizationEvent:
     status: EvaluationStatus | None
     selection_energy: float | None
     energy: float | None
+    artifact_path: str | None
     failure_stage: FailureStage | None
     failure_code: str | None
     failure_message: str | None
@@ -524,6 +528,7 @@ class OptimizationEvent:
         status: EvaluationStatus | None = None,
         selection_energy: float | None = None,
         energy: float | None = None,
+        artifact_path: str | None = None,
         failure_stage: FailureStage | None = None,
         failure_code: str | None = None,
         failure_message: str | None = None,
@@ -557,6 +562,9 @@ class OptimizationEvent:
             selection_energy, name="selection_energy"
         )
         energy = _normalize_optional_energy(energy, name="energy")
+        artifact_path = _normalize_optional_identity(
+            artifact_path, name="artifact_path"
+        )
         if failure_stage is not None and not isinstance(failure_stage, FailureStage):
             raise ObservabilityTypeError("failure_stage must be a FailureStage or None")
         failure_code = _normalize_optional_identity(failure_code, name="failure_code")
@@ -588,6 +596,7 @@ class OptimizationEvent:
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "selection_energy", selection_energy)
         object.__setattr__(self, "energy", energy)
+        object.__setattr__(self, "artifact_path", artifact_path)
         object.__setattr__(self, "failure_stage", failure_stage)
         object.__setattr__(self, "failure_code", failure_code)
         object.__setattr__(self, "failure_message", failure_message)

@@ -27,7 +27,7 @@ not that this particular candidate was a bad fit.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import numpy as np
 
@@ -60,14 +60,17 @@ _LEGACY_OPERATION_TYPES: dict[str, type[Manipulation]] = {
 
 def _insert_atoms_invoker(manipulator: GBManipulator, rng: np.random.Generator):
     del rng
-    new_system = manipulator.insert_atoms(method="grid", num_to_insert=1)
-    return "add1", new_system
+    method = "grid"
+    num_to_insert = 1
+    new_system = manipulator.insert_atoms(method=method, num_to_insert=num_to_insert)
+    return "add1", new_system, {"method": method, "num_to_insert": num_to_insert}
 
 
 def _remove_atoms_invoker(manipulator: GBManipulator, rng: np.random.Generator):
     del rng
-    new_system = manipulator.remove_atoms(num_to_remove=1)
-    return "remove1", new_system
+    num_to_remove = 1
+    new_system = manipulator.remove_atoms(num_to_remove=num_to_remove)
+    return "remove1", new_system, {"num_to_remove": num_to_remove}
 
 
 def _make_translate_right_grain_invoker(GB: GBMaker) -> LegacyInvoker:
@@ -80,7 +83,11 @@ def _make_translate_right_grain_invoker(GB: GBMaker) -> LegacyInvoker:
         dz = (z_dim / GB.repeat_factor[1]) * rng.uniform(0, 1)
 
         new_system = manipulator.translate_right_grain(dy=dy, dz=dz)
-        return f"shift{dy:.8f}dy{dz:.8f}dz", new_system
+        return (
+            f"shift{dy:.8f}dy{dz:.8f}dz",
+            new_system,
+            {"dy": float(dy), "dz": float(dz)},
+        )
 
     return _invoke
 
@@ -110,7 +117,11 @@ def _generic_apply_invoker(operation: Manipulation) -> LegacyInvoker:
                 "children; MC/GA dispatch requires exactly one"
             )
         (child,) = result.children
-        return operation.name, np.array(child.atoms, copy=True)
+        return (
+            operation.name,
+            np.array(child.atoms, copy=True),
+            dict(result.parameters) if result.parameters else None,
+        )
 
     return _invoke
 
@@ -170,7 +181,7 @@ class Mutator:
         local_random: np.random.Generator,
         GB: GBMaker,
         manipulator: GBManipulator,
-    ):
+    ) -> tuple[str, np.ndarray, Mapping[str, object] | None]:
         """Perform a randomly selected feasible mutation.
 
         Each configured mutation is attempted at most once, in the same
@@ -181,7 +192,8 @@ class Mutator:
         :param local_random: Optimizer-owned random-number generator.
         :param GB: GBMaker providing boundary dimensions and repeat factors.
         :param manipulator: GBManipulator on which to perform the mutation.
-        :return: Mutation description and resulting atom positions.
+        :return: Mutation description, resulting atom positions, and a JSON-safe mapping
+            of the concrete parameter values the mutation used (or ``None``).
         :raises GBMinimizerValueError: If a configured choice cannot be resolved, or a
             registry-resolved operation produces other than one child.
         :raises GBMinimizerError: If no configured mutation can produce a candidate.
