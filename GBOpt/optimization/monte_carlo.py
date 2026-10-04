@@ -854,7 +854,7 @@ class MonteCarloMinimizer:
                 if current_candidate_id is None
                 else (current_candidate_id,)
             )
-            mutation, new_system = self.mutator.mutate(
+            mutation, new_system, mutation_parameters = self.mutator.mutate(
                 self.local_random, self.GB, self.manipulator
             )
 
@@ -900,6 +900,7 @@ class MonteCarloMinimizer:
                 run_context=run_context,
                 iteration=i,
                 operation_name=mutation,
+                operation_parameters=mutation_parameters,
                 **evaluation_event_fields(step_result),
             )
 
@@ -941,6 +942,7 @@ class MonteCarloMinimizer:
                     run_context=run_context,
                     iteration=i,
                     operation_name=mutation,
+                    operation_parameters=mutation_parameters,
                     **evaluation_event_fields(step_result),
                 )
                 self.operation_list.append([mutation, True])
@@ -1018,6 +1020,7 @@ class MonteCarloMinimizer:
                     run_context=run_context,
                     iteration=i,
                     operation_name=mutation,
+                    operation_parameters=mutation_parameters,
                     **evaluation_event_fields(step_result),
                 )
                 self.operation_list.append([mutation, False])
