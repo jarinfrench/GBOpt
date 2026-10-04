@@ -1360,9 +1360,20 @@ class GBManipulator:
         physical grain bounds, and interface-separation state exactly as the rest of this
         class already constructs them via ``_to_interface_candidate``), checks the
         operation's declared arity against the number of parents actually available, and
-        executes it. No built-in manipulation algorithm is routed through this seam; it
-        exists so an operation defined outside ``GBOpt`` can run against real manipulator
-        state.
+        executes it. ``cycle_grain_terminations`` is the first (and, as of this writing,
+        only) built-in routed through this seam; every other legacy method still bypasses
+        it for its own documented reason (RNG duck-typing, missing ``unit_cell``/
+        ``gb_thickness`` fields, or ``InterfaceCandidate``-leniency conflicts -- see
+        ``CLAUDE.md``). It also exists so an operation defined outside ``GBOpt`` can run
+        against real manipulator state.
+
+        This seam validates only the *input* side; it does not re-check a returned
+        child candidate beyond what ``ManipulationResult`` itself already enforces
+        (a nonempty tuple of ``InterfaceCandidate`` instances). Every built-in operation's
+        own ``execute`` already builds its child candidate(s) through
+        ``InterfaceCandidate``'s own constructor, which performs full geometry
+        validation, so a second, facade-level output check here would only repeat that
+        validation, not add real coverage.
 
         :param manipulation: Operation to execute; may be defined outside GBOpt.
         :param seed: Keyword argument, optional, defaults to ``None``. When given, used
@@ -1532,6 +1543,12 @@ class GBManipulator:
     ) -> np.ndarray:
         """Cycle grain-local terminations for a periodic bicrystal or slab.
 
+        Delegates to :meth:`apply` with a fresh ``GrainTerminationCycle()``: unlike
+        ``translate_right_grain``, ``slice_and_merge``, ``insert_atoms``,
+        ``remove_atoms``, and ``displace_along_soft_modes``, this method has no
+        ``InterfaceCandidate`` leniency conflict, RNG duck-typing need, or missing-field
+        need that would require bypassing the generic facade boundary.
+
         Each grain is cycled independently through its finite physical x interval. The
         left grain remains fixed in-plane, while the right grain may also be translated
         along the periodic in-plane directions.
@@ -1564,18 +1581,13 @@ class GBManipulator:
                 "termination cycling requires exactly one parent"
             )
 
-        context = ManipulationContext(
-            parents=(self.__parent_candidate_geometry(0),),
-            rng=self.__rng,
-            params={
-                "left_phase_shift": left_phase_shift,
-                "right_phase_shift": right_phase_shift,
-                "right_dy": right_dy,
-                "right_dz": right_dz,
-            },
-        )
         result = self.__translate_manipulation_error(
-            GrainTerminationCycle().execute, context
+            self.apply,
+            GrainTerminationCycle(),
+            left_phase_shift=left_phase_shift,
+            right_phase_shift=right_phase_shift,
+            right_dy=right_dy,
+            right_dz=right_dz,
         )
         return np.array(result.children[0].atoms, copy=True)
 
