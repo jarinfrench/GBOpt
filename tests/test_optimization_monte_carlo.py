@@ -12,7 +12,11 @@ from GBOpt.artifacts import ArtifactRetentionPolicy, KeepBest
 from GBOpt.GBMaker import GBMaker
 from GBOpt.manipulation import ManipulationRegistry, ManipulationResult
 from GBOpt.optimization.monte_carlo import MonteCarloMinimizer
-from GBOpt.optimization.types import GBMinimizerError, GBMinimizerValueError
+from GBOpt.optimization.types import (
+    GBMinimizerError,
+    GBMinimizerTypeError,
+    GBMinimizerValueError,
+)
 
 _TEST_CALCULATION_CONTEXT = {"calculator": {"name": "test-evaluator"}}
 
@@ -640,6 +644,30 @@ def test_resolved_seed_from_none_is_retained_on_the_minimizer(gb):
         gb, _make_energy_func(gb), ["translate_right_grain"], seed=None
     )
     assert isinstance(minimizer.seed, int)
+
+
+@pytest.mark.parametrize("seed", [1.5, "0", [0], True, False])
+def test_non_int_seed_is_rejected(gb, seed):
+    with pytest.raises(GBMinimizerTypeError, match="seed must be an int or None"):
+        MonteCarloMinimizer(
+            gb, _make_energy_func(gb), ["translate_right_grain"], seed=seed
+        )
+
+
+def test_debug_level_logs_run_lifecycle(gb, tmp_path, caplog):
+    import logging
+
+    root = tmp_path / "structures"
+    energy_func = _make_sequence_energy_func([2.0, 1.5, 1.0], root)
+    mc = MonteCarloMinimizer(gb, energy_func, ["translate_right_grain"], seed=0)
+
+    with caplog.at_level(logging.DEBUG, logger="GBOpt.optimization.monte_carlo"):
+        mc.run_MC(max_steps=2, unique_id=100)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("MC run starting" in message for message in messages)
+    assert any("initial evaluation" in message for message in messages)
+    assert any("step 1 complete" in message for message in messages)
 
 
 def test_energy_tolerance_termination_logs_instead_of_printing(gb, tmp_path, capsys):

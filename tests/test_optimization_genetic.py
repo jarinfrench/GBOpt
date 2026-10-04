@@ -187,6 +187,38 @@ class TestGeneticAlgorithmMinimizerCheckpointing(unittest.TestCase):
         self.assertEqual(state["run_params"]["seed"], 0)
         self.assertEqual(minimizer2.seed, 0)
 
+    def test_non_int_seed_is_rejected(self):
+        for bad_seed in (1.5, "0", [0], True, False):
+            with self.assertRaisesRegex(
+                GBMinimizerTypeError, "seed must be an int or None"
+            ):
+                GeneticAlgorithmMinimizer(
+                    self.gb,
+                    self._fake_energy_func,
+                    ["insert_atoms", "remove_atoms", "translate_right_grain"],
+                    seed=bad_seed,
+                    population_size=4,
+                    generations=2,
+                    keep_top_pct=25,
+                    intermediate_pct=75,
+                )
+
+    def test_debug_level_logs_run_lifecycle(self):
+        import logging
+
+        minimizer = self._make_minimizer(generations=2)
+        with self.assertLogs(
+            "GBOpt.optimization.genetic", level=logging.DEBUG
+        ) as captured:
+            minimizer.run_GA(unique_id=101)
+
+        messages = captured.output
+        self.assertTrue(any("GA run" in m and "starting" in m for m in messages))
+        self.assertTrue(any("initial evaluation" in m for m in messages))
+        self.assertTrue(
+            any("generation" in m and "complete" in m for m in messages)
+        )
+
     def test_run_ga_corrupted_checkpoint_raises(self):
         cp = Path(self.tmpdir.name) / "corrupt.json"
         cp.write_bytes(b"not valid json {{{")
@@ -1775,6 +1807,28 @@ def test_owned_batch_cache_preserves_full_population_indices(owned_ga, tmp_path)
         "GA_214_g1_c2",
         "GA_214_g1_c3",
     ]
+
+
+def test_owned_ga_debug_level_logs_run_lifecycle(owned_ga, tmp_path, caplog):
+    import logging
+
+    energy = _owned_checkpoint_energy(tmp_path)
+    minimizer = _make_owned_checkpoint_minimizer(
+        owned_ga,
+        energy,
+        generations=1,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="GBOpt.optimization.genetic"):
+        minimizer.run_GA(unique_id=202)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("starting (owned mode)" in message for message in messages)
+    assert any("initial evaluation (owned mode)" in message for message in messages)
+    assert any(
+        "generation" in message and "complete (owned mode)" in message
+        for message in messages
+    )
 
 
 def test_owned_ga_checkpoint_json_contains_reconstruction_state(owned_ga, tmp_path):
