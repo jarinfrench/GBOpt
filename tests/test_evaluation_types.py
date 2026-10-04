@@ -47,7 +47,7 @@ def test_structure_artifact_normalizes_path_type():
 
     artifact = StructureArtifact(path=Path("/tmp/candidate.data"), format="lammps")
 
-    assert artifact.path == "/tmp/candidate.data"
+    assert artifact.path == str(Path("/tmp/candidate.data"))
     assert type(artifact.path) is str
 
 
