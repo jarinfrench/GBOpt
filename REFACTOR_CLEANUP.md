@@ -76,6 +76,22 @@ invokers') return contract to also surface the `ManipulationResult` itself, at w
 `operation_parameters` can be populated from its `.parameters` mapping the same way
 `evaluation_event_fields()` already sources candidate/evaluation fields from `EvaluationResult`.
 
+**Resolved** on `refactor/r24-event-vocabulary` (discussed with the user 2026-10-03, implemented
+across several commits): `Mutator.mutate()` and both
+`run_legacy_compat_operation()`/`run_legacy_compat_binary_operation()` now return a JSON-safe
+parameters mapping (or `None`) alongside the label and atoms, rather than discarding it. Not a
+literal `ManipulationResult` end-to-end, by design: 3 of the 4 operation shapes dispatched through
+this seam (`insert_atoms`/`remove_atoms`/`translate_right_grain`) never produce one at all (they
+call `GBManipulator`'s own established methods directly, bypassing `ManipulationContext` -- see
+this file's R16/R18 entries on that), so a plain dict built from whatever scalar args each invoker
+already computed is the only shape all four paths can share uniformly; the one path that does
+produce a real `ManipulationResult` (the registry-resolved generic invoker, and
+`_run_generic_binary_operation` for the binary case) reads `.parameters` from it before discarding
+the object, same as before. Threaded through both `GeneticAlgorithmMinimizer` generation loops
+(owned and legacy) via a new in-memory-only `population_operation_parameters` parallel list --
+deliberately *not* checkpointed, so a resumed population's candidates report no operation
+parameters until the next generation produces new offspring (checkpoint schema unchanged).
+
 ## R24's GA accept/reject events map to next-generation selection, not a Metropolis-style decision
 
 Issue #84 asks for "accept/reject" as one of MC and GA's shared lifecycle events, modeled on
@@ -114,6 +130,15 @@ behavior change no acceptance criterion asked for.
 
 **Resolve at**: no action needed unless a later step's acceptance criteria require a real
 recovery boundary at legacy `run_GA`'s initial evaluation, the way R23 added one for MC's.
+
+**Resolved** on `refactor/r24-event-vocabulary` (user's own call, 2026-10-03: "consistency is the
+better approach" over keeping the two algorithms' shapes deliberately different). Legacy
+`run_GA`'s initial-evaluation except block now matches `MonteCarloMinimizer.run_MC`'s exactly:
+builds a failed `EvaluationResult`, emits `INITIAL_EVALUATION` (with full failure context) ahead
+of `RUN_FAILED`, and raises `GBMinimizerError(...) from exc` instead of a bare `raise`. This is a
+real, intentional behavior change (the original exception type no longer propagates unchanged) --
+confirmed as already the owned-mode path's established behavior, so legacy mode was the
+inconsistent one, not owned mode.
 
 ## R24 legacy `_evaluate_generation`'s returned `EvaluationResult` now reflects a candidate-reconstruction failure too
 
