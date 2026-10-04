@@ -51,6 +51,15 @@ class ManipulationRegistry:
                 f"no manipulation named {name!r} is registered"
             ) from exc
 
+    def __contains__(self, name: str) -> bool:
+        """Return whether an operation is registered under ``name``."""
+        return name in self.__entries
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """Return every registered operation name, in registration order."""
+        return tuple(self.__entries)
+
 
 default_registry = ManipulationRegistry()
 

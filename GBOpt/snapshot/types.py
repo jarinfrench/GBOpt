@@ -1737,21 +1737,12 @@ class GeneticAlgorithmSnapshot:
 
         See the class docstring for parameter semantics and raised exceptions.
         """
-        if not isinstance(run, RunIdentitySnapshot):
-            raise SnapshotTypeError("run must be a RunIdentitySnapshot")
-        if not isinstance(rng, RngStateSnapshot):
-            raise SnapshotTypeError("rng must be an RngStateSnapshot")
+        _require_ga_scalar_fields(
+            run=run, rng=rng, best=best, configuration=configuration
+        )
         completed_generation = _normalize_index(
             completed_generation, name="completed_generation"
         )
-        if not isinstance(best, CandidateEvaluationSnapshot):
-            raise SnapshotTypeError("best must be a CandidateEvaluationSnapshot")
-        if best.status is not EvaluationStatus.SUCCESS:
-            raise SnapshotValueError("best must be a successful evaluation")
-        if not isinstance(configuration, GeneticAlgorithmConfigurationSnapshot):
-            raise SnapshotTypeError(
-                "configuration must be a GeneticAlgorithmConfigurationSnapshot"
-            )
 
         population_tuple = _validate_ga_population(population)
         population_size = len(population_tuple)
@@ -1772,39 +1763,19 @@ class GeneticAlgorithmSnapshot:
         last_generation_evaluations_tuple = _validate_ga_last_generation_evaluations(
             last_generation_evaluations, population_size=population_size
         )
-        if not all(
-            isinstance(entry, FailureDiagnosticSnapshot)
-            for entry in failure_diagnostics
-        ):
-            raise SnapshotTypeError(
-                "failure_diagnostics entries must be FailureDiagnosticSnapshot"
+        failure_diagnostics_tuple = _require_ga_failure_diagnostics(failure_diagnostics)
+        claimed_paths_tuple, retention_state, retention_archive_mappings_dict = (
+            _normalize_ga_retention_fields(
+                claimed_paths=claimed_paths,
+                retention_state=retention_state,
+                retention_archive_mappings=retention_archive_mappings,
             )
-        claimed_paths_tuple = tuple(
-            _normalize_identity(value, name="claimed_paths entry")
-            for value in claimed_paths
         )
-        retention_state = _validate_optional_retention_state(retention_state)
-        retention_archive_mappings_dict = _validate_ga_retention_archive_mappings(
-            retention_archive_mappings
+        best_mapping, population_cache_mappings_tuple = _validate_ga_mapping_fields(
+            best_mapping=best_mapping,
+            population_cache_mappings=population_cache_mappings,
+            population_size=population_size,
         )
-        if best_mapping is not None and not isinstance(
-            best_mapping, CandidateFileMapping
-        ):
-            raise SnapshotTypeError("best_mapping must be a CandidateFileMapping or None")
-        population_cache_mappings_tuple = tuple(population_cache_mappings)
-        if population_cache_mappings_tuple and (
-            len(population_cache_mappings_tuple) != population_size
-        ):
-            raise SnapshotValueError(
-                "population_cache_mappings must be empty or aligned with population"
-            )
-        if not all(
-            entry is None or isinstance(entry, CandidateFileMapping)
-            for entry in population_cache_mappings_tuple
-        ):
-            raise SnapshotTypeError(
-                "population_cache_mappings entries must be CandidateFileMapping or None"
-            )
 
         object.__setattr__(self, "schema_version", SNAPSHOT_SCHEMA_VERSION)
         object.__setattr__(self, "run", run)
@@ -1821,9 +1792,7 @@ class GeneticAlgorithmSnapshot:
             "last_generation_evaluations",
             last_generation_evaluations_tuple,
         )
-        object.__setattr__(
-            self, "failure_diagnostics", tuple(failure_diagnostics)
-        )
+        object.__setattr__(self, "failure_diagnostics", failure_diagnostics_tuple)
         object.__setattr__(self, "claimed_paths", claimed_paths_tuple)
         object.__setattr__(self, "retention_state", retention_state)
         object.__setattr__(
@@ -1995,6 +1964,126 @@ class GeneticAlgorithmSnapshot:
             raise SnapshotTypeError(
                 f"GeneticAlgorithmSnapshot state is missing required field: {exc}"
             ) from exc
+
+
+def _require_ga_scalar_fields(
+    *,
+    run: object,
+    rng: object,
+    best: object,
+    configuration: object,
+) -> None:
+    """Validate ``GeneticAlgorithmSnapshot``'s required non-sequence fields.
+
+    :param run: Candidate run identity to validate.
+    :param rng: Candidate RNG state to validate.
+    :param best: Candidate best-evaluation snapshot to validate.
+    :param configuration: Candidate GA configuration snapshot to validate.
+    :raises SnapshotTypeError: If any field has the wrong type.
+    :raises SnapshotValueError: If ``best`` is not a successful evaluation.
+    """
+    if not isinstance(run, RunIdentitySnapshot):
+        raise SnapshotTypeError("run must be a RunIdentitySnapshot")
+    if not isinstance(rng, RngStateSnapshot):
+        raise SnapshotTypeError("rng must be an RngStateSnapshot")
+    if not isinstance(best, CandidateEvaluationSnapshot):
+        raise SnapshotTypeError("best must be a CandidateEvaluationSnapshot")
+    if best.status is not EvaluationStatus.SUCCESS:
+        raise SnapshotValueError("best must be a successful evaluation")
+    if not isinstance(configuration, GeneticAlgorithmConfigurationSnapshot):
+        raise SnapshotTypeError(
+            "configuration must be a GeneticAlgorithmConfigurationSnapshot"
+        )
+
+
+def _require_ga_failure_diagnostics(
+    failure_diagnostics: Sequence[FailureDiagnosticSnapshot],
+) -> tuple[FailureDiagnosticSnapshot, ...]:
+    """Validate a sequence of bounded failed-evaluation diagnostic snapshots.
+
+    :param failure_diagnostics: Diagnostic sequence to validate.
+    :return: Validated diagnostic tuple.
+    :raises SnapshotTypeError: If any entry is not a ``FailureDiagnosticSnapshot``.
+    """
+    failure_diagnostics_tuple = tuple(failure_diagnostics)
+    if not all(
+        isinstance(entry, FailureDiagnosticSnapshot)
+        for entry in failure_diagnostics_tuple
+    ):
+        raise SnapshotTypeError(
+            "failure_diagnostics entries must be FailureDiagnosticSnapshot"
+        )
+    return failure_diagnostics_tuple
+
+
+def _normalize_ga_retention_fields(
+    *,
+    claimed_paths: Sequence[str],
+    retention_state: Mapping[str, object] | None,
+    retention_archive_mappings: Mapping[str, CandidateFileMapping],
+) -> tuple[
+    tuple[str, ...], Mapping[str, object] | None, dict[str, CandidateFileMapping]
+]:
+    """Validate and normalize ``GeneticAlgorithmSnapshot``'s retention-related fields.
+
+    :param claimed_paths: Claimed evaluator artifact path sequence to validate.
+    :param retention_state: Opaque ``ArtifactStore`` state to validate, or ``None``.
+    :param retention_archive_mappings: Archived-candidate ownership mapping to
+        validate.
+    :return: ``(claimed_paths, retention_state, retention_archive_mappings)``, each
+        validated and normalized.
+    :raises SnapshotTypeError: If any field has an invalid type or shape.
+    """
+    claimed_paths_tuple = tuple(
+        _normalize_identity(value, name="claimed_paths entry")
+        for value in claimed_paths
+    )
+    retention_state = _validate_optional_retention_state(retention_state)
+    retention_archive_mappings_dict = _validate_ga_retention_archive_mappings(
+        retention_archive_mappings
+    )
+    return claimed_paths_tuple, retention_state, retention_archive_mappings_dict
+
+
+def _validate_ga_mapping_fields(
+    *,
+    best_mapping: CandidateFileMapping | None,
+    population_cache_mappings: Sequence[CandidateFileMapping | None],
+    population_size: int,
+) -> tuple[CandidateFileMapping | None, tuple[CandidateFileMapping | None, ...]]:
+    """Validate explicit-ownership reconstruction mapping fields for a GA snapshot.
+
+    :param best_mapping: Mapping for the snapshot's ``best`` evaluation to validate,
+        or ``None``.
+    :param population_cache_mappings: Population-cache-aligned mapping sequence to
+        validate.
+    :param population_size: Keyword argument, required. Population size to align
+        against, when ``population_cache_mappings`` is non-empty.
+    :return: ``(best_mapping, population_cache_mappings)``, the latter normalized to a
+        tuple.
+    :raises SnapshotTypeError: If any field has an invalid type.
+    :raises SnapshotValueError: If ``population_cache_mappings`` is non-empty and
+        misaligned with ``population_size``.
+    """
+    if best_mapping is not None and not isinstance(
+        best_mapping, CandidateFileMapping
+    ):
+        raise SnapshotTypeError("best_mapping must be a CandidateFileMapping or None")
+    population_cache_mappings_tuple = tuple(population_cache_mappings)
+    if population_cache_mappings_tuple and (
+        len(population_cache_mappings_tuple) != population_size
+    ):
+        raise SnapshotValueError(
+            "population_cache_mappings must be empty or aligned with population"
+        )
+    if not all(
+        entry is None or isinstance(entry, CandidateFileMapping)
+        for entry in population_cache_mappings_tuple
+    ):
+        raise SnapshotTypeError(
+            "population_cache_mappings entries must be CandidateFileMapping or None"
+        )
+    return best_mapping, population_cache_mappings_tuple
 
 
 def _validate_ga_population(

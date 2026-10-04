@@ -167,6 +167,8 @@ class Mutator:
             raise GBMinimizerValueError(
                 "Unknown GBManipulator mutation choice(s): "
                 + ", ".join(repr(choice) for choice in invalid_choices)
+                + "; registered operation names: "
+                + (", ".join(self._registry.names) or "(none)")
             )
 
         # Duplicate names do not weight a mutation more heavily.
