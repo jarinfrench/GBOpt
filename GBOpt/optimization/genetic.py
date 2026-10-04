@@ -11,7 +11,6 @@ import warnings
 from collections.abc import Callable, Mapping, Sequence
 from numbers import Integral, Real
 from pathlib import Path
-from time import time
 
 import numpy as np
 
@@ -112,6 +111,7 @@ from GBOpt.optimization.types import (
     _candidate_mapping_from_state,
     _candidate_mapping_to_state,
     _FailureDiagnostic,
+    resolve_rng_seed,
 )
 from GBOpt.snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
@@ -350,11 +350,12 @@ class GeneticAlgorithmMinimizer:
         :param campaign_id: Keyword argument, optional, defaults to ``None``.
             Caller-supplied campaign identity grouping several runs, stamped on every
             emitted event's ``RunContext``.
-        :raises TypeError: If ``initial_ownership`` is not GrainOwnership, accompanies a
-            non-file initial structure, ``allow_variable_cell`` is not Boolean, a
-            crossover/cleanup policy argument has an invalid type, ``retention_policy``
-            is not an ``ArtifactRetentionPolicy``, or ``event_sink`` is neither ``None``
-            nor an ``EventSink``.
+        :raises TypeError: If ``seed`` is neither ``None`` nor an ``int``,
+            ``initial_ownership`` is not GrainOwnership, accompanies a non-file initial
+            structure, ``allow_variable_cell`` is not Boolean, a crossover/cleanup
+            policy argument has an invalid type, ``retention_policy`` is not an
+            ``ArtifactRetentionPolicy``, or ``event_sink`` is neither ``None`` nor an
+            ``EventSink``.
         :raises ValueError: If ownership is supplied without an initial structure,
             variable-cell execution is requested without explicit ownership, cleanup
             ownership is ambiguous, or pruning lacks an explicit cleanup owner.
@@ -493,7 +494,7 @@ class GeneticAlgorithmMinimizer:
         self.artifact_store: ArtifactStore | None = artifact_store
         self._retention_archive_mappings: dict[str, dict] = {}
         self._artifact_provenance: _ArtifactProvenance | None = None
-        self.seed: int = int(time()) if seed is None else seed
+        self.seed: int = resolve_rng_seed(seed)
         self.local_random: np.random.Generator = np.random.default_rng(self.seed)
         self._owned_evaluator: ExplicitOwnershipEvaluator | None = (
             ExplicitOwnershipEvaluator(
@@ -2109,6 +2110,16 @@ class GeneticAlgorithmMinimizer:
         except CheckpointError as e:
             raise GBMinimizerValueError(str(e)) from e
 
+        logger.debug(
+            "GA run %s starting: generations=%d, population_size=%d, seed=%d, "
+            "resuming=%s",
+            unique_id,
+            self.generations,
+            self.population_size,
+            self.seed,
+            state is not None,
+        )
+
         if state is not None:
             try:
                 snapshot = _ga_snapshot_from_checkpoint_state(state, owned=False)
@@ -2247,6 +2258,9 @@ class GeneticAlgorithmMinimizer:
 
             best_energy = init_gbe
             best_dump = init_dump
+            logger.debug(
+                "GA run %s initial evaluation: energy=%.6g", unique_id, init_gbe
+            )
 
             base_parent = init_dump
             population_manipulators = []
@@ -2445,6 +2459,14 @@ class GeneticAlgorithmMinimizer:
                     gbe = gen_energies[i]
                     dump_file_name = gen_files[i]
                     if gbe < best_energy:
+                        logger.debug(
+                            "GA run %s new best at generation %d: energy %.6g "
+                            "(was %.6g)",
+                            unique_id,
+                            gen,
+                            gbe,
+                            best_energy,
+                        )
                         best_energy = gbe
                         best_dump = dump_file_name
                         self._emit(
@@ -2515,6 +2537,16 @@ class GeneticAlgorithmMinimizer:
                 population_structures = next_structures
                 population_lineages = next_lineages
                 population_cached_evaluations = next_cached_evaluations
+
+            logger.debug(
+                "GA run %s generation %d complete: %d/%d candidates valid, best "
+                "energy %.6g",
+                unique_id,
+                gen,
+                len(valid_old_idxs),
+                len(gen_energies),
+                best_energy,
+            )
 
             _last_completed_gen = gen
             is_final_gen = (gen == self.generations - 1)
@@ -2630,6 +2662,16 @@ class GeneticAlgorithmMinimizer:
             raise GBMinimizerError(
                 "Invalid explicit-ownership GA checkpoint envelope."
             ) from exc
+
+        logger.debug(
+            "GA run %s starting (owned mode): generations=%d, population_size=%d, "
+            "seed=%d, resuming=%s",
+            unique_id,
+            self.generations,
+            self.population_size,
+            self.seed,
+            state is not None,
+        )
 
         self._owned_evaluator.begin_run()
         if (
@@ -2951,6 +2993,11 @@ class GeneticAlgorithmMinimizer:
             )
             best_record = initial_record
             self.best_evaluation = best_record
+            logger.debug(
+                "GA run %s initial evaluation (owned mode): energy=%.6g",
+                unique_id,
+                initial_record.objective,
+            )
             if self.artifact_store is not None:
                 self._register_owned_retention_candidate(
                     initial_record, generation=0, lineage=()
@@ -3265,6 +3312,14 @@ class GeneticAlgorithmMinimizer:
                         record
                     ).selection_energy
                     if record_selection_energy < best_selection_energy:
+                        logger.debug(
+                            "GA run %s new best at generation %d (owned mode): "
+                            "energy %.6g (was %.6g)",
+                            unique_id,
+                            gen,
+                            record_selection_energy,
+                            best_selection_energy,
+                        )
                         best_record = record
                         best_selection_energy = record_selection_energy
                         self.best_evaluation = record
@@ -3477,6 +3532,16 @@ class GeneticAlgorithmMinimizer:
                 self._write_owned_artifact_manifest()
             elif self.artifact_store is not None:
                 self._write_owned_artifact_manifest()
+
+            logger.debug(
+                "GA run %s generation %d complete (owned mode): %d/%d candidates "
+                "valid, best energy %.6g",
+                unique_id,
+                gen,
+                len(valid_records),
+                len(records),
+                from_candidate_evaluation(best_record).selection_energy,
+            )
 
             _last_completed_gen = gen
             self._emit(

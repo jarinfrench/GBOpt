@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from numbers import Integral, Real
+from time import time
 
 import numpy as np
 
@@ -33,6 +34,28 @@ class GBMinimizerTypeError(GBMinimizerError, TypeError):
 
 class GBMinimizerValueError(GBMinimizerError, ValueError):
     """Raised when an argument has an invalid value."""
+
+
+def resolve_rng_seed(seed: object) -> int:
+    """Validate and resolve one optimizer constructor's ``seed`` argument.
+
+    Only a plain ``int`` or ``None`` is accepted -- not the broader set of types
+    ``numpy.random.default_rng`` itself accepts (array-like, ``SeedSequence``,
+    ``BitGenerator``, ``Generator``), since the resolved seed must round-trip through
+    JSON checkpoint serialization and GBOpt has no caller that needs those richer forms.
+
+    :param seed: Constructor-supplied seed; ``None`` resolves to the current time.
+    :return: The concrete ``int`` seed to pass to ``numpy.random.default_rng``.
+    :raises GBMinimizerTypeError: If ``seed`` is neither ``None`` nor a non-Boolean
+        integer.
+    """
+    if seed is None:
+        return int(time())
+    if isinstance(seed, bool) or not isinstance(seed, Integral):
+        raise GBMinimizerTypeError(
+            f"seed must be an int or None, not {type(seed).__name__!r}"
+        )
+    return int(seed)
 
 
 def _no_extra_params(

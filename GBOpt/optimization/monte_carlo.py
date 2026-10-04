@@ -10,7 +10,6 @@ import warnings
 from collections.abc import Callable, Mapping
 from numbers import Integral, Real
 from pathlib import Path
-from time import time
 from typing import Any
 
 import numpy as np
@@ -76,6 +75,7 @@ from GBOpt.optimization.types import (
     GBMinimizerError,
     GBMinimizerTypeError,
     GBMinimizerValueError,
+    resolve_rng_seed,
 )
 from GBOpt.snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
@@ -211,8 +211,9 @@ class MonteCarloMinimizer:
         :param campaign_id: Keyword argument, optional, defaults to ``None``.
             Caller-supplied campaign identity grouping several runs, stamped on every
             emitted event's ``RunContext``.
-        :raises GBMinimizerTypeError: If artifact retention/cleanup configuration has an
-            invalid type, or ``event_sink`` is neither ``None`` nor an ``EventSink``.
+        :raises GBMinimizerTypeError: If ``seed`` is neither ``None`` nor an ``int``,
+            artifact retention/cleanup configuration has an invalid type, or
+            ``event_sink`` is neither ``None`` nor an ``EventSink``.
         :raises GBMinimizerValueError: If cleanup ownership is ambiguous or inconsistent
             with pruning configuration.
         """
@@ -241,7 +242,7 @@ class MonteCarloMinimizer:
         self.mutator = Mutator(choices, self.manipulator, registry=registry)
         self.accepted_idx = [0]  # Initial guess is accepted by definition
         self.operation_list = [["START", True]]
-        self.seed: int = int(time()) if seed is None else seed
+        self.seed: int = resolve_rng_seed(seed)
         self.local_random = np.random.default_rng(self.seed)
         self.manipulator.rng = self.local_random
         self.GBE_vals: list[float] = []
@@ -623,6 +624,19 @@ class MonteCarloMinimizer:
         except CheckpointError as e:
             raise GBMinimizerError(str(e)) from e
 
+        logger.debug(
+            "MC run starting: E_accept=%s, min_steps=%s, max_steps=%s, E_tol=%s, "
+            "max_rejections=%s, cooldown_rate=%s, seed=%d, resuming=%s",
+            E_accept,
+            min_steps,
+            max_steps,
+            E_tol,
+            max_rejections,
+            cooldown_rate,
+            self.seed,
+            state is not None,
+        )
+
         current_candidate_id: str | None = None
         best_candidate_id: str | None = None
         if state is not None:
@@ -789,6 +803,9 @@ class MonteCarloMinimizer:
             init_gbe = initial_result.selection_energy
             _current_dump = initial_result.artifact.path
             self.GBE_vals.append(init_gbe)
+            logger.debug(
+                "MC run %s initial evaluation: energy=%.6g", unique_id, init_gbe
+            )
             T = -1 * E_accept / math.log(0.5)
             rejection_count = 0
             min_gbe = min(self.GBE_vals)
@@ -1081,6 +1098,13 @@ class MonteCarloMinimizer:
                         "min_" + Path(dump_file_name).name)
                     shutil.copyfile(dump_file_name, best_dump)
                     del_E = min_gbe - new_gbe
+                    logger.debug(
+                        "MC run %s new best at step %d: energy %.6g (was %.6g)",
+                        unique_id,
+                        i,
+                        new_gbe,
+                        min_gbe,
+                    )
                     min_gbe = new_gbe
                     self._emit(
                         OptimizationEventType.BEST_UPDATED,
@@ -1149,6 +1173,17 @@ class MonteCarloMinimizer:
                     break
 
             T *= cooldown_rate
+
+            logger.debug(
+                "MC run %s step %d complete: mutation=%s accepted=%s energy=%.6g "
+                "T=%.6g",
+                unique_id,
+                i,
+                mutation,
+                accepted,
+                new_gbe,
+                T,
+            )
 
             _last_completed_step = i
             if i < max_steps:
