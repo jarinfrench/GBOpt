@@ -305,72 +305,23 @@ def _calculate_dynamical_matrix(
     return Dij
 
 
-def soft_mode_displacement_atoms(
+def _solve_soft_mode_eigenvectors(
     *,
-    structured_atoms: np.ndarray,
-    unit_cell,
+    hardness,
+    positions: np.ndarray,
     gb_indices: np.ndarray,
-    box_dims: np.ndarray,
-    gb_thickness: float,
-    mesh_size: int,
+    neighbor_list_typed,
+    q_points,
     num_q: int,
     mode_index: int,
-    subtract_displacement: bool,
 ) -> np.ndarray:
-    """Return ``structured_atoms`` displaced along its ``mode_index``-th soft mode.
+    """Return every non-acoustic soft-mode eigenvector, softest first.
 
-    Pure computational core shared by ``GBManipulator.displace_along_soft_modes`` and
-    ``SoftModeDisplacement.execute``. No unrelated change to the physical soft-mode
-    calculation or q-point selection relative to R17 (#27) -- this is that method's own
-    body, taking every input explicitly instead of a ``Parent``.
-
-    :param structured_atoms: Keyword argument, required. Structured whole-system atom
-        rows.
-    :param unit_cell: Keyword argument, required. Unit cell supplying ideal bond
-        lengths, atomic radius, and crystal symmetry.
-    :param gb_indices: Keyword argument, required. Whole-system row indices of atoms
-        in the GB region (the movable degrees of freedom).
-    :param box_dims: Keyword argument, required. 3 by 2 Cartesian box bounds.
-    :param gb_thickness: Keyword argument, required. Full width of the GB region in
-        angstroms.
-    :param mesh_size: Keyword argument, required. Reciprocal-space mesh size.
-    :param num_q: Keyword argument, required. Number of unique q points to use.
-    :param mode_index: Keyword argument, required. Selects which non-acoustic soft
-        mode to displace along, ordered from softest (0) to next-softest (1), and so
-        on.
-    :param subtract_displacement: Keyword argument, required. Whether to subtract,
-        rather than add, the eigenvector displacement.
-    :return: Structured whole-system atom rows after displacement.
+    :return: ``(num_non_acoustic_modes, 3 * len(gb_indices))`` real eigenvectors.
     :raises ManipulationCapabilityError: If ``mode_index`` is out of range for this
-        system.
+        system, or the requested mode cannot be generated from a sparse matrix.
     """
-    atoms = Atom.as_array(structured_atoms)
-    positions = atoms[:, 1:]
-
-    ideal_bonds = unit_cell.ideal_bond_lengths
-    cutoff = 1.5 * max(ideal_bonds.values())
-    neighbor_list = _create_neighbor_list(cutoff, positions)
-    neighbor_list_typed = List()
-    for neighbor in neighbor_list:
-        neighbor_list_typed.append(List(neighbor))
-    hardness = _calculate_bond_hardness(
-        atoms=structured_atoms,
-        gb_indices=gb_indices,
-        box_dims=box_dims,
-        gb_thickness=gb_thickness,
-        ideal_bonds=ideal_bonds,
-        neighbor_list=neighbor_list,
-    )
-    q_points = _soft_mode_q_points(unit_cell, mesh_size)
-
-    if len(q_points) < num_q:
-        warnings.warn(
-            f"Fewer q_points generated than desired: {len(q_points)} < {num_q}. "
-            "Recommended to increase mesh size."
-        )
-
     n_atoms = len(gb_indices)
-
     sparse_threshold = 10000
 
     num_modes_needed = mode_index + 1
@@ -410,8 +361,26 @@ def soft_mode_displacement_atoms(
             f"mode_index={mode_index} is out of range: only "
             f"{len(saved_disps)} non-acoustic soft mode(s) available."
         )
+    return saved_disps
 
-    d_min = 2 * unit_cell.radius
+
+def _apply_gb_displacement(
+    *,
+    positions: np.ndarray,
+    gb_indices: np.ndarray,
+    neighbor_list,
+    radius: float,
+    disp_vector: np.ndarray,
+    threshold: float,
+    subtract_displacement: bool,
+) -> np.ndarray:
+    """Return ``positions`` with the GB region displaced along ``disp_vector``.
+
+    Caps each atom's displacement to avoid overlapping a neighbor, then
+    independently caps the resulting magnitude at ``threshold``. Leaves every
+    position unchanged if any atom's raw eigenvector displacement is exactly zero.
+    """
+    d_min = 2 * radius
 
     precomputed_distances = np.zeros(len(gb_indices))
     for i, atom_idx in enumerate(gb_indices):
@@ -421,7 +390,6 @@ def soft_mode_displacement_atoms(
         precomputed_distances[i] = np.min(dists) - d_min
 
     pos = np.copy(positions)
-    disp_vector = saved_disps[mode_index].reshape(-1, 3)
     disp_magnitude = np.linalg.norm(disp_vector, axis=1)
 
     if not np.any(disp_magnitude == 0):
@@ -433,8 +401,115 @@ def soft_mode_displacement_atoms(
             safe_displacements[overlap_condition] = overlapped_atoms / overlap_disps
 
         adjusted_displacements = disp_vector * safe_displacements[:, None]
+
+        # Independently cap the final displacement magnitude at threshold. The
+        # overlap check above only constrains an atom that would collide with a
+        # neighbor; an atom with open space around it is otherwise displaced by
+        # the raw eigenvector magnitude with no upper bound. This clamps the
+        # already-overlap-adjusted vector's own magnitude, preserving its
+        # direction (including the overlap clamp's possible sign flip), rather
+        # than combining with the overlap scale factor directly -- that scale
+        # factor can itself be negative, which would make a naive elementwise
+        # minimum pick the larger-magnitude (more negative) value instead of
+        # the more restrictive one.
+        adjusted_magnitudes = np.linalg.norm(adjusted_displacements, axis=1)
+        over_threshold = adjusted_magnitudes > threshold
+        if np.any(over_threshold):
+            adjusted_displacements[over_threshold] *= (
+                threshold / adjusted_magnitudes[over_threshold]
+            )[:, None]
+
         pos[gb_indices] = positions[gb_indices] + \
             adjusted_displacements * (-1 if subtract_displacement else 1)
+
+    return pos
+
+
+def soft_mode_displacement_atoms(
+    *,
+    structured_atoms: np.ndarray,
+    unit_cell,
+    gb_indices: np.ndarray,
+    box_dims: np.ndarray,
+    gb_thickness: float,
+    mesh_size: int,
+    num_q: int,
+    mode_index: int,
+    subtract_displacement: bool,
+    threshold: float,
+) -> np.ndarray:
+    """Return ``structured_atoms`` displaced along its ``mode_index``-th soft mode.
+
+    Pure computational core shared by ``GBManipulator.displace_along_soft_modes`` and
+    ``SoftModeDisplacement.execute``. No unrelated change to the physical soft-mode
+    calculation or q-point selection relative to R17 (#27) -- this is that method's own
+    body, taking every input explicitly instead of a ``Parent``.
+
+    :param structured_atoms: Keyword argument, required. Structured whole-system atom
+        rows.
+    :param unit_cell: Keyword argument, required. Unit cell supplying ideal bond
+        lengths, atomic radius, and crystal symmetry.
+    :param gb_indices: Keyword argument, required. Whole-system row indices of atoms
+        in the GB region (the movable degrees of freedom).
+    :param box_dims: Keyword argument, required. 3 by 2 Cartesian box bounds.
+    :param gb_thickness: Keyword argument, required. Full width of the GB region in
+        angstroms.
+    :param mesh_size: Keyword argument, required. Reciprocal-space mesh size.
+    :param num_q: Keyword argument, required. Number of unique q points to use.
+    :param mode_index: Keyword argument, required. Selects which non-acoustic soft
+        mode to displace along, ordered from softest (0) to next-softest (1), and so
+        on.
+    :param subtract_displacement: Keyword argument, required. Whether to subtract,
+        rather than add, the eigenvector displacement.
+    :param threshold: Keyword argument, required. Maximum displacement magnitude
+        allowed per atom, in angstroms, applied after the overlap-avoidance clamp.
+    :return: Structured whole-system atom rows after displacement.
+    :raises ManipulationCapabilityError: If ``mode_index`` is out of range for this
+        system.
+    """
+    atoms = Atom.as_array(structured_atoms)
+    positions = atoms[:, 1:]
+
+    ideal_bonds = unit_cell.ideal_bond_lengths
+    cutoff = 1.5 * max(ideal_bonds.values())
+    neighbor_list = _create_neighbor_list(cutoff, positions)
+    neighbor_list_typed = List()
+    for neighbor in neighbor_list:
+        neighbor_list_typed.append(List(neighbor))
+    hardness = _calculate_bond_hardness(
+        atoms=structured_atoms,
+        gb_indices=gb_indices,
+        box_dims=box_dims,
+        gb_thickness=gb_thickness,
+        ideal_bonds=ideal_bonds,
+        neighbor_list=neighbor_list,
+    )
+    q_points = _soft_mode_q_points(unit_cell, mesh_size)
+
+    if len(q_points) < num_q:
+        warnings.warn(
+            f"Fewer q_points generated than desired: {len(q_points)} < {num_q}. "
+            "Recommended to increase mesh size."
+        )
+
+    saved_disps = _solve_soft_mode_eigenvectors(
+        hardness=hardness,
+        positions=positions,
+        gb_indices=gb_indices,
+        neighbor_list_typed=neighbor_list_typed,
+        q_points=q_points,
+        num_q=num_q,
+        mode_index=mode_index,
+    )
+    pos = _apply_gb_displacement(
+        positions=positions,
+        gb_indices=gb_indices,
+        neighbor_list=neighbor_list,
+        radius=unit_cell.radius,
+        disp_vector=saved_disps[mode_index].reshape(-1, 3),
+        threshold=threshold,
+        subtract_displacement=subtract_displacement,
+    )
 
     structured_pos = np.zeros((len(atoms)), dtype=Atom.atom_dtype)
     structured_pos["name"] = structured_atoms["name"]
@@ -496,15 +571,16 @@ class SoftModeDisplacement:
 
         :param context: Validated input whose ``params`` supply ``unit_cell`` and
             ``gb_thickness`` (required), and ``mesh_size``, ``num_q``, ``mode_index``,
-            ``subtract_displacement`` (all optional, matching
-            ``GBManipulator.displace_along_soft_modes``'s own defaults).
+            ``subtract_displacement``, ``threshold`` (all optional, matching
+            ``GBManipulator.displace_along_soft_modes``'s own defaults -- ``threshold``
+            defaults to 1.5 times the unit cell's largest ideal bond length).
         :return: A single displaced child candidate; ``parameters`` records the
             resolved ``mode_index`` (and the other resolved parameters) rather than
             embedding the displaced structure a second time.
         :raises ManipulationConfigurationError: If a required parameter is missing or
             malformed.
         :raises ManipulationCapabilityError: If ``mode_index`` is out of range for this
-            system.
+            system, or ``threshold`` is negative.
         """
         parent = context.parents[0]
         unit_cell = _require(context.params, "unit_cell")
@@ -513,6 +589,7 @@ class SoftModeDisplacement:
         num_q = int(context.params.get("num_q", 1))
         mode_index = int(context.params.get("mode_index", 0))
         subtract_displacement = bool(context.params.get("subtract_displacement", False))
+        threshold = context.params.get("threshold")
 
         if mesh_size < 1:
             raise ManipulationCapabilityError("mesh_size must be >= 1.")
@@ -520,6 +597,10 @@ class SoftModeDisplacement:
             raise ManipulationCapabilityError("num_q must be >= 1.")
         if mode_index < 0:
             raise ManipulationCapabilityError("mode_index must be >= 0.")
+        if threshold is not None and threshold < 0:
+            raise ManipulationCapabilityError("threshold must be a positive float value.")
+        if threshold is None:
+            threshold = 1.5 * max(unit_cell.ideal_bond_lengths.values())
 
         atoms_struct = parent.atoms
         gb_indices = _gb_region_indices(
@@ -536,6 +617,7 @@ class SoftModeDisplacement:
             num_q=num_q,
             mode_index=mode_index,
             subtract_displacement=subtract_displacement,
+            threshold=threshold,
         )
         child = _build_candidate(parent, displaced)
         return ManipulationResult(
@@ -545,6 +627,7 @@ class SoftModeDisplacement:
                 "num_q": num_q,
                 "mode_index": mode_index,
                 "subtract_displacement": subtract_displacement,
+                "threshold": threshold,
             },
             lineage={"operation": self.name, "parent_count": 1},
         )
