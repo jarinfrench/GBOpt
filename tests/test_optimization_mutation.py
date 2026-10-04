@@ -23,6 +23,38 @@ def test_mutator_rejects_unknown_choices():
         Mutator(["translate_right_grain", "not_a_real_operation"], Manipulator())
 
 
+def test_mutator_unknown_choice_error_lists_registered_operation_names():
+    from GBOpt.manipulation.registry import ManipulationRegistry
+    from GBOpt.manipulation.translation import RightGrainTranslation
+
+    class Manipulator:
+        pass
+
+    registry = ManipulationRegistry()
+    registry.register("right_grain_translation", RightGrainTranslation())
+
+    with pytest.raises(
+        GBMinimizerValueError,
+        match=r"registered operation names: right_grain_translation",
+    ):
+        Mutator(["not_a_real_operation"], Manipulator(), registry=registry)
+
+
+def test_mutator_unknown_choice_error_reports_no_registrations():
+    from GBOpt.manipulation.registry import ManipulationRegistry
+
+    class Manipulator:
+        pass
+
+    with pytest.raises(
+        GBMinimizerValueError,
+        match=r"registered operation names: \(none\)",
+    ):
+        Mutator(
+            ["not_a_real_operation"], Manipulator(), registry=ManipulationRegistry()
+        )
+
+
 def test_mutator_rejects_empty_choices():
     class Manipulator:
         pass

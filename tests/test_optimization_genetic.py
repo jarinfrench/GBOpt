@@ -3434,6 +3434,38 @@ def test_binary_operations_rejects_unregistered_name(ga_gb, tmp_path):
         )
 
 
+def test_binary_operations_unregistered_name_error_lists_registered_names(
+    ga_gb, tmp_path
+):
+    registry = ManipulationRegistry()
+
+    class _RegisteredOp:
+        @property
+        def name(self):
+            return "registered_op"
+
+        @property
+        def arity(self):
+            return 2
+
+        def execute(self, context):
+            return ManipulationResult(children=context.parents)
+
+    registry.register("registered_op", _RegisteredOp())
+    with pytest.raises(
+        GBMinimizerValueError,
+        match="registered operation names: registered_op",
+    ):
+        GeneticAlgorithmMinimizer(
+            ga_gb,
+            _fake_energy_func_ga(tmp_path),
+            ["translate_right_grain"],
+            seed=0,
+            binary_operations=["not_a_real_operation"],
+            registry=registry,
+        )
+
+
 def test_binary_operations_rejects_wrong_arity(ga_gb, tmp_path):
     registry = ManipulationRegistry()
 

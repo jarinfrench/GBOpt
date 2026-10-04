@@ -69,3 +69,26 @@ def test_module_level_default_registry_starts_empty():
 
     with pytest.raises(ManipulationLookupError):
         default_registry.get("nothing-should-be-registered-here")
+
+
+def test_names_is_empty_for_a_fresh_registry():
+    registry = ManipulationRegistry()
+    assert registry.names == ()
+
+
+def test_names_reflects_registration_order():
+    registry = ManipulationRegistry()
+    registry.register("second", _StubManipulation(name="second"))
+    registry.register("first", _StubManipulation(name="first"))
+    assert registry.names == ("second", "first")
+
+
+def test_contains_is_true_for_a_registered_name():
+    registry = ManipulationRegistry()
+    registry.register("stub", _StubManipulation())
+    assert "stub" in registry
+
+
+def test_contains_is_false_for_an_unregistered_name():
+    registry = ManipulationRegistry()
+    assert "missing" not in registry

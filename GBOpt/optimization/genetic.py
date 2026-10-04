@@ -541,7 +541,8 @@ class GeneticAlgorithmMinimizer:
                 operation = self._registry.get(name)
             except ManipulationLookupError as exc:
                 raise GBMinimizerValueError(
-                    f"Unknown binary_operations entry: {name!r}"
+                    f"Unknown binary_operations entry: {name!r}; registered "
+                    f"operation names: {', '.join(self._registry.names) or '(none)'}"
                 ) from exc
             if operation.arity != 2:
                 raise GBMinimizerValueError(
