@@ -2558,6 +2558,146 @@ class GeneticAlgorithmMinimizer:
 
         return (best_energy, best_dump)
 
+    @staticmethod
+    def _owned_population_snapshot(
+        population_snapshots: list[dict], population_lineages: list[list]
+    ) -> list[PopulationCandidateSnapshot]:
+        """Build one generation's population snapshot from raw per-candidate state.
+
+        :param population_snapshots: Per-candidate serialized evaluation state, in
+            population order.
+        :param population_lineages: Per-candidate raw lineage entries, aligned by
+            position with ``population_snapshots``.
+        :return: Typed population snapshot list, in the same order.
+        """
+        return [
+            PopulationCandidateSnapshot(
+                artifact=StructureArtifact(
+                    path=snap["structure_path"], format=_STRUCTURE_FORMAT
+                ),
+                lineage=_lineage_step_from_v1(lineage),
+                mapping=(
+                    None
+                    if snap["mapping"] is None
+                    else _candidate_mapping_from_state(snap["mapping"])
+                ),
+            )
+            for snap, lineage in zip(
+                population_snapshots, population_lineages, strict=True
+            )
+        ]
+
+    def _owned_population_cache_snapshot(
+        self,
+        population_cached_evaluations: list[CandidateEvaluation | None],
+    ) -> list[CandidateEvaluationSnapshot | None]:
+        """Build one generation's carryover-cache snapshot from live evaluations.
+
+        :param population_cached_evaluations: Per-slot reusable carryover evaluation,
+            aligned with the population; ``None`` for a slot with no reusable result.
+        :return: Typed cache snapshot list, in the same order.
+        """
+        return [
+            None
+            if record is None
+            else _owned_evaluation_to_snapshot(self._owned_evaluation_to_state(record))
+            for record in population_cached_evaluations
+        ]
+
+    def _owned_generation_history_snapshot(
+        self,
+    ) -> list[list[GenerationHistoryEntrySnapshot]]:
+        """Build this run's full generation-history snapshot from live history.
+
+        :return: Typed per-generation lineage/energy record list, in order.
+        """
+        return [
+            [
+                GenerationHistoryEntrySnapshot(
+                    lineage=_lineage_step_from_v1(lineage), energy=energy
+                )
+                for lineage, energy in gen_history
+            ]
+            for gen_history in self.history
+        ]
+
+    def _owned_last_generation_snapshot(self) -> list[CandidateEvaluationSnapshot]:
+        """Build the most recent generation's per-slot evaluation-outcome snapshot.
+
+        :return: Typed evaluation-outcome snapshot list, aligned with the population.
+        """
+        return [
+            CandidateEvaluationSnapshot(
+                candidate_id=record.candidate_id,
+                input_index=record.input_index,
+                status=(
+                    EvaluationStatus.SUCCESS
+                    if record.success
+                    else EvaluationStatus.FAILED
+                ),
+                selection_energy=record.objective,
+                energy=record.objective if record.success else None,
+                failure_stage=(None if record.success else FailureStage.EVALUATOR),
+                failure_message=(
+                    None
+                    if record.success
+                    else (record.failure_reason or "unknown evaluation failure")
+                ),
+            )
+            for record in self.last_generation_evaluations
+        ]
+
+    def _owned_failure_diagnostics_snapshot(self) -> list[FailureDiagnosticSnapshot]:
+        """Build this run's bounded failed-evaluation diagnostic history snapshot.
+
+        :return: Typed diagnostic snapshot list, in order.
+        """
+        return [
+            FailureDiagnosticSnapshot(
+                candidate_id=diagnostic.candidate_id,
+                generation=diagnostic.generation,
+                input_index=diagnostic.input_index,
+                failure_reason=diagnostic.failure_reason,
+                source_path=diagnostic.source_path,
+            )
+            for diagnostic in self._failure_diagnostics
+        ]
+
+    def _owned_retention_archive_mapping_objects(
+        self,
+    ) -> dict[str, CandidateFileMapping]:
+        """Build this run's archived-candidate ownership-mapping snapshot.
+
+        :return: Typed ownership mapping, keyed by candidate identity.
+        """
+        return {
+            candidate_id: _candidate_mapping_from_state(
+                self._retention_archive_mappings[candidate_id]
+            )
+            for candidate_id in sorted(self._retention_archive_mappings)
+        }
+
+    def _owned_ga_configuration_snapshot(self) -> GeneticAlgorithmConfigurationSnapshot:
+        """Build this run's deterministic GA configuration snapshot.
+
+        :return: Typed configuration snapshot, checked against a resuming run's own
+            construction arguments.
+        """
+        return GeneticAlgorithmConfigurationSnapshot(
+            slice_and_merge_pct=self.slice_and_merge_pct,
+            reuse_carryover_evaluations=self.reuse_carryover_evaluations,
+            population_size=self.population_size,
+            keep_top_pct=self.keep_top_pct,
+            intermediate_pct=self.intermediate_pct,
+            allow_variable_cell=self.allow_variable_cell,
+            choices=self.mutator.choices_keys,
+            crossover_surface=self.crossover_surface,
+            crossover_max_tilt_degrees=self.crossover_max_tilt_degrees,
+            crossover_attempts=self.crossover_attempts,
+            failure_diagnostic_count=self.failure_diagnostic_count,
+            composition_policy=self.composition_policy,
+        )
+
     def _run_owned_GA(
         self,
         unique_id: int | uuid.UUID | None = None,
@@ -3000,81 +3140,16 @@ class GeneticAlgorithmMinimizer:
             best_snapshot = _owned_evaluation_to_snapshot(
                 self._owned_evaluation_to_state(best_record)
             )
-            population_snapshot = [
-                PopulationCandidateSnapshot(
-                    artifact=StructureArtifact(
-                        path=snap["structure_path"], format=_STRUCTURE_FORMAT
-                    ),
-                    lineage=_lineage_step_from_v1(lineage),
-                    mapping=(
-                        None
-                        if snap["mapping"] is None
-                        else _candidate_mapping_from_state(snap["mapping"])
-                    ),
-                )
-                for snap, lineage in zip(
-                    population_snapshots, population_lineages, strict=True
-                )
-            ]
-            population_cache_snapshot = [
-                None
-                if record is None
-                else _owned_evaluation_to_snapshot(
-                    self._owned_evaluation_to_state(record)
-                )
-                for record in population_cached_evaluations
-            ]
+            population_snapshot = self._owned_population_snapshot(
+                population_snapshots, population_lineages
+            )
+            population_cache_snapshot = self._owned_population_cache_snapshot(
+                population_cached_evaluations
+            )
             population_cache_mapping_objects = [
                 None if record is None else record.mapping
                 for record in population_cached_evaluations
             ]
-            generation_history_snapshot = [
-                [
-                    GenerationHistoryEntrySnapshot(
-                        lineage=_lineage_step_from_v1(lineage), energy=energy
-                    )
-                    for lineage, energy in gen_history
-                ]
-                for gen_history in self.history
-            ]
-            last_generation_snapshot = [
-                CandidateEvaluationSnapshot(
-                    candidate_id=record.candidate_id,
-                    input_index=record.input_index,
-                    status=(
-                        EvaluationStatus.SUCCESS
-                        if record.success
-                        else EvaluationStatus.FAILED
-                    ),
-                    selection_energy=record.objective,
-                    energy=record.objective if record.success else None,
-                    failure_stage=(
-                        None if record.success else FailureStage.EVALUATOR
-                    ),
-                    failure_message=(
-                        None
-                        if record.success
-                        else (record.failure_reason or "unknown evaluation failure")
-                    ),
-                )
-                for record in self.last_generation_evaluations
-            ]
-            failure_diagnostics_snapshot = [
-                FailureDiagnosticSnapshot(
-                    candidate_id=diagnostic.candidate_id,
-                    generation=diagnostic.generation,
-                    input_index=diagnostic.input_index,
-                    failure_reason=diagnostic.failure_reason,
-                    source_path=diagnostic.source_path,
-                )
-                for diagnostic in self._failure_diagnostics
-            ]
-            retention_archive_mapping_objects = {
-                candidate_id: _candidate_mapping_from_state(
-                    self._retention_archive_mappings[candidate_id]
-                )
-                for candidate_id in sorted(self._retention_archive_mappings)
-            }
             snapshot = GeneticAlgorithmSnapshot(
                 run=RunIdentitySnapshot(
                     run_id=str(unique_id),
@@ -3086,35 +3161,24 @@ class GeneticAlgorithmMinimizer:
                 completed_generation=gen,
                 best=best_snapshot,
                 population=population_snapshot,
-                configuration=GeneticAlgorithmConfigurationSnapshot(
-                    slice_and_merge_pct=self.slice_and_merge_pct,
-                    reuse_carryover_evaluations=self.reuse_carryover_evaluations,
-                    population_size=self.population_size,
-                    keep_top_pct=self.keep_top_pct,
-                    intermediate_pct=self.intermediate_pct,
-                    allow_variable_cell=self.allow_variable_cell,
-                    choices=self.mutator.choices_keys,
-                    crossover_surface=self.crossover_surface,
-                    crossover_max_tilt_degrees=self.crossover_max_tilt_degrees,
-                    crossover_attempts=self.crossover_attempts,
-                    failure_diagnostic_count=self.failure_diagnostic_count,
-                    composition_policy=self.composition_policy,
-                ),
+                configuration=self._owned_ga_configuration_snapshot(),
                 population_cache=population_cache_snapshot,
                 energy_history=[list(gen_vals) for gen_vals in self.GBE_vals],
-                generation_history=generation_history_snapshot,
+                generation_history=self._owned_generation_history_snapshot(),
                 retention_lineages=[
                     list(lineage) for lineage in population_retention_lineages
                 ],
-                last_generation_evaluations=last_generation_snapshot,
-                failure_diagnostics=failure_diagnostics_snapshot,
+                last_generation_evaluations=self._owned_last_generation_snapshot(),
+                failure_diagnostics=self._owned_failure_diagnostics_snapshot(),
                 claimed_paths=self._owned_evaluator.claimed_paths_state(),
                 retention_state=(
                     None
                     if self.artifact_store is None
                     else self.artifact_store.to_state()
                 ),
-                retention_archive_mappings=retention_archive_mapping_objects,
+                retention_archive_mappings=(
+                    self._owned_retention_archive_mapping_objects()
+                ),
                 best_mapping=best_record.mapping,
                 population_cache_mappings=population_cache_mapping_objects,
             )
