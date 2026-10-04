@@ -4,8 +4,9 @@
 
 This module consumes one already-classified ``EvaluationResult`` (from
 ``GBOpt.evaluation``) and returns the subset of ``OptimizationEvent`` keyword arguments
-it authoritatively determines -- candidate identity, position, status, energies, and
-failure context. It does not decide which lifecycle occurrence is being reported (that
+it authoritatively determines -- candidate identity, position, status, energies,
+artifact reference, and failure context. It does not decide which lifecycle occurrence
+is being reported (that
 is the event's own ``event_type``, chosen by the caller), run any evaluation, or emit
 anything; those belong to ``MonteCarloMinimizer``/``GeneticAlgorithmMinimizer`` and to
 ``GBOpt.observability.sinks``, respectively. Sharing this one function is what lets both
@@ -27,8 +28,8 @@ def evaluation_event_fields(result: EvaluationResult) -> dict[str, object]:
 
     :param result: Authoritative, already-classified candidate evaluation outcome.
     :return: Keyword arguments for ``OptimizationEvent``'s ``candidate_id``/
-        ``input_index``/``status``/``selection_energy``/``energy``/``failure_stage``/
-        ``failure_code``/``failure_message`` fields.
+        ``input_index``/``status``/``selection_energy``/``energy``/``artifact_path``/
+        ``failure_stage``/``failure_code``/``failure_message`` fields.
     """
     return {
         "candidate_id": result.candidate_id,
@@ -36,6 +37,9 @@ def evaluation_event_fields(result: EvaluationResult) -> dict[str, object]:
         "status": result.status,
         "selection_energy": result.selection_energy,
         "energy": result.energy,
+        "artifact_path": (
+            result.artifact.path if result.artifact is not None else None
+        ),
         "failure_stage": result.failure_stage,
         "failure_code": result.failure_code,
         "failure_message": result.failure_message,
