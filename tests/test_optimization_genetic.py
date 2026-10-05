@@ -3640,6 +3640,78 @@ def test_legacy_ga_emits_expected_lifecycle_sequence(ga_gb, tmp_path):
         assert event.run.campaign_id == "campaign-b"
 
 
+def test_legacy_ga_resumed_generation_reports_no_operation_parameters(
+    ga_gb, tmp_path
+):
+    """A generation restored from checkpoint reports no operation parameters.
+
+    operation_parameters is in-memory-only and never checkpointed (see
+    GeneticAlgorithmMinimizer.run_GA's docstring), so the first generation
+    evaluated after a resume -- whose population was mutated in the run that
+    produced the checkpoint, not this one -- must report operation_parameters
+    as None rather than crash or report stale/wrong parameters. A later
+    generation, mutated in-memory by this same resumed run, must report real
+    parameters again.
+    """
+    cp = tmp_path / "resume_ops.json"
+    choices = ["insert_atoms", "remove_atoms", "translate_right_grain"]
+
+    first_run = GeneticAlgorithmMinimizer(
+        ga_gb,
+        _legacy_fake_energy(tmp_path),
+        choices,
+        seed=0,
+        population_size=4,
+        generations=1,
+        keep_top_pct=25,
+        intermediate_pct=75,
+    )
+    first_run.run_GA(unique_id=99, checkpoint_file=cp)
+
+    sink = _RecordingSink()
+    resumed_run = GeneticAlgorithmMinimizer(
+        ga_gb,
+        _legacy_fake_energy(tmp_path),
+        choices,
+        seed=0,
+        population_size=4,
+        generations=3,
+        keep_top_pct=25,
+        intermediate_pct=75,
+        event_sink=sink,
+    )
+    resumed_run.run_GA(unique_id=99, checkpoint_file=cp)
+
+    proposal_events = [
+        event
+        for event in sink.events
+        if event.event_type is OptimizationEventType.PROPOSAL_EVALUATED
+    ]
+    assert len(proposal_events) == 2 * resumed_run.population_size
+
+    restored_generation = proposal_events[: resumed_run.population_size]
+    assert any(
+        event.operation_name != "carryover" for event in restored_generation
+    )
+    assert all(
+        event.operation_parameters is None for event in restored_generation
+    )
+
+    # "carryover" candidates are never mutated, so they legitimately report no
+    # operation parameters in any generation -- excluded here since this test is
+    # about parameters lost to checkpointing, not carryover's own separate lack of
+    # any mutation to report.
+    next_generation = proposal_events[resumed_run.population_size :]
+    mutated_in_next_generation = [
+        event for event in next_generation if event.operation_name != "carryover"
+    ]
+    assert mutated_in_next_generation
+    assert all(
+        event.operation_parameters is not None
+        for event in mutated_in_next_generation
+    )
+
+
 def test_legacy_ga_initial_evaluation_failure_emits_run_failed_and_propagates(
     ga_gb, tmp_path
 ):
